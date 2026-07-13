@@ -1,0 +1,15 @@
+[package]
+name = "nes-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.35.0"
+nes-audio-native = { path = "../nes-audio-native" }
+nes-core = { path = "../nes-core" }
+png = "0.18.1"
+rfd = "0.17.2"
+
+[lints]
+workspace = true

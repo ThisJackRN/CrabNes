@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/nes-audio-native", "crates/nes-core", "crates/nes-cli", "crates/nes-ui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
