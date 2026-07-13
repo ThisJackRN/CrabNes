@@ -1,0 +1,12 @@
+[package]
+name = "nes-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nes-core = { path = "../nes-core" }
+png = "0.18.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+/target
+/frame.png
+/frame.ppm
+*.nes
+*.sav
+*.state
