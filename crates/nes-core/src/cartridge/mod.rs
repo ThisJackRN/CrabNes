@@ -91,6 +91,9 @@ impl Cartridge {
     pub fn cpu_read(&mut self, address: u16) -> Option<u8> {
         self.mapper.cpu_read(address)
     }
+    pub fn cpu_peek(&self, address: u16) -> Option<u8> {
+        self.mapper.cpu_peek(address)
+    }
     pub fn cpu_write(&mut self, address: u16, value: u8) -> bool {
         self.mapper.cpu_write(address, value)
     }

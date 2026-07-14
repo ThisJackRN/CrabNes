@@ -2,79 +2,55 @@ use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use gilrs::{Axis, Button as GamepadButton, ev::Code};
+
 use crate::persistence;
 
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 3;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum KeyBinding {
-    Z,
-    X,
-    Enter,
-    Shift,
-    Up,
-    Down,
-    Left,
-    Right,
-    A,
-    S,
-    Q,
-    W,
-    C,
-    V,
-    E,
-    I,
-    J,
-    K,
-    L,
-}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct KeyBinding(String);
 
 impl KeyBinding {
-    pub const ALL: [Self; 19] = [
-        Self::Z,
-        Self::X,
-        Self::Enter,
-        Self::Shift,
-        Self::Up,
-        Self::Down,
-        Self::Left,
-        Self::Right,
-        Self::A,
-        Self::S,
-        Self::Q,
-        Self::W,
-        Self::C,
-        Self::V,
-        Self::E,
-        Self::I,
-        Self::J,
-        Self::K,
-        Self::L,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Z => "Z",
-            Self::X => "X",
-            Self::Enter => "Enter",
-            Self::Shift => "Shift",
-            Self::Up => "Up",
-            Self::Down => "Down",
-            Self::Left => "Left",
-            Self::Right => "Right",
-            Self::A => "A",
-            Self::S => "S",
-            Self::Q => "Q",
-            Self::W => "W",
-            Self::C => "C",
-            Self::V => "V",
-            Self::E => "E",
-            Self::I => "I",
-            Self::J => "J",
-            Self::K => "K",
-            Self::L => "L",
-        }
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
     }
+
+    pub fn label(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GamepadBinding {
+    Button(GamepadButton),
+    Axis {
+        axis: Axis,
+        direction: i8,
+    },
+    ExactButton {
+        button: GamepadButton,
+        code: Code,
+    },
+    ExactButtonLow {
+        button: GamepadButton,
+        code: Code,
+    },
+    ExactAxis {
+        axis: Axis,
+        code: Code,
+        direction: i8,
+    },
+    ExactAxisLow {
+        axis: Axis,
+        code: Code,
+    },
+    RawButton(Code),
+    RawAxis {
+        code: Code,
+        direction: i8,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -90,12 +66,36 @@ pub struct Settings {
     pub save_states: SaveStateSettings,
     pub tas: TasSettings,
     pub debugging: DebugSettings,
+    pub achievements: AchievementSettings,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralSettings {
     pub reopen_last_game: bool,
+    pub play_mode: PlayMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PlayMode {
+    #[default]
+    Standard,
+    Speedrun,
+    Achievement,
+}
+
+impl PlayMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Speedrun => "Speedrun",
+            Self::Achievement => "Achievements",
+        }
+    }
+
+    pub const fn restricts_assists(self) -> bool {
+        !matches!(self, Self::Standard)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -208,6 +208,11 @@ pub struct AudioSettings {
 pub struct InputSettings {
     pub bindings: [KeyBinding; 8],
     pub player2_bindings: [KeyBinding; 8],
+    pub gamepad_bindings: [Option<GamepadBinding>; 8],
+    pub player2_gamepad_bindings: [Option<GamepadBinding>; 8],
+    /// Connected-controller index for each player. `None` assigns controllers in player order.
+    pub gamepad_slots: [Option<usize>; 2],
+    pub gamepad_axis_threshold: f32,
     pub allow_opposite_directions: bool,
 }
 
@@ -248,6 +253,13 @@ pub struct DebugSettings {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct AchievementSettings {
+    pub username: String,
+    pub token: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PerGameSettings {
     pub volume: Option<f32>,
     pub muted: Option<bool>,
@@ -273,6 +285,7 @@ impl Default for Settings {
             save_states: SaveStateSettings::default(),
             tas: TasSettings::default(),
             debugging: DebugSettings::default(),
+            achievements: AchievementSettings::default(),
         }
     }
 }
@@ -281,6 +294,7 @@ impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             reopen_last_game: true,
+            play_mode: PlayMode::Standard,
         }
     }
 }
@@ -298,34 +312,52 @@ impl Default for InputSettings {
     fn default() -> Self {
         Self {
             bindings: [
-                KeyBinding::Z,
-                KeyBinding::X,
-                KeyBinding::Shift,
-                KeyBinding::Enter,
-                KeyBinding::Up,
-                KeyBinding::Down,
-                KeyBinding::Left,
-                KeyBinding::Right,
+                KeyBinding::new("Z"),
+                KeyBinding::new("X"),
+                KeyBinding::new("Shift"),
+                KeyBinding::new("Enter"),
+                KeyBinding::new("Up"),
+                KeyBinding::new("Down"),
+                KeyBinding::new("Left"),
+                KeyBinding::new("Right"),
             ],
             player2_bindings: [
-                KeyBinding::C,
-                KeyBinding::V,
-                KeyBinding::Q,
-                KeyBinding::E,
-                KeyBinding::I,
-                KeyBinding::K,
-                KeyBinding::J,
-                KeyBinding::L,
+                KeyBinding::new("C"),
+                KeyBinding::new("V"),
+                KeyBinding::new("Q"),
+                KeyBinding::new("E"),
+                KeyBinding::new("I"),
+                KeyBinding::new("K"),
+                KeyBinding::new("J"),
+                KeyBinding::new("L"),
             ],
+            gamepad_bindings: default_gamepad_bindings(),
+            player2_gamepad_bindings: default_gamepad_bindings(),
+            gamepad_slots: [None, None],
+            gamepad_axis_threshold: 0.5,
             allow_opposite_directions: false,
         }
     }
+}
+
+fn default_gamepad_bindings() -> [Option<GamepadBinding>; 8] {
+    use GamepadBinding::Button;
+    [
+        Some(Button(GamepadButton::South)),
+        Some(Button(GamepadButton::East)),
+        Some(Button(GamepadButton::Select)),
+        Some(Button(GamepadButton::Start)),
+        Some(Button(GamepadButton::DPadUp)),
+        Some(Button(GamepadButton::DPadDown)),
+        Some(Button(GamepadButton::DPadLeft)),
+        Some(Button(GamepadButton::DPadRight)),
+    ]
 }
 impl Default for EmulationSettings {
     fn default() -> Self {
         Self {
             speed_index: 2,
-            rewind_seconds: 5,
+            rewind_seconds: 120,
             rewind_interval_frames: 2,
         }
     }
@@ -368,7 +400,24 @@ pub fn load() -> Settings {
     let Ok(data) = fs::read(&path) else {
         return Settings::default();
     };
-    serde_json::from_slice(&data).unwrap_or_default()
+    serde_json::from_slice(&data)
+        .map(migrate)
+        .unwrap_or_default()
+}
+
+fn migrate(mut settings: Settings) -> Settings {
+    if settings.version < 2 {
+        // Five seconds was the original default. Upgrade that value once, but
+        // preserve any duration the player deliberately selected.
+        if settings.emulation.rewind_seconds == 5 {
+            settings.emulation.rewind_seconds = EmulationSettings::default().rewind_seconds;
+        }
+        settings.version = 2;
+    }
+    if settings.version < 3 {
+        settings.version = 3;
+    }
+    settings
 }
 
 pub fn save(settings: &Settings) -> io::Result<()> {
@@ -429,6 +478,12 @@ mod tests {
             settings.input.player2_bindings,
             InputSettings::default().player2_bindings
         );
+        assert_eq!(
+            settings.input.gamepad_bindings,
+            InputSettings::default().gamepad_bindings
+        );
+        assert_eq!(settings.input.gamepad_slots, [None, None]);
+        assert_eq!(settings.input.gamepad_axis_threshold, 0.5);
         assert!(!settings.input.allow_opposite_directions);
         assert_eq!(settings.tas.checkpoint_interval, 300);
         assert!(!settings.video.crt_enabled);
@@ -438,9 +493,58 @@ mod tests {
         );
         assert_eq!(settings.video.crt_profile, CrtProfile::Royale);
         assert_eq!(settings.video.crt_mask, CrtMask::ApertureGrille);
+        assert_eq!(settings.general.play_mode, PlayMode::Standard);
+        assert!(settings.achievements.username.is_empty());
+        assert!(settings.achievements.token.is_empty());
         assert_eq!(
             settings.video.crt_halation_strength,
             VideoSettings::default().crt_halation_strength
         );
+    }
+
+    #[test]
+    fn keyboard_bindings_remain_string_compatible_and_accept_new_keys() {
+        let binding: KeyBinding = serde_json::from_str(r#""Backspace""#).unwrap();
+        assert_eq!(binding.label(), "Backspace");
+        assert_eq!(serde_json::to_string(&binding).unwrap(), r#""Backspace""#);
+    }
+
+    #[test]
+    fn migration_extends_only_the_old_five_second_default() {
+        let old_default = Settings {
+            version: 1,
+            emulation: EmulationSettings {
+                rewind_seconds: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(migrate(old_default).emulation.rewind_seconds, 120);
+
+        let customized = Settings {
+            version: 1,
+            emulation: EmulationSettings {
+                rewind_seconds: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(migrate(customized).emulation.rewind_seconds, 30);
+    }
+
+    #[test]
+    fn restricted_profiles_disable_assists_and_round_trip() {
+        assert!(!PlayMode::Standard.restricts_assists());
+        assert!(PlayMode::Speedrun.restricts_assists());
+        assert!(PlayMode::Achievement.restricts_assists());
+
+        for mode in [
+            PlayMode::Standard,
+            PlayMode::Speedrun,
+            PlayMode::Achievement,
+        ] {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<PlayMode>(&encoded).unwrap(), mode);
+        }
     }
 }

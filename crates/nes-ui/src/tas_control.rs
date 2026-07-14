@@ -4,6 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// External movie support is an independent interoperability implementation.
+// The FM2 parser follows FCEUX's public format documentation; no FCEUX or
+// BizHawk source code is incorporated. See THIRD_PARTY_NOTICES.md.
+
 use zip::ZipArchive;
 
 use crate::tas::{self, TasFrame, TasMarker, TasMovie, TasStartType};
@@ -24,7 +28,7 @@ impl fmt::Display for ControlFormat {
             Self::FceuxFm2 => "FCEUX FM2",
             Self::BizHawkBk2 => "BizHawk BK2",
             Self::BizHawkInputLog => "BizHawk Input Log",
-            Self::NativeTas => "My Own NES TAS",
+            Self::NativeTas => "CrabNes TAS",
         })
     }
 }

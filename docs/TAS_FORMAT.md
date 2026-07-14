@@ -1,4 +1,4 @@
-# My Own NES Emulator TAS format
+# CrabNes TAS format
 
 `TAS_FORMAT 1` is a UTF-8 text format owned by this emulator. It is not FM2 and
 does not copy FCEUX's movie serialization. Blank lines and lines beginning with
@@ -8,7 +8,7 @@ does not copy FCEUX's movie serialization. Blank lines and lines beginning with
 
 ```text
 TAS_FORMAT 1
-EMULATOR MyOwnNesEmulator
+EMULATOR CrabNes
 EMULATOR_VERSION 0.1.0
 ROM_SHA256 <64 lowercase or uppercase hex characters>
 REGION NTSC
@@ -25,6 +25,9 @@ The loader rejects unsupported versions, non-NTSC movies, unknown start types,
 invalid masks, missing required fields, nonsequential input rows, malformed
 embedded states, and ROM SHA-256 mismatches. A differing emulator version is a
 warning rather than an error.
+
+Movies created before the CrabNes rename with `EMULATOR MyOwnNesEmulator` remain
+compatible and load with a migration warning.
 
 ## Starting state
 

@@ -9,7 +9,14 @@ pub fn app_directory() -> PathBuf {
     let base = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    base.join("MyOwnNesEmulator")
+    let current = base.join("CrabNes");
+    let legacy = base.join("MyOwnNesEmulator");
+    if !current.exists() && legacy.is_dir() && fs::rename(&legacy, &current).is_err() {
+        // Do not strand existing settings and saves if migration is temporarily
+        // blocked by antivirus, permissions, or another running emulator build.
+        return legacy;
+    }
+    current
 }
 
 pub fn load_recent_roms() -> Vec<PathBuf> {

@@ -33,7 +33,7 @@ pub enum StateError {
 impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidHeader => write!(f, "not a My Own NES Emulator save state"),
+            Self::InvalidHeader => write!(f, "not a CrabNes save state"),
             Self::UnsupportedVersion(version) => {
                 write!(f, "save-state version {version} is not supported")
             }
@@ -301,6 +301,13 @@ impl Nes {
         }
     }
 
+    /// Copies the side-effect-free 64 KiB CPU address space used by
+    /// RetroAchievements. Hardware registers read as zero; RAM, cartridge RAM,
+    /// and currently mapped PRG ROM are exposed at their normal CPU addresses.
+    pub fn copy_achievement_memory(&self, output: &mut [u8]) {
+        self.bus.copy_achievement_memory(output);
+    }
+
     pub fn controller_reads(&self, port: usize) -> u64 {
         self.bus
             .controllers
@@ -466,5 +473,18 @@ mod tests {
         assert!(nes.debug_write_memory(MemorySpace::Palette, 0, 0xff));
         assert_eq!(nes.memory_image(MemorySpace::Palette).bytes[0], 0x3f);
         assert!(!nes.debug_write_memory(MemorySpace::CpuRam, 0x800, 0xff));
+    }
+
+    #[test]
+    fn achievement_memory_is_side_effect_free_and_mirrors_system_ram() {
+        let rom = test_rom(&[0xea, 0x4c, 0x00, 0x80]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert!(nes.debug_write_memory(MemorySpace::CpuRam, 0x123, 0x5a));
+        let mut memory = vec![0xff; 0x1_0000];
+        nes.copy_achievement_memory(&mut memory);
+        assert_eq!(memory[0x0123], 0x5a);
+        assert_eq!(memory[0x0923], 0x5a);
+        assert_eq!(memory[0x8000], 0xea);
+        assert_eq!(memory[0x2002], 0);
     }
 }

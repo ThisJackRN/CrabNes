@@ -20,7 +20,7 @@ Supported formats:
 Imported files are stored under:
 
 ```text
-%LOCALAPPDATA%\MyOwnNesEmulator\palettes\custom-<hash>.pal
+%LOCALAPPDATA%\CrabNes\palettes\custom-<hash>.pal
 ```
 
 The **RGB 2C03 / PlayChoice-10** built-in uses the RP2C03/RP2C05 three-bit DAC

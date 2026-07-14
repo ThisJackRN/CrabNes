@@ -5,12 +5,17 @@ use std::{
     path::Path,
 };
 
+// FCEUX's TAS Editor informed this module's high-level workflow, but this is an
+// independent Rust implementation and contains no FCEUX code. See
+// THIRD_PARTY_NOTICES.md.
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Digest, Sha256};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_CHECKPOINT_INTERVAL: usize = 300;
-pub const EMULATOR_NAME: &str = "MyOwnNesEmulator";
+pub const EMULATOR_NAME: &str = "CrabNes";
+const LEGACY_EMULATOR_NAME: &str = "MyOwnNesEmulator";
 pub const EMULATOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -841,7 +846,8 @@ impl TasDeserializer {
         if version != FORMAT_VERSION {
             return Err(TasFormatError::UnsupportedVersion(version));
         }
-        if required(&metadata, "EMULATOR")? != EMULATOR_NAME {
+        let emulator_name = required(&metadata, "EMULATOR")?;
+        if emulator_name != EMULATOR_NAME && emulator_name != LEGACY_EMULATOR_NAME {
             return Err(TasFormatError::Invalid(
                 "movie was created by an unknown emulator".into(),
             ));
@@ -901,6 +907,9 @@ impl TasDeserializer {
             .parse::<u64>()
             .map_err(|_| TasFormatError::Invalid("invalid RERECORDS".into()))?;
         let mut warnings = Vec::new();
+        if emulator_name == LEGACY_EMULATOR_NAME {
+            warnings.push("movie uses the legacy pre-CrabNes emulator name".into());
+        }
         if emulator_version != EMULATOR_VERSION {
             warnings.push(format!(
                 "movie was created with emulator version {emulator_version}; current version is {EMULATOR_VERSION}"
@@ -1121,7 +1130,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir()
-            .join(format!("my-own-nes-tas-{}-{nonce}", std::process::id()))
+            .join(format!("crabnes-tas-{}-{nonce}", std::process::id()))
             .join("movie.tas");
         let movie = movie();
         save(&movie, &path).unwrap();
@@ -1130,6 +1139,22 @@ mod tests {
             movie.frames
         );
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_emulator_name_remains_compatible() {
+        let movie = movie();
+        let text = TasSerializer::serialize(&movie)
+            .unwrap()
+            .replace("EMULATOR CrabNes", "EMULATOR MyOwnNesEmulator");
+        let loaded = TasDeserializer::deserialize(&text, &movie.rom_sha256).unwrap();
+        assert_eq!(loaded.movie.frames, movie.frames);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("legacy"))
+        );
     }
 
     #[test]

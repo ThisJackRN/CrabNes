@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nes-audio-native", "crates/nes-core", "crates/nes-cli", "crates/nes-ui"]
+members = ["crates/nes-achievements-native", "crates/nes-audio-native", "crates/nes-core", "crates/nes-cli", "crates/nes-ui"]
 resolver = "2"
 
 [workspace.package]
