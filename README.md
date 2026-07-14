@@ -8,7 +8,7 @@ audio, long smooth rewind, TAS tools, speedrun-safe play profiles, and
 RetroAchievements support.
 
 > [!IMPORTANT]
-> CrabNes currently supports NTSC iNES Mapper 0 games (NROM-128 and NROM-256).
+> CrabNes currently supports NTSC iNES and NES 2.0 Mapper 0 games (NROM-128 and NROM-256).
 > More mappers and accuracy work are planned. No commercial ROMs are included;
 > use legally obtained games or homebrew.
 
@@ -69,8 +69,8 @@ pins that limitation as a warning instead of presenting it as a game achievement
 
 | Area | Current support |
 |---|---|
-| Region | NTSC |
-| ROM format | iNES 1.0 |
+| Region | NTSC; multi-region NES 2.0 images default to NTSC |
+| ROM format | iNES 1.0 and NES 2.0 for supported Mapper 0 boards |
 | Mapper | Mapper 0 / NROM-128 / NROM-256 |
 | Desktop | Windows x64 |
 | Controllers | Two NES controllers through keyboard and gamepads |

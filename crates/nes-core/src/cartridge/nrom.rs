@@ -31,6 +31,11 @@ impl Nrom {
             chr_is_ram,
         })
     }
+
+    pub fn load_trainer(&mut self, trainer: &[u8]) {
+        let count = trainer.len().min(512);
+        self.prg_ram[0x1000..0x1000 + count].copy_from_slice(&trainer[..count]);
+    }
 }
 
 impl Mapper for Nrom {
