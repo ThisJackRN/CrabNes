@@ -1,20 +1,46 @@
+mod axrom;
+mod cnrom;
+mod fme7;
 mod ines;
 mod mapper;
+mod mmc1;
+mod mmc2;
+mod mmc3;
+mod mmc5;
+mod n163;
 mod nrom;
+mod uxrom;
+mod vrc;
+mod vrc6;
+mod vrc7;
 
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
+use axrom::Axrom;
+use cnrom::Cnrom;
+use fme7::Fme7;
 pub use ines::{InesHeader, RomFormat, TimingMode};
 use mapper::{Mapper, MapperSnapshot};
+use mmc1::Mmc1;
+use mmc2::Mmc2;
+use mmc3::Mmc3;
+use mmc5::Mmc5;
+use n163::N163;
 use nrom::Nrom;
+use uxrom::Uxrom;
+use vrc::Vrc;
+use vrc6::Vrc6;
+use vrc7::Vrc7;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mirroring {
     Horizontal,
     Vertical,
     FourScreen,
+    SingleScreenLower,
+    SingleScreenUpper,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,12 +48,23 @@ pub enum CartridgeError {
     FileTooSmall,
     InvalidMagic,
     RomSizeOverflow,
-    Truncated { expected: usize, actual: usize },
+    Truncated {
+        expected: usize,
+        actual: usize,
+    },
     UnsupportedConsoleType(u8),
     UnsupportedTiming(TimingMode),
     UnsupportedMapper(u16),
-    UnsupportedSubmapper { mapper: u16, submapper: u8 },
+    UnsupportedSubmapper {
+        mapper: u16,
+        submapper: u8,
+    },
     InvalidNromPrgSize(usize),
+    InvalidMapperRomSize {
+        mapper: u16,
+        kind: &'static str,
+        size: usize,
+    },
 }
 
 impl fmt::Display for CartridgeError {
@@ -58,6 +95,12 @@ impl fmt::Display for CartridgeError {
             Self::InvalidNromPrgSize(size) => {
                 write!(f, "NROM PRG ROM must be 16 or 32 KiB, got {size} bytes")
             }
+            Self::InvalidMapperRomSize { mapper, kind, size } => {
+                write!(
+                    f,
+                    "mapper {mapper} has an invalid {kind} size of {size} bytes"
+                )
+            }
         }
     }
 }
@@ -67,7 +110,7 @@ impl Error for CartridgeError {}
 pub struct Cartridge {
     mapper: Box<dyn Mapper>,
     mapper_id: u16,
-    mirroring: Mirroring,
+    header_mirroring: Mirroring,
     battery_backed: bool,
 }
 
@@ -95,6 +138,85 @@ impl Cartridge {
                 }
                 Box::new(nrom)
             }
+            1 => Box::new(Mmc1::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            2 => Box::new(Uxrom::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            3 => Box::new(Cnrom::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            4 => Box::new(Mmc3::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                header.mirroring,
+                parsed.trainer.as_deref(),
+            )?),
+            5 => Box::new(Mmc5::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            7 => Box::new(Axrom::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            9 | 10 => Box::new(Mmc2::new(
+                header.mapper_id,
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            19 => Box::new(N163::new(
+                header.submapper,
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            21 | 22 | 23 | 25 => Box::new(Vrc::new(
+                header.mapper_id,
+                header.submapper,
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            24 | 26 => Box::new(Vrc6::new(
+                header.mapper_id,
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            69 => Box::new(Fme7::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
+            85 => Box::new(Vrc7::new(
+                header.submapper,
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
             mapper @ 0 => {
                 return Err(CartridgeError::UnsupportedSubmapper {
                     mapper,
@@ -107,7 +229,7 @@ impl Cartridge {
         Ok(Self {
             mapper,
             mapper_id: header.mapper_id,
-            mirroring: header.mirroring,
+            header_mirroring: header.mirroring,
             battery_backed: header.battery_backed,
         })
     }
@@ -116,7 +238,7 @@ impl Cartridge {
         self.mapper_id
     }
     pub fn mirroring(&self) -> Mirroring {
-        self.mirroring
+        self.mapper.mirroring().unwrap_or(self.header_mirroring)
     }
     pub fn has_battery(&self) -> bool {
         self.battery_backed
@@ -136,6 +258,30 @@ impl Cartridge {
     }
     pub fn ppu_write(&mut self, address: u16, value: u8) -> bool {
         self.mapper.ppu_write(address, value)
+    }
+    pub fn nametable_read(&mut self, address: u16) -> Option<u8> {
+        self.mapper.nametable_read(address)
+    }
+    pub fn nametable_write(&mut self, address: u16, value: u8) -> bool {
+        self.mapper.nametable_write(address, value)
+    }
+    pub fn nametable_ciram_index(&self, address: u16) -> Option<usize> {
+        self.mapper.nametable_ciram_index(address)
+    }
+    pub fn clock_cpu(&mut self) {
+        self.mapper.clock_cpu();
+    }
+    pub fn clock_scanline(&mut self, scanline: i16) {
+        self.mapper.clock_scanline_at(scanline);
+    }
+    pub fn irq_pending(&self) -> bool {
+        self.mapper.irq_pending()
+    }
+    pub fn expansion_audio(&self) -> f32 {
+        self.mapper.expansion_audio()
+    }
+    pub fn reset(&mut self) {
+        self.mapper.reset();
     }
     pub fn battery_ram(&self) -> Option<&[u8]> {
         self.mapper.battery_ram()
@@ -209,5 +355,45 @@ mod tests {
         rom[16] = 0x5a;
         let mut cartridge = Cartridge::from_ines(&rom).unwrap();
         assert_eq!(cartridge.cpu_read(0x7000), Some(0x5a));
+    }
+
+    fn mapper_rom(mapper: u16, prg_banks: u8, chr_banks: u8) -> Vec<u8> {
+        let mut rom =
+            vec![0; 16 + usize::from(prg_banks) * 0x4000 + usize::from(chr_banks) * 0x2000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = prg_banks;
+        rom[5] = chr_banks;
+        rom[6] = (mapper as u8 & 0x0f) << 4;
+        rom[7] = mapper as u8 & 0xf0;
+        rom
+    }
+
+    #[test]
+    fn loads_every_supported_mapper_id_from_an_ines_header() {
+        let cases = [
+            (0, 1, 1),
+            (1, 2, 1),
+            (2, 2, 0),
+            (3, 2, 2),
+            (4, 2, 1),
+            (5, 2, 1),
+            (7, 2, 0),
+            (9, 4, 2),
+            (10, 2, 2),
+            (19, 4, 1),
+            (21, 4, 1),
+            (22, 4, 1),
+            (23, 4, 1),
+            (24, 4, 1),
+            (25, 4, 1),
+            (26, 4, 1),
+            (69, 4, 1),
+            (85, 4, 1),
+        ];
+        for (mapper, prg, chr) in cases {
+            let cartridge = Cartridge::from_ines(&mapper_rom(mapper, prg, chr))
+                .unwrap_or_else(|error| panic!("mapper {mapper} did not load: {error}"));
+            assert_eq!(cartridge.mapper_id(), mapper);
+        }
     }
 }

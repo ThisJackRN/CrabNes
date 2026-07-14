@@ -8,8 +8,8 @@ audio, long smooth rewind, TAS tools, speedrun-safe play profiles, and
 RetroAchievements support.
 
 > [!IMPORTANT]
-> CrabNes currently supports NTSC iNES and NES 2.0 Mapper 0 games (NROM-128 and NROM-256).
-> More mappers and accuracy work are planned. No commercial ROMs are included;
+> CrabNes supports the major Nintendo, Konami, Sunsoft, and Namco mapper families
+> listed in the compatibility table below. Accuracy work is ongoing. No commercial ROMs are included;
 > use legally obtained games or homebrew.
 
 ## Download for Windows
@@ -27,6 +27,7 @@ run the workflow manually or [build from source](#build-from-source).
 ## What CrabNes includes
 
 - Cycle-driven NTSC 2A03 CPU, 2C02 PPU, and APU emulation.
+- Cartridge IRQs, banked RAM/ROM, dynamic mirroring, and expansion audio.
 - Native low-latency Windows audio with per-channel controls.
 - Keyboard and hot-pluggable gamepad support for two players.
 - Searchable ROM library with custom titles and cover artwork.
@@ -70,16 +71,19 @@ pins that limitation as a warning instead of presenting it as a game achievement
 | Area | Current support |
 |---|---|
 | Region | NTSC; multi-region NES 2.0 images default to NTSC |
-| ROM format | iNES 1.0 and NES 2.0 for supported Mapper 0 boards |
-| Mapper | Mapper 0 / NROM-128 / NROM-256 |
+| ROM format | iNES 1.0 and NES 2.0 for supported boards |
+| Mapper | 0 NROM; 1 MMC1; 2 UxROM; 3 CNROM; 4 MMC3; 5 MMC5; 7 AxROM; 9 MMC2; 10 MMC4; 19 Namco 163; 21/22/23/25 VRC2/VRC4; 24/26 VRC6; 69 FME-7/5B; 85 VRC7 |
+| Expansion audio | Sunsoft 5B, VRC6, Namco 163, MMC5, and VRC7 FM |
 | Desktop | Windows x64 |
 | Controllers | Two NES controllers through keyboard and gamepads |
 | Battery RAM | `.sav` beside the ROM |
 | Save states | Versioned, validated, and separated by ROM hash |
 
 The PPU is not yet dot-perfect for every sprite evaluation and fetch-pipeline
-quirk. PAL/Dendy timing, unofficial CPU opcodes, light guns, Four Score, and
-additional cartridge mappers are not implemented yet.
+quirk. MMC5 extended attributes and vertical split rendering, exact VRC7 FM
+operator/envelope behavior, and unusual board variants still need accuracy
+work. PAL/Dendy timing, unofficial CPU opcodes, light guns, Four Score, and
+cartridge families outside the table are not implemented yet.
 
 ## Controls
 

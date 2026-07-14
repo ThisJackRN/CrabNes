@@ -45,7 +45,7 @@ impl Default for Sampler {
 }
 
 impl Sampler {
-    pub(super) fn clock(&mut self, levels: Levels) -> Option<f32> {
+    pub(super) fn clock(&mut self, levels: Levels, expansion: f32) -> Option<f32> {
         // The mixer is nonlinear, so averaging each channel first (the old
         // behavior) is not equivalent and changes transients and timbre.
         let mut mixed = nonlinear_mix(
@@ -54,7 +54,7 @@ impl Sampler {
             f32::from(levels.triangle),
             f32::from(levels.noise),
             f32::from(levels.dmc),
-        );
+        ) + expansion;
         for filter in &mut self.anti_alias {
             mixed = filter.process(mixed);
         }

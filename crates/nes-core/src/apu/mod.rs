@@ -139,6 +139,10 @@ impl Apu {
     }
 
     pub fn clock(&mut self) {
+        self.clock_with_expansion(0.0);
+    }
+
+    pub(crate) fn clock_with_expansion(&mut self, expansion: f32) {
         self.cycles = self.cycles.wrapping_add(1);
 
         self.triangle.clock_timer();
@@ -162,7 +166,7 @@ impl Apu {
         self.noise.apply_length_pending();
 
         let levels = self.levels();
-        if let Some(sample) = self.sampler.clock(levels) {
+        if let Some(sample) = self.sampler.clock(levels, expansion) {
             if self.samples.len() == MAX_QUEUED_SAMPLES {
                 self.samples.pop_front();
                 self.dropped_samples = self.dropped_samples.saturating_add(1);
