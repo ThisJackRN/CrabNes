@@ -11,11 +11,14 @@ pub enum Button {
     Right = 7,
 }
 
-#[derive(Debug, Clone, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Controller {
     buttons: u8,
     shift: u8,
     strobe: bool,
+    total_reads: u64,
 }
 
 impl Controller {
@@ -44,6 +47,7 @@ impl Controller {
     }
 
     pub(crate) fn read(&mut self) -> u8 {
+        self.total_reads = self.total_reads.wrapping_add(1);
         if self.strobe {
             self.shift = self.buttons;
         }
@@ -52,6 +56,10 @@ impl Controller {
             self.shift = (self.shift >> 1) | 0x80;
         }
         value | 0x40
+    }
+
+    pub fn total_reads(&self) -> u64 {
+        self.total_reads
     }
 }
 

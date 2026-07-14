@@ -9,13 +9,15 @@ mod mixer;
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use channels::{Dmc, Noise, Pulse, Triangle};
 use mixer::{Levels, Sampler};
 
 use crate::CPU_CLOCK_HZ;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
-const MAX_QUEUED_SAMPLES: usize = 8_192;
+const MAX_QUEUED_SAMPLES: usize = OUTPUT_SAMPLE_RATE as usize * 2;
 const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
     192, 24, 72, 26, 16, 28, 32, 30,
@@ -41,8 +43,22 @@ pub struct ApuState {
     pub dmc_level: u8,
     pub frame_five_step: bool,
     pub queued_samples: usize,
+    pub channel_output_enabled: [bool; 5],
+    pub dropped_samples: u64,
 }
 
+/// Debug-only output gates. Disabling a channel here never changes its
+/// emulated registers, counters, DMA, or IRQ behavior; it only affects mixing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApuChannel {
+    Pulse1 = 0,
+    Pulse2 = 1,
+    Triangle = 2,
+    Noise = 3,
+    Dmc = 4,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Apu {
     pulse: [Pulse; 2],
     triangle: Triangle,
@@ -52,6 +68,8 @@ pub struct Apu {
     cycles: u64,
     sampler: Sampler,
     samples: VecDeque<f32>,
+    channel_output_enabled: [bool; 5],
+    dropped_samples: u64,
 }
 
 impl Default for Apu {
@@ -65,13 +83,17 @@ impl Default for Apu {
             cycles: 0,
             sampler: Sampler::default(),
             samples: VecDeque::with_capacity(MAX_QUEUED_SAMPLES),
+            channel_output_enabled: [true; 5],
+            dropped_samples: 0,
         }
     }
 }
 
 impl Apu {
     pub fn reset(&mut self) {
+        let channel_output_enabled = self.channel_output_enabled;
         *self = Self::default();
+        self.channel_output_enabled = channel_output_enabled;
     }
 
     pub fn write(&mut self, address: u16, value: u8) {
@@ -93,7 +115,7 @@ impl Apu {
                 self.pulse[1].set_enabled(value & 0x02 != 0);
                 self.triangle.set_enabled(value & 0x04 != 0);
                 self.noise.set_enabled(value & 0x08 != 0);
-                self.dmc.set_enabled(value & 0x10 != 0);
+                self.dmc.set_enabled(value & 0x10 != 0, self.cycles);
             }
             0x4017 => self.frame_counter.write(value, self.cycles),
             _ => {}
@@ -134,11 +156,16 @@ impl Apu {
         if events.half {
             self.clock_half_frame();
         }
+        self.pulse[0].apply_length_pending();
+        self.pulse[1].apply_length_pending();
+        self.triangle.apply_length_pending();
+        self.noise.apply_length_pending();
 
         let levels = self.levels();
         if let Some(sample) = self.sampler.clock(levels) {
             if self.samples.len() == MAX_QUEUED_SAMPLES {
                 self.samples.pop_front();
+                self.dropped_samples = self.dropped_samples.saturating_add(1);
             }
             self.samples.push_back(sample);
         }
@@ -160,8 +187,20 @@ impl Apu {
         destination.extend(self.samples.drain(..));
     }
 
+    pub(crate) fn clear_samples(&mut self) {
+        self.samples.clear();
+    }
+
     pub const fn sample_rate(&self) -> u32 {
         OUTPUT_SAMPLE_RATE
+    }
+
+    pub fn set_channel_output_enabled(&mut self, channel: ApuChannel, enabled: bool) {
+        self.channel_output_enabled[channel as usize] = enabled;
+    }
+
+    pub fn channel_output_enabled(&self, channel: ApuChannel) -> bool {
+        self.channel_output_enabled[channel as usize]
     }
 
     pub fn state(&self) -> ApuState {
@@ -188,16 +227,18 @@ impl Apu {
             dmc_level: self.dmc.output(),
             frame_five_step: self.frame_counter.five_step,
             queued_samples: self.samples.len(),
+            channel_output_enabled: self.channel_output_enabled,
+            dropped_samples: self.dropped_samples,
         }
     }
 
     fn levels(&self) -> Levels {
         Levels {
-            pulse_1: self.pulse[0].output(),
-            pulse_2: self.pulse[1].output(),
-            triangle: self.triangle.output(),
-            noise: self.noise.output(),
-            dmc: self.dmc.output(),
+            pulse_1: self.pulse[0].output() * u8::from(self.channel_output_enabled[0]),
+            pulse_2: self.pulse[1].output() * u8::from(self.channel_output_enabled[1]),
+            triangle: self.triangle.output() * u8::from(self.channel_output_enabled[2]),
+            noise: self.noise.output() * u8::from(self.channel_output_enabled[3]),
+            dmc: self.dmc.output() * u8::from(self.channel_output_enabled[4]),
         }
     }
 
@@ -216,23 +257,30 @@ impl Apu {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct FrameCounter {
     cycle: u32,
+    step: usize,
     five_step: bool,
     pending_five_step: bool,
     reset_delay: u8,
     irq_inhibit: bool,
     irq_flag: bool,
+    block_counter: u8,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Eq, PartialEq)]
 struct FrameEvents {
     quarter: bool,
     half: bool,
 }
 
 impl FrameCounter {
+    // Adapted from TetaNES's CPU-cycle frame sequencer (Copyright 2021
+    // Luke Petherbridge; MIT/Apache-2.0). See THIRD_PARTY_NOTICES.md.
+    const FOUR_STEP_CYCLES: [u32; 6] = [7_457, 14_913, 22_371, 29_828, 29_829, 29_830];
+    const FIVE_STEP_CYCLES: [u32; 6] = [7_457, 14_913, 22_371, 29_829, 37_281, 37_282];
+
     fn write(&mut self, value: u8, cpu_cycles: u64) {
         self.pending_five_step = value & 0x80 != 0;
         self.irq_inhibit = value & 0x40 != 0;
@@ -244,36 +292,56 @@ impl FrameCounter {
 
     fn clock(&mut self) -> FrameEvents {
         self.cycle += 1;
+        let mut events = FrameEvents::default();
+        let step_cycles = if self.five_step {
+            Self::FIVE_STEP_CYCLES
+        } else {
+            Self::FOUR_STEP_CYCLES
+        };
+
+        if self.cycle == step_cycles[self.step] {
+            if !self.five_step && self.step >= 3 && !self.irq_inhibit {
+                // The four-step sequencer asserts its IRQ across the final
+                // three CPU clocks, matching the hardware-visible race window.
+                self.irq_flag = true;
+            }
+            if self.block_counter == 0 {
+                match self.step {
+                    0 | 2 => events.quarter = true,
+                    1 | 4 => {
+                        events.quarter = true;
+                        events.half = true;
+                    }
+                    _ => {}
+                }
+                if events.quarter {
+                    self.block_counter = 2;
+                }
+            }
+            self.step += 1;
+            if self.step == step_cycles.len() {
+                self.step = 0;
+                self.cycle = 0;
+            }
+        }
+
         if self.reset_delay > 0 {
             self.reset_delay -= 1;
             if self.reset_delay == 0 {
                 self.five_step = self.pending_five_step;
+                self.step = 0;
                 self.cycle = 0;
-                return FrameEvents {
-                    quarter: self.five_step,
-                    half: self.five_step,
-                };
+                if self.five_step && self.block_counter == 0 {
+                    events.quarter = true;
+                    events.half = true;
+                    self.block_counter = 2;
+                }
             }
         }
-
-        let quarter = if self.five_step {
-            matches!(self.cycle, 3729 | 7457 | 11186 | 18641)
-        } else {
-            matches!(self.cycle, 3729 | 7457 | 11186 | 14915)
-        };
-        let half = if self.five_step {
-            matches!(self.cycle, 7457 | 18641)
-        } else {
-            matches!(self.cycle, 7457 | 14915)
-        };
-        if !self.five_step && self.cycle == 14915 && !self.irq_inhibit {
-            self.irq_flag = true;
+        if self.block_counter > 0 {
+            self.block_counter -= 1;
         }
-        let end = if self.five_step { 18641 } else { 14915 };
-        if self.cycle >= end {
-            self.cycle = 0;
-        }
-        FrameEvents { quarter, half }
+        events
     }
 }
 
@@ -289,7 +357,7 @@ mod tests {
         }
         let mut samples = Vec::new();
         apu.drain_samples(&mut samples);
-        assert_eq!(samples.len(), MAX_QUEUED_SAMPLES);
+        assert_eq!(samples.len(), OUTPUT_SAMPLE_RATE as usize);
         assert!(samples.iter().all(|sample| sample.is_finite()));
     }
 
@@ -298,6 +366,7 @@ mod tests {
         let mut apu = Apu::default();
         apu.write(0x4015, 1);
         apu.write(0x4003, 0xf8);
+        apu.clock();
         assert_eq!(apu.read_status() & 1, 1);
         apu.write(0x4015, 0);
         assert_eq!(apu.read_status() & 1, 0);
@@ -346,7 +415,14 @@ mod tests {
         }
         let mut samples = Vec::new();
         apu.drain_samples(&mut samples);
-        assert!(samples.iter().all(|sample| sample.abs() < 0.001));
+        // The triangle DAC powers up at a non-zero level, so the high-pass
+        // chain correctly produces a short startup transient. Its settled tail
+        // must contain no audible DC bias.
+        assert!(
+            samples[samples.len() / 2..]
+                .iter()
+                .all(|sample| sample.abs() < 0.001)
+        );
     }
 
     #[test]
@@ -374,8 +450,87 @@ mod tests {
         apu.write(0x4012, 0x20);
         apu.write(0x4013, 0x01);
         apu.write(0x4015, 0x10);
+        assert_eq!(apu.take_dmc_dma_request(), None);
+        apu.clock();
+        apu.clock();
         assert_eq!(apu.take_dmc_dma_request(), Some(0xc800));
         apu.supply_dmc_sample(0xff);
         assert_eq!(apu.read_status() & 0x10, 0x10);
+    }
+
+    #[test]
+    fn four_step_frame_counter_uses_cpu_cycle_landmarks() {
+        let mut counter = FrameCounter::default();
+        let mut quarter_cycles = Vec::new();
+        let mut half_cycles = Vec::new();
+        for cycle in 1..=29_830 {
+            let events = counter.clock();
+            if events.quarter {
+                quarter_cycles.push(cycle);
+            }
+            if events.half {
+                half_cycles.push(cycle);
+            }
+            if cycle < 29_828 {
+                assert!(!counter.irq_flag);
+            }
+        }
+        assert_eq!(quarter_cycles, [7_457, 14_913, 22_371, 29_829]);
+        assert_eq!(half_cycles, [14_913, 29_829]);
+        assert!(counter.irq_flag);
+        assert_eq!(counter.cycle, 0);
+    }
+
+    #[test]
+    fn five_step_frame_counter_has_no_irq_and_clocks_on_write() {
+        let mut counter = FrameCounter::default();
+        counter.write(0x80, 0);
+        assert_eq!(counter.clock(), FrameEvents::default());
+        assert_eq!(counter.clock(), FrameEvents::default());
+        let immediate = counter.clock();
+        assert!(immediate.quarter && immediate.half);
+        for _ in 0..37_282 {
+            counter.clock();
+        }
+        assert!(!counter.irq_flag);
+    }
+
+    #[test]
+    fn pulse_one_negate_shift_zero_uses_ones_complement_target() {
+        let mut pulse_one = Pulse::new(true);
+        pulse_one.set_enabled(true);
+        pulse_one.write(0, 0xdf);
+        pulse_one.write(1, 0x08);
+        pulse_one.write(2, 100);
+        pulse_one.write(3, 0);
+        pulse_one.apply_length_pending();
+
+        let mut pulse_two = Pulse::new(false);
+        pulse_two.set_enabled(true);
+        pulse_two.write(0, 0xdf);
+        pulse_two.write(1, 0x08);
+        pulse_two.write(2, 100);
+        pulse_two.write(3, 0);
+        pulse_two.apply_length_pending();
+
+        assert_eq!(pulse_one.output(), 0);
+        assert_eq!(pulse_two.output(), 15);
+    }
+
+    #[test]
+    fn dmc_last_fetch_loops_or_raises_irq() {
+        let mut irq_dmc = Dmc::default();
+        irq_dmc.write_control(0x80);
+        irq_dmc.set_enabled(true, 0);
+        irq_dmc.supply_sample(0xaa);
+        assert!(irq_dmc.irq_flag());
+        assert!(!irq_dmc.active());
+
+        let mut looping_dmc = Dmc::default();
+        looping_dmc.write_control(0xc0);
+        looping_dmc.set_enabled(true, 0);
+        looping_dmc.supply_sample(0xaa);
+        assert!(!looping_dmc.irq_flag());
+        assert!(looping_dmc.active());
     }
 }
