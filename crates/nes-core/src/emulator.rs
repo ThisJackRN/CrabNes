@@ -107,30 +107,39 @@ impl Nes {
             rom_hash: hash_rom(bytes),
             rom_sha256: Sha256::digest(bytes).into(),
         };
+        nes.bus.begin_cpu_sequence();
         nes.cpu.reset(&mut nes.bus);
-        nes.bus.clock_cpu_cycles(7);
+        nes.bus.finish_cpu_sequence(7);
         Ok(nes)
     }
 
-    /// Execute one CPU instruction and advance the APU and PPU by matching clocks.
+    /// Execute one CPU instruction with each CPU bus access interleaved with
+    /// one APU clock and three NTSC PPU dots.
     pub fn step_instruction(&mut self) -> Result<u16, EmulationError> {
         if !self.powered {
             return Ok(0);
         }
-        let cycles = if self.bus.ppu.take_nmi() {
-            self.cpu.nmi(&mut self.bus)
+        self.bus.begin_cpu_sequence();
+        let cycle_result = if self.bus.ppu.take_nmi() {
+            Ok(self.cpu.nmi(&mut self.bus))
         } else if self.bus.irq_pending() {
             let irq_cycles = self.cpu.irq(&mut self.bus);
             if irq_cycles == 0 {
-                self.cpu.step(&mut self.bus)?
+                self.cpu.step(&mut self.bus)
             } else {
-                irq_cycles
+                Ok(irq_cycles)
             }
         } else {
-            self.cpu.step(&mut self.bus)?
+            self.cpu.step(&mut self.bus)
         };
-        self.bus.clock_cpu_cycles(cycles);
-        Ok(cycles)
+        let cycles = match cycle_result {
+            Ok(cycles) => cycles,
+            Err(error) => {
+                self.bus.cancel_cpu_sequence();
+                return Err(error.into());
+            }
+        };
+        Ok(self.bus.finish_cpu_sequence(cycles))
     }
 
     /// Run until the PPU completes a video frame.
@@ -147,8 +156,9 @@ impl Nes {
     /// Console reset: preserve cartridge RAM, but reset CPU/APU/PPU control state.
     pub fn reset(&mut self) {
         self.bus.reset();
+        self.bus.begin_cpu_sequence();
         self.cpu.reset(&mut self.bus);
-        self.bus.clock_cpu_cycles(7);
+        self.bus.finish_cpu_sequence(7);
         self.powered = true;
     }
 
@@ -306,6 +316,12 @@ impl Nes {
     /// and currently mapped PRG ROM are exposed at their normal CPU addresses.
     pub fn copy_achievement_memory(&self, output: &mut [u8]) {
         self.bus.copy_achievement_memory(output);
+    }
+
+    /// Read the CPU address space without triggering hardware register side
+    /// effects. Intended for test harnesses and external inspection tools.
+    pub fn peek_cpu(&self, address: u16) -> u8 {
+        self.bus.peek_cpu(address)
     }
 
     pub fn controller_reads(&self, port: usize) -> u64 {
@@ -473,6 +489,34 @@ mod tests {
         assert!(nes.debug_write_memory(MemorySpace::Palette, 0, 0xff));
         assert_eq!(nes.memory_image(MemorySpace::Palette).bytes[0], 0x3f);
         assert!(!nes.debug_write_memory(MemorySpace::CpuRam, 0x800, 0xff));
+    }
+
+    #[test]
+    fn reset_and_instructions_advance_exact_cpu_slots() {
+        let rom = test_rom(&[0xea, 0x4c, 0x00, 0x80]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert_eq!(nes.cpu_cycles(), 7);
+        assert_eq!(nes.ppu_state().scanline, -1);
+        assert_eq!(nes.ppu_state().dot, 21);
+
+        assert_eq!(nes.step_instruction().unwrap(), 2);
+        assert_eq!(nes.cpu_cycles(), 9);
+        assert_eq!(nes.ppu_state().dot, 27);
+    }
+
+    #[test]
+    fn oam_dma_stalls_before_the_next_cpu_bus_slot() {
+        // LDA #$02; STA $4014; NOP
+        let rom = test_rom(&[0xa9, 0x02, 0x8d, 0x14, 0x40, 0xea]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert_eq!(nes.step_instruction().unwrap(), 2);
+        assert_eq!(nes.step_instruction().unwrap(), 4);
+        let before_nop = nes.cpu_cycles();
+
+        assert_eq!(nes.step_instruction().unwrap(), 2);
+        // The write ended on odd CPU cycle 13, selecting the 514-cycle DMA
+        // stall. The following NOP still owns only its documented two slots.
+        assert_eq!(nes.cpu_cycles() - before_nop, 514 + 2);
     }
 
     #[test]

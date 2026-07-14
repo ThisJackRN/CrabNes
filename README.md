@@ -177,12 +177,23 @@ The headless runner can be used for smoke tests and screenshots:
 cargo run -p nes-cli --locked -- path\to\game.nes --frames 120 --screenshot frame.png
 ```
 
+Developers can run individual ROMs or recursive directories that use the
+standard blargg `$6000` pass/fail protocol:
+
+```powershell
+cargo run -p nes-cli --bin crabnes-test-rom --locked -- path\to\test-roms
+```
+
+See the [test-ROM runner guide](docs/TEST_ROMS.md) for limits, exit behavior, and
+the current cycle-scheduling accuracy boundary.
+
 ## Documentation
 
 - [TAS movie format](docs/TAS_FORMAT.md)
 - [TAS Control View and external movie conversion](docs/TAS_CONTROL_VIEW.md)
 - [CRT filters](docs/CRT_FILTER.md)
 - [Custom palettes](docs/CUSTOM_PALETTES.md)
+- [Test ROM runner and timing status](docs/TEST_ROMS.md)
 - [Third-party licenses and acknowledgements](THIRD_PARTY_NOTICES.md)
 
 ## Project layout
@@ -192,7 +203,7 @@ crates/
   nes-core/                    Platform-independent emulation core
   nes-audio-native/            Native miniaudio output
   nes-achievements-native/     Safe Rust wrapper around vendored rcheevos
-  nes-cli/                     Headless frame runner
+  nes-cli/                     Headless frame and test-ROM runners
   nes-ui/                      CrabNes desktop application
 ```
 
