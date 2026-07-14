@@ -26,9 +26,6 @@ invalid masks, missing required fields, nonsequential input rows, malformed
 embedded states, and ROM SHA-256 mismatches. A differing emulator version is a
 warning rather than an error.
 
-Movies created before the CrabNes rename with `EMULATOR MyOwnNesEmulator` remain
-compatible and load with a migration warning.
-
 ## Starting state
 
 `POWER_ON` reconstructs a fresh console from the matching ROM. `RESET` movies
