@@ -104,7 +104,9 @@ impl Mapper for Nrom {
     }
 
     fn restore_snapshot(&mut self, snapshot: &MapperSnapshot) -> bool {
-        let MapperSnapshot::Nrom(snapshot) = snapshot;
+        let MapperSnapshot::Nrom(snapshot) = snapshot else {
+            return false;
+        };
         if snapshot.prg_ram.len() != self.prg_ram.len() || snapshot.chr.len() != self.chr.len() {
             return false;
         }

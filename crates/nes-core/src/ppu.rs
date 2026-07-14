@@ -287,6 +287,9 @@ impl Ppu {
             if self.scanline == -1 && (280..=304).contains(&self.dot) {
                 self.copy_vertical_scroll();
             }
+            if self.dot == 260 {
+                cartridge.clock_scanline(self.scanline);
+            }
         }
 
         self.dot += 1;
@@ -377,8 +380,14 @@ impl Ppu {
         match address {
             0x0000..=0x1fff => cartridge.ppu_read(address).unwrap_or(0),
             0x2000..=0x3eff => {
-                let index = mirror_nametable(address, cartridge.mirroring());
-                self.nametable[index]
+                if let Some(value) = cartridge.nametable_read(address) {
+                    value
+                } else {
+                    let index = cartridge
+                        .nametable_ciram_index(address)
+                        .unwrap_or_else(|| mirror_nametable(address, cartridge.mirroring()));
+                    self.nametable[index]
+                }
             }
             _ => self.palette[mirror_palette(address)],
         }
@@ -391,8 +400,12 @@ impl Ppu {
                 cartridge.ppu_write(address, value);
             }
             0x2000..=0x3eff => {
-                let index = mirror_nametable(address, cartridge.mirroring());
-                self.nametable[index] = value;
+                if !cartridge.nametable_write(address, value) {
+                    let index = cartridge
+                        .nametable_ciram_index(address)
+                        .unwrap_or_else(|| mirror_nametable(address, cartridge.mirroring()));
+                    self.nametable[index] = value;
+                }
             }
             _ => self.palette[mirror_palette(address)] = value & 0x3f,
         }
@@ -553,6 +566,8 @@ fn mirror_nametable(address: u16, mirroring: Mirroring) -> usize {
         Mirroring::Vertical => [0, 1, 0, 1][table],
         Mirroring::Horizontal => [0, 0, 1, 1][table],
         Mirroring::FourScreen => table,
+        Mirroring::SingleScreenLower => 0,
+        Mirroring::SingleScreenUpper => 1,
     };
     physical * 0x400 + offset
 }

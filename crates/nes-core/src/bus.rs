@@ -52,6 +52,7 @@ impl Bus {
     pub fn reset(&mut self) {
         self.ppu.reset();
         self.apu.reset();
+        self.cartridge.reset();
         self.dma_stall = 0;
         self.dmc_dma = None;
         self.cpu_cycles = 0;
@@ -155,7 +156,9 @@ impl Bus {
     }
 
     fn clock_hardware_cycle(&mut self) {
-        self.apu.clock();
+        self.cartridge.clock_cpu();
+        self.apu
+            .clock_with_expansion(self.cartridge.expansion_audio());
         for _ in 0..3 {
             self.ppu.clock(&mut self.cartridge);
         }
@@ -175,7 +178,7 @@ impl Bus {
     }
 
     pub fn irq_pending(&self) -> bool {
-        self.apu.irq_pending()
+        self.apu.irq_pending() || self.cartridge.irq_pending()
     }
 
     pub fn cpu_cycles(&self) -> u64 {
