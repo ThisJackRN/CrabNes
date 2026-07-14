@@ -12,6 +12,22 @@ RetroAchievements support.
 > listed in the compatibility table below. Accuracy work is ongoing. No commercial ROMs are included;
 > use legally obtained games or homebrew.
 
+## Measured emulation accuracy
+
+**68.8% — 97 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
+
+This is CrabNes's current automated hardware-conformance test pass rate, not a
+claim that every NES game is exactly 68.8% accurate. Compatibility varies by
+game, mapper, and the hardware behavior it relies on. The score is updated only
+when it has been reproduced with the headless runner:
+
+```powershell
+cargo run --release -p nes-cli -- AccuracyCoin.nes --frames 5000 --press-start-at 120 --accuracycoin-report
+```
+
+AccuracyCoin targets the RP2A03G CPU/APU and RP2C02G PPU used by NTSC NES
+hardware. PAL support is tested separately because it uses different timing.
+
 ## Download for Windows
 
 Automated 64-bit Windows builds are available from GitHub Actions:
