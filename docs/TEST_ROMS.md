@@ -17,6 +17,28 @@ Run every `.nes` file below one or more directories:
 cargo run -p nes-cli --bin crabnes-test-rom --locked -- tests\cpu tests\ppu
 ```
 
+The runner groups results into CPU, PPU, APU, mapper, timing, input, and other
+categories and prints an accuracy summary after the individual results. To save
+the same results as a stable, machine-readable CI artifact, add:
+
+```powershell
+cargo run -p nes-cli --bin crabnes-test-rom --locked -- `
+  --json accuracy-report.json tests
+```
+
+The JSON document contains schema version 1, aggregate and per-category counts,
+and each ROM's outcome, diagnostic message, cycle count, instruction count, and
+reset count.
+
+AccuracyCoin uses an interactive menu instead of the blargg status protocol.
+The regular headless CLI can delay a one-frame Start press until that menu is
+ready and then print the ROM's documented result counters:
+
+```powershell
+cargo run --release -p nes-cli --locked -- path\to\AccuracyCoin.nes `
+  --frames 5000 --press-start-at 120 --accuracycoin-report
+```
+
 The default budget is 30 emulated NTSC CPU seconds. It and the number of reset
 requests a test may issue can be changed explicitly:
 
@@ -57,8 +79,12 @@ documented instruction slots are explicit idle cycles, and OAM/DMC DMA stalls
 are serviced before the next CPU bus slot.
 
 This is the scheduling foundation for cycle accuracy, not the end of the
-accuracy work. Some addressing modes still use an idle slot where hardware
-would perform a specific dummy read or write. Stable unofficial CPU opcodes and
-several PPU fetch/evaluation quirks also remain to be implemented. The test-ROM
-runner makes those gaps visible and prevents later fixes from regressing already
+accuracy work. Indexed, branch, stack, interrupt, and read-modify-write
+sequences perform their observable dummy reads and writes. Stable unofficial
+NMOS 6502 operations and JAM behavior are implemented. PPU register accesses
+cover rendering-time VRAM increments, palette-bus behavior, the VBlank/NMI
+suppression edge, rendering-time OAM restrictions, grayscale masking, and timed
+sprite-overflow evaluation. The full background/sprite fetch pipeline and the
+sprite-overflow hardware bug remain future accuracy work. The test-ROM runner
+makes those gaps visible and prevents later fixes from regressing already
 passing behavior.

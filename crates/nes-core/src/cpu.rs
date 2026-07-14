@@ -22,6 +22,7 @@ pub struct CpuState {
     pub program_counter: u16,
     pub status: u8,
     pub instructions: u64,
+    pub jammed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,18 @@ pub struct Cpu {
     pc: u16,
     status: u8,
     instructions: u64,
+    #[serde(default)]
+    jammed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum UnofficialRmw {
+    Slo,
+    Rla,
+    Sre,
+    Rra,
+    Dcp,
+    Isc,
 }
 
 impl Default for Cpu {
@@ -62,6 +75,7 @@ impl Default for Cpu {
             pc: 0,
             status: U | I,
             instructions: 0,
+            jammed: false,
         }
     }
 }
@@ -75,6 +89,7 @@ impl Cpu {
         self.status = U | I;
         self.pc = self.read_word(bus, 0xfffc);
         self.instructions = 0;
+        self.jammed = false;
     }
 
     pub fn state(&self) -> CpuState {
@@ -86,10 +101,13 @@ impl Cpu {
             program_counter: self.pc,
             status: self.status,
             instructions: self.instructions,
+            jammed: self.jammed,
         }
     }
 
     pub fn nmi(&mut self, bus: &mut Bus) -> u16 {
+        bus.read(self.pc);
+        bus.read(self.pc);
         self.interrupt(bus, 0xfffa, false);
         7
     }
@@ -98,13 +116,18 @@ impl Cpu {
         if self.flag(I) {
             0
         } else {
+            bus.read(self.pc);
+            bus.read(self.pc);
             self.interrupt(bus, 0xfffe, false);
             7
         }
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<u16, CpuError> {
-        let opcode_address = self.pc;
+        if self.jammed {
+            bus.read(self.pc);
+            return Ok(1);
+        }
         let opcode = self.fetch(bus);
         self.instructions = self.instructions.wrapping_add(1);
         let cycles = match opcode {
@@ -209,6 +232,7 @@ impl Cpu {
 
             // ASL
             0x0a => {
+                bus.read(self.pc);
                 self.a = self.asl(self.a);
                 2
             }
@@ -216,28 +240,28 @@ impl Cpu {
                 let a = self.zp(bus);
                 let v = bus.read(a);
                 let r = self.asl(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 5
             }
             0x16 => {
                 let a = self.zpx(bus);
                 let v = bus.read(a);
                 let r = self.asl(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x0e => {
                 let a = self.abs(bus);
                 let v = bus.read(a);
                 let r = self.asl(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x1e => {
-                let (a, _) = self.absx(bus);
+                let (a, _) = self.absx_write(bus);
                 let v = bus.read(a);
                 let r = self.asl(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 7
             }
 
@@ -266,37 +290,44 @@ impl Cpu {
             }
 
             0x00 => {
-                self.pc = self.pc.wrapping_add(1);
+                self.fetch(bus);
                 self.interrupt(bus, 0xfffe, true);
                 7
             }
 
             // Flags
             0x18 => {
+                bus.read(self.pc);
                 self.set_flag(C, false);
                 2
             }
             0xd8 => {
+                bus.read(self.pc);
                 self.set_flag(D, false);
                 2
             }
             0x58 => {
+                bus.read(self.pc);
                 self.set_flag(I, false);
                 2
             }
             0xb8 => {
+                bus.read(self.pc);
                 self.set_flag(V, false);
                 2
             }
             0x38 => {
+                bus.read(self.pc);
                 self.set_flag(C, true);
                 2
             }
             0xf8 => {
+                bus.read(self.pc);
                 self.set_flag(D, true);
                 2
             }
             0x78 => {
+                bus.read(self.pc);
                 self.set_flag(I, true);
                 2
             }
@@ -388,38 +419,44 @@ impl Cpu {
             // DEC/DEX/DEY
             0xc6 => {
                 let a = self.zp(bus);
-                let v = bus.read(a).wrapping_sub(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let old = bus.read(a);
+                let value = old.wrapping_sub(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 5
             }
             0xd6 => {
                 let a = self.zpx(bus);
-                let v = bus.read(a).wrapping_sub(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let old = bus.read(a);
+                let value = old.wrapping_sub(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 6
             }
             0xce => {
                 let a = self.abs(bus);
-                let v = bus.read(a).wrapping_sub(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let old = bus.read(a);
+                let value = old.wrapping_sub(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 6
             }
             0xde => {
-                let (a, _) = self.absx(bus);
-                let v = bus.read(a).wrapping_sub(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let (a, _) = self.absx_write(bus);
+                let old = bus.read(a);
+                let value = old.wrapping_sub(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 7
             }
             0xca => {
+                bus.read(self.pc);
                 self.x = self.x.wrapping_sub(1);
                 self.set_zn(self.x);
                 2
             }
             0x88 => {
+                bus.read(self.pc);
                 self.y = self.y.wrapping_sub(1);
                 self.set_zn(self.y);
                 2
@@ -478,38 +515,44 @@ impl Cpu {
             // INC/INX/INY
             0xe6 => {
                 let a = self.zp(bus);
-                let v = bus.read(a).wrapping_add(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let old = bus.read(a);
+                let value = old.wrapping_add(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 5
             }
             0xf6 => {
                 let a = self.zpx(bus);
-                let v = bus.read(a).wrapping_add(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let old = bus.read(a);
+                let value = old.wrapping_add(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 6
             }
             0xee => {
                 let a = self.abs(bus);
-                let v = bus.read(a).wrapping_add(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let old = bus.read(a);
+                let value = old.wrapping_add(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 6
             }
             0xfe => {
-                let (a, _) = self.absx(bus);
-                let v = bus.read(a).wrapping_add(1);
-                bus.write(a, v);
-                self.set_zn(v);
+                let (a, _) = self.absx_write(bus);
+                let old = bus.read(a);
+                let value = old.wrapping_add(1);
+                Self::rmw_write(bus, a, old, value);
+                self.set_zn(value);
                 7
             }
             0xe8 => {
+                bus.read(self.pc);
                 self.x = self.x.wrapping_add(1);
                 self.set_zn(self.x);
                 2
             }
             0xc8 => {
+                bus.read(self.pc);
                 self.y = self.y.wrapping_add(1);
                 self.set_zn(self.y);
                 2
@@ -526,9 +569,11 @@ impl Cpu {
                 5
             }
             0x20 => {
-                let target = self.abs(bus);
-                self.push_word(bus, self.pc.wrapping_sub(1));
-                self.pc = target;
+                let low = self.fetch(bus) as u16;
+                bus.read(0x0100 | self.sp as u16);
+                self.push_word(bus, self.pc);
+                let high = self.fetch(bus) as u16;
+                self.pc = (high << 8) | low;
                 6
             }
 
@@ -643,6 +688,7 @@ impl Cpu {
 
             // LSR
             0x4a => {
+                bus.read(self.pc);
                 self.a = self.lsr(self.a);
                 2
             }
@@ -650,32 +696,35 @@ impl Cpu {
                 let a = self.zp(bus);
                 let v = bus.read(a);
                 let r = self.lsr(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 5
             }
             0x56 => {
                 let a = self.zpx(bus);
                 let v = bus.read(a);
                 let r = self.lsr(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x4e => {
                 let a = self.abs(bus);
                 let v = bus.read(a);
                 let r = self.lsr(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x5e => {
-                let (a, _) = self.absx(bus);
+                let (a, _) = self.absx_write(bus);
                 let v = bus.read(a);
                 let r = self.lsr(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 7
             }
 
-            0xea => 2,
+            0xea => {
+                bus.read(self.pc);
+                2
+            }
 
             // ORA
             0x09 => {
@@ -729,25 +778,32 @@ impl Cpu {
 
             // Stack
             0x48 => {
+                bus.read(self.pc);
                 self.push(bus, self.a);
                 3
             }
             0x08 => {
+                bus.read(self.pc);
                 self.push(bus, self.status | B | U);
                 3
             }
             0x68 => {
+                bus.read(self.pc);
+                bus.read(0x0100 | self.sp as u16);
                 self.a = self.pop(bus);
                 self.set_zn(self.a);
                 4
             }
             0x28 => {
+                bus.read(self.pc);
+                bus.read(0x0100 | self.sp as u16);
                 self.status = (self.pop(bus) | U) & !B;
                 4
             }
 
             // ROL
             0x2a => {
+                bus.read(self.pc);
                 self.a = self.rol(self.a);
                 2
             }
@@ -755,32 +811,33 @@ impl Cpu {
                 let a = self.zp(bus);
                 let v = bus.read(a);
                 let r = self.rol(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 5
             }
             0x36 => {
                 let a = self.zpx(bus);
                 let v = bus.read(a);
                 let r = self.rol(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x2e => {
                 let a = self.abs(bus);
                 let v = bus.read(a);
                 let r = self.rol(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x3e => {
-                let (a, _) = self.absx(bus);
+                let (a, _) = self.absx_write(bus);
                 let v = bus.read(a);
                 let r = self.rol(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 7
             }
             // ROR
             0x6a => {
+                bus.read(self.pc);
                 self.a = self.ror(self.a);
                 2
             }
@@ -788,38 +845,44 @@ impl Cpu {
                 let a = self.zp(bus);
                 let v = bus.read(a);
                 let r = self.ror(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 5
             }
             0x76 => {
                 let a = self.zpx(bus);
                 let v = bus.read(a);
                 let r = self.ror(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x6e => {
                 let a = self.abs(bus);
                 let v = bus.read(a);
                 let r = self.ror(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 6
             }
             0x7e => {
-                let (a, _) = self.absx(bus);
+                let (a, _) = self.absx_write(bus);
                 let v = bus.read(a);
                 let r = self.ror(v);
-                bus.write(a, r);
+                Self::rmw_write(bus, a, v, r);
                 7
             }
 
             0x40 => {
+                bus.read(self.pc);
+                bus.read(0x0100 | self.sp as u16);
                 self.status = (self.pop(bus) | U) & !B;
                 self.pc = self.pop_word(bus);
                 6
             }
             0x60 => {
-                self.pc = self.pop_word(bus).wrapping_add(1);
+                bus.read(self.pc);
+                bus.read(0x0100 | self.sp as u16);
+                let return_address = self.pop_word(bus);
+                bus.read(return_address);
+                self.pc = return_address.wrapping_add(1);
                 6
             }
 
@@ -889,12 +952,12 @@ impl Cpu {
                 4
             }
             0x9d => {
-                let (a, _) = self.absx(bus);
+                let (a, _) = self.absx_write(bus);
                 bus.write(a, self.a);
                 5
             }
             0x99 => {
-                let (a, _) = self.absy(bus);
+                let (a, _) = self.absy_write(bus);
                 bus.write(a, self.a);
                 5
             }
@@ -904,7 +967,7 @@ impl Cpu {
                 6
             }
             0x91 => {
-                let (a, _) = self.indy(bus);
+                let (a, _) = self.indy_write(bus);
                 bus.write(a, self.a);
                 6
             }
@@ -941,63 +1004,249 @@ impl Cpu {
 
             // Transfers
             0xaa => {
+                bus.read(self.pc);
                 self.x = self.a;
                 self.set_zn(self.x);
                 2
             }
             0xa8 => {
+                bus.read(self.pc);
                 self.y = self.a;
                 self.set_zn(self.y);
                 2
             }
             0xba => {
+                bus.read(self.pc);
                 self.x = self.sp;
                 self.set_zn(self.x);
                 2
             }
             0x8a => {
+                bus.read(self.pc);
                 self.a = self.x;
                 self.set_zn(self.a);
                 2
             }
             0x9a => {
+                bus.read(self.pc);
                 self.sp = self.x;
                 2
             }
             0x98 => {
+                bus.read(self.pc);
                 self.a = self.y;
                 self.set_zn(self.a);
                 2
             }
 
+            // Stable NMOS 6502 unofficial read-modify-write combinations.
+            0x03 | 0x07 | 0x0f | 0x13 | 0x17 | 0x1b | 0x1f | 0x23 | 0x27 | 0x2f | 0x33 | 0x37
+            | 0x3b | 0x3f | 0x43 | 0x47 | 0x4f | 0x53 | 0x57 | 0x5b | 0x5f | 0x63 | 0x67 | 0x6f
+            | 0x73 | 0x77 | 0x7b | 0x7f | 0xc3 | 0xc7 | 0xcf | 0xd3 | 0xd7 | 0xdb | 0xdf | 0xe3
+            | 0xe7 | 0xef | 0xf3 | 0xf7 | 0xfb | 0xff => {
+                let operation = match opcode & 0xe0 {
+                    0x00 => UnofficialRmw::Slo,
+                    0x20 => UnofficialRmw::Rla,
+                    0x40 => UnofficialRmw::Sre,
+                    0x60 => UnofficialRmw::Rra,
+                    0xc0 => UnofficialRmw::Dcp,
+                    0xe0 => UnofficialRmw::Isc,
+                    _ => unreachable!(),
+                };
+                self.unofficial_rmw(bus, opcode, operation)
+            }
+
+            // LAX: load A and X together.
+            0xa3 | 0xa7 | 0xaf | 0xb3 | 0xb7 | 0xbf => {
+                let (address, cycles) = match opcode {
+                    0xa3 => (self.indx(bus), 6),
+                    0xa7 => (self.zp(bus), 3),
+                    0xaf => (self.abs(bus), 4),
+                    0xb3 => {
+                        let (address, crossed) = self.indy(bus);
+                        (address, 5 + crossed as u16)
+                    }
+                    0xb7 => (self.zpy(bus), 4),
+                    0xbf => {
+                        let (address, crossed) = self.absy(bus);
+                        (address, 4 + crossed as u16)
+                    }
+                    _ => unreachable!(),
+                };
+                let value = bus.read(address);
+                self.a = value;
+                self.x = value;
+                self.set_zn(value);
+                cycles
+            }
+
+            // SAX: store A & X without changing flags.
+            0x83 | 0x87 | 0x8f | 0x97 => {
+                let (address, cycles) = match opcode {
+                    0x83 => (self.indx(bus), 6),
+                    0x87 => (self.zp(bus), 3),
+                    0x8f => (self.abs(bus), 4),
+                    0x97 => (self.zpy(bus), 4),
+                    _ => unreachable!(),
+                };
+                bus.write(address, self.a & self.x);
+                cycles
+            }
+
+            // Immediate stable unofficial operations.
+            0x0b | 0x2b => {
+                self.a &= self.fetch(bus);
+                self.set_zn(self.a);
+                self.set_flag(C, self.a & 0x80 != 0);
+                2
+            }
+            0x4b => {
+                self.a &= self.fetch(bus);
+                self.a = self.lsr(self.a);
+                2
+            }
+            0x6b => {
+                self.a &= self.fetch(bus);
+                let carry_in = u8::from(self.flag(C)) << 7;
+                self.a = (self.a >> 1) | carry_in;
+                self.set_zn(self.a);
+                self.set_flag(C, self.a & 0x40 != 0);
+                self.set_flag(V, ((self.a >> 6) ^ (self.a >> 5)) & 1 != 0);
+                2
+            }
+            0xcb => {
+                let left = self.a & self.x;
+                let right = self.fetch(bus);
+                self.x = left.wrapping_sub(right);
+                self.set_flag(C, left >= right);
+                self.set_zn(self.x);
+                2
+            }
+            0xbb => {
+                let (address, crossed) = self.absy(bus);
+                let value = bus.read(address) & self.sp;
+                self.a = value;
+                self.x = value;
+                self.sp = value;
+                self.set_zn(value);
+                4 + crossed as u16
+            }
+
+            // Unstable NMOS stores. With no DMC interruption on the penultimate
+            // cycle, the value is masked by the literal address high byte + 1.
+            // On a page crossing, that same value also replaces the effective
+            // address high byte.
+            0x93 => {
+                let (base, address, crossed) = self.indy_store(bus);
+                let unmasked_value = self.a & self.x;
+                let value = unmasked_value & Self::unstable_store_mask(base);
+                bus.write_unstable_store(
+                    Self::unstable_store_address(address, crossed, value),
+                    value,
+                    address,
+                    unmasked_value,
+                );
+                6
+            }
+            0x9f => {
+                let (base, address, crossed) = self.absy_store(bus);
+                let unmasked_value = self.a & self.x;
+                let value = unmasked_value & Self::unstable_store_mask(base);
+                bus.write_unstable_store(
+                    Self::unstable_store_address(address, crossed, value),
+                    value,
+                    address,
+                    unmasked_value,
+                );
+                5
+            }
+            0x9b => {
+                let (base, address, crossed) = self.absy_store(bus);
+                self.sp = self.a & self.x;
+                let value = self.sp & Self::unstable_store_mask(base);
+                bus.write_unstable_store(
+                    Self::unstable_store_address(address, crossed, value),
+                    value,
+                    address,
+                    self.sp,
+                );
+                5
+            }
+            0x9c => {
+                let (base, address, crossed) = self.absx_store(bus);
+                let value = self.y & Self::unstable_store_mask(base);
+                bus.write_unstable_store(
+                    Self::unstable_store_address(address, crossed, value),
+                    value,
+                    address,
+                    self.y,
+                );
+                5
+            }
+            0x9e => {
+                let (base, address, crossed) = self.absy_store(bus);
+                let value = self.x & Self::unstable_store_mask(base);
+                bus.write_unstable_store(
+                    Self::unstable_store_address(address, crossed, value),
+                    value,
+                    address,
+                    self.x,
+                );
+                5
+            }
+
+            // XAA is analog-sensitive on real NMOS parts; 0xEE is the commonly
+            // observed RP2A03 magic constant. Immediate LAX uses the behavior
+            // accepted by current RP2A03 accuracy tests.
+            0x8b => {
+                let value = (self.a | 0xee) & self.x & self.fetch(bus);
+                self.a = value;
+                self.set_zn(value);
+                2
+            }
+            0xab => {
+                let value = self.fetch(bus);
+                self.a = value;
+                self.x = value;
+                self.set_zn(value);
+                2
+            }
+            // KIL/JAM locks the CPU until reset while the rest of the machine
+            // continues to receive clocks.
+            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xb2 | 0xd2 | 0xf2 => {
+                self.jammed = true;
+                bus.read(self.pc);
+                2
+            }
+
             // Harmless unofficial NOP encodings frequently used by test/homebrew ROMs.
-            0x1a | 0x3a | 0x5a | 0x7a | 0xda | 0xfa => 2,
+            0x1a | 0x3a | 0x5a | 0x7a | 0xda | 0xfa => {
+                bus.read(self.pc);
+                2
+            }
             0x80 | 0x82 | 0x89 | 0xc2 | 0xe2 => {
                 self.fetch(bus);
                 2
             }
             0x04 | 0x44 | 0x64 => {
-                self.fetch(bus);
+                let address = self.zp(bus);
+                bus.read(address);
                 3
             }
             0x14 | 0x34 | 0x54 | 0x74 | 0xd4 | 0xf4 => {
-                self.fetch(bus);
+                let address = self.zpx(bus);
+                bus.read(address);
                 4
             }
             0x0c => {
-                self.abs(bus);
+                let address = self.abs(bus);
+                bus.read(address);
                 4
             }
             0x1c | 0x3c | 0x5c | 0x7c | 0xdc | 0xfc => {
-                let (_, p) = self.absx(bus);
+                let (address, p) = self.absx(bus);
+                bus.read(address);
                 4 + p as u16
-            }
-
-            _ => {
-                return Err(CpuError {
-                    opcode,
-                    address: opcode_address,
-                });
             }
         };
         Ok(cycles)
@@ -1012,10 +1261,14 @@ impl Cpu {
         self.fetch(bus) as u16
     }
     fn zpx(&mut self, bus: &mut Bus) -> u16 {
-        self.fetch(bus).wrapping_add(self.x) as u16
+        let base = self.fetch(bus);
+        bus.read(base as u16);
+        base.wrapping_add(self.x) as u16
     }
     fn zpy(&mut self, bus: &mut Bus) -> u16 {
-        self.fetch(bus).wrapping_add(self.y) as u16
+        let base = self.fetch(bus);
+        bus.read(base as u16);
+        base.wrapping_add(self.y) as u16
     }
     fn abs(&mut self, bus: &mut Bus) -> u16 {
         let lo = self.fetch(bus) as u16;
@@ -1025,15 +1278,39 @@ impl Cpu {
     fn absx(&mut self, bus: &mut Bus) -> (u16, bool) {
         let base = self.abs(bus);
         let address = base.wrapping_add(self.x as u16);
-        (address, base & 0xff00 != address & 0xff00)
+        let page_crossed = base & 0xff00 != address & 0xff00;
+        if page_crossed {
+            bus.read((base & 0xff00) | (address & 0x00ff));
+        }
+        (address, page_crossed)
     }
     fn absy(&mut self, bus: &mut Bus) -> (u16, bool) {
         let base = self.abs(bus);
         let address = base.wrapping_add(self.y as u16);
-        (address, base & 0xff00 != address & 0xff00)
+        let page_crossed = base & 0xff00 != address & 0xff00;
+        if page_crossed {
+            bus.read((base & 0xff00) | (address & 0x00ff));
+        }
+        (address, page_crossed)
+    }
+    fn absx_write(&mut self, bus: &mut Bus) -> (u16, bool) {
+        let (address, page_crossed) = self.absx(bus);
+        if !page_crossed {
+            bus.read(address);
+        }
+        (address, page_crossed)
+    }
+    fn absy_write(&mut self, bus: &mut Bus) -> (u16, bool) {
+        let (address, page_crossed) = self.absy(bus);
+        if !page_crossed {
+            bus.read(address);
+        }
+        (address, page_crossed)
     }
     fn indx(&mut self, bus: &mut Bus) -> u16 {
-        let pointer = self.fetch(bus).wrapping_add(self.x);
+        let base = self.fetch(bus);
+        bus.read(base as u16);
+        let pointer = base.wrapping_add(self.x);
         let lo = bus.read(pointer as u16) as u16;
         let hi = bus.read(pointer.wrapping_add(1) as u16) as u16;
         (hi << 8) | lo
@@ -1044,7 +1321,51 @@ impl Cpu {
         let hi = bus.read(pointer.wrapping_add(1) as u16) as u16;
         let base = (hi << 8) | lo;
         let address = base.wrapping_add(self.y as u16);
-        (address, base & 0xff00 != address & 0xff00)
+        let page_crossed = base & 0xff00 != address & 0xff00;
+        if page_crossed {
+            bus.read((base & 0xff00) | (address & 0x00ff));
+        }
+        (address, page_crossed)
+    }
+    fn indy_write(&mut self, bus: &mut Bus) -> (u16, bool) {
+        let (address, page_crossed) = self.indy(bus);
+        if !page_crossed {
+            bus.read(address);
+        }
+        (address, page_crossed)
+    }
+    fn absx_store(&mut self, bus: &mut Bus) -> (u16, u16, bool) {
+        self.abs_indexed_store(bus, self.x)
+    }
+    fn absy_store(&mut self, bus: &mut Bus) -> (u16, u16, bool) {
+        self.abs_indexed_store(bus, self.y)
+    }
+    fn abs_indexed_store(&mut self, bus: &mut Bus, index: u8) -> (u16, u16, bool) {
+        let base = self.abs(bus);
+        let address = base.wrapping_add(index as u16);
+        let page_crossed = base & 0xff00 != address & 0xff00;
+        bus.read((base & 0xff00) | (address & 0x00ff));
+        (base, address, page_crossed)
+    }
+    fn indy_store(&mut self, bus: &mut Bus) -> (u16, u16, bool) {
+        let pointer = self.fetch(bus);
+        let lo = bus.read(pointer as u16) as u16;
+        let hi = bus.read(pointer.wrapping_add(1) as u16) as u16;
+        let base = (hi << 8) | lo;
+        let address = base.wrapping_add(self.y as u16);
+        let page_crossed = base & 0xff00 != address & 0xff00;
+        bus.read((base & 0xff00) | (address & 0x00ff));
+        (base, address, page_crossed)
+    }
+    fn unstable_store_mask(base: u16) -> u8 {
+        ((base >> 8) as u8).wrapping_add(1)
+    }
+    fn unstable_store_address(address: u16, page_crossed: bool, value: u8) -> u16 {
+        if page_crossed {
+            (u16::from(value) << 8) | (address & 0x00ff)
+        } else {
+            address
+        }
     }
     fn read_word(&mut self, bus: &mut Bus, address: u16) -> u16 {
         bus.read(address) as u16 | ((bus.read(address.wrapping_add(1)) as u16) << 8)
@@ -1131,6 +1452,59 @@ impl Cpu {
         self.set_zn(r);
         r
     }
+    fn unofficial_rmw(&mut self, bus: &mut Bus, opcode: u8, operation: UnofficialRmw) -> u16 {
+        let (address, cycles) = match opcode & 0x1f {
+            0x03 => (self.indx(bus), 8),
+            0x07 => (self.zp(bus), 5),
+            0x0f => (self.abs(bus), 6),
+            0x13 => {
+                let (address, _) = self.indy_write(bus);
+                (address, 8)
+            }
+            0x17 => (self.zpx(bus), 6),
+            0x1b => {
+                let (address, _) = self.absy_write(bus);
+                (address, 7)
+            }
+            0x1f => {
+                let (address, _) = self.absx_write(bus);
+                (address, 7)
+            }
+            _ => unreachable!(),
+        };
+        let old = bus.read(address);
+        let value = match operation {
+            UnofficialRmw::Slo => self.asl(old),
+            UnofficialRmw::Rla => self.rol(old),
+            UnofficialRmw::Sre => self.lsr(old),
+            UnofficialRmw::Rra => self.ror(old),
+            UnofficialRmw::Dcp => old.wrapping_sub(1),
+            UnofficialRmw::Isc => old.wrapping_add(1),
+        };
+        Self::rmw_write(bus, address, old, value);
+        match operation {
+            UnofficialRmw::Slo => {
+                self.a |= value;
+                self.set_zn(self.a);
+            }
+            UnofficialRmw::Rla => {
+                self.a &= value;
+                self.set_zn(self.a);
+            }
+            UnofficialRmw::Sre => {
+                self.a ^= value;
+                self.set_zn(self.a);
+            }
+            UnofficialRmw::Rra => self.adc(value),
+            UnofficialRmw::Dcp => self.compare(self.a, value),
+            UnofficialRmw::Isc => self.sbc(value),
+        }
+        cycles
+    }
+    fn rmw_write(bus: &mut Bus, address: u16, old: u8, new: u8) {
+        bus.write(address, old);
+        bus.write(address, new);
+    }
     fn branch(&mut self, bus: &mut Bus, condition: bool) -> u16 {
         let offset = self.fetch(bus) as i8;
         if !condition {
@@ -1138,7 +1512,12 @@ impl Cpu {
         }
         let old = self.pc;
         self.pc = self.pc.wrapping_add_signed(offset as i16);
-        3 + (old & 0xff00 != self.pc & 0xff00) as u16
+        bus.read(old);
+        let page_crossed = old & 0xff00 != self.pc & 0xff00;
+        if page_crossed {
+            bus.read((old & 0xff00) | (self.pc & 0x00ff));
+        }
+        3 + page_crossed as u16
     }
     fn interrupt(&mut self, bus: &mut Bus, vector: u16, software: bool) {
         self.push_word(bus, self.pc);

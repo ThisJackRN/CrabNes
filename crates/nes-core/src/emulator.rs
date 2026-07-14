@@ -20,7 +20,7 @@ pub enum EmulationError {
 }
 
 const STATE_MAGIC: &[u8; 8] = b"MONESST\0";
-pub const SAVE_STATE_VERSION: u32 = 1;
+pub const SAVE_STATE_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub enum StateError {
@@ -384,6 +384,177 @@ mod tests {
         assert_eq!(state.a, 0x40);
         assert_eq!(state.x, 0x41);
         assert_eq!(state.program_counter, 0x8004);
+    }
+
+    #[test]
+    fn stable_unofficial_rmw_opcodes_update_memory_and_accumulator() {
+        let cases = [
+            (0x07, 0x01, 0x80, false, 0x01, 0x00), // SLO
+            (0x27, 0xff, 0x80, true, 0x01, 0x01),  // RLA
+            (0x47, 0x01, 0x03, false, 0x00, 0x01), // SRE
+            (0x67, 0x00, 0x01, false, 0x01, 0x00), // RRA
+            (0xc7, 0x04, 0x04, false, 0x04, 0x03), // DCP
+            (0xe7, 0x05, 0x01, true, 0x03, 0x02),  // ISC
+        ];
+        for (opcode, accumulator, memory, carry, expected_a, expected_memory) in cases {
+            let rom = test_rom(&[
+                0xa9,
+                accumulator,
+                if carry { 0x38 } else { 0x18 },
+                opcode,
+                0x10,
+            ]);
+            let mut nes = Nes::from_ines(&rom).unwrap();
+            assert!(nes.debug_write_memory(MemorySpace::CpuRam, 0x10, memory));
+            nes.step_instruction().unwrap();
+            nes.step_instruction().unwrap();
+            nes.step_instruction().unwrap();
+            assert_eq!(nes.cpu_state().a, expected_a, "opcode ${opcode:02X}");
+            assert_eq!(nes.peek_cpu(0x10), expected_memory, "opcode ${opcode:02X}");
+        }
+    }
+
+    #[test]
+    fn stable_unofficial_load_store_and_immediate_opcodes_execute() {
+        // LDA #$CC; LDX #$0F; SAX $10; LAX $10; ANC #$08; AXS #$03
+        let rom = test_rom(&[
+            0xa9, 0xcc, 0xa2, 0x0f, 0x87, 0x10, 0xa7, 0x10, 0x0b, 0x08, 0xcb, 0x03,
+        ]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        for _ in 0..6 {
+            nes.step_instruction().unwrap();
+        }
+        assert_eq!(nes.peek_cpu(0x10), 0x0c);
+        assert_eq!(nes.cpu_state().a, 0x08);
+        assert_eq!(nes.cpu_state().x, 0x05);
+    }
+
+    #[test]
+    fn unstable_unofficial_stores_execute_with_nmos_address_masking() {
+        type StoreCase<'a> = (&'a [u8], Option<(u16, u8)>, u16, u8);
+        let cases: &[StoreCase<'_>] = &[
+            // AHX ($10),Y with a $02FE pointer.
+            (
+                &[0xa9, 0xff, 0xa2, 0x0f, 0xa0, 0x01, 0x93, 0x10],
+                Some((0x10, 0xfe)),
+                0x02ff,
+                0x03,
+            ),
+            // AHX/TAS/SHX absolute,Y and SHY absolute,X.
+            (
+                &[0xa9, 0xff, 0xa2, 0x0f, 0xa0, 0x01, 0x9f, 0xfe, 0x02],
+                None,
+                0x02ff,
+                0x03,
+            ),
+            (
+                &[0xa9, 0xff, 0xa2, 0x0f, 0xa0, 0x01, 0x9b, 0xfe, 0x02],
+                None,
+                0x02ff,
+                0x03,
+            ),
+            (
+                &[0xa2, 0x01, 0xa0, 0x0f, 0x9c, 0xfe, 0x02],
+                None,
+                0x02ff,
+                0x03,
+            ),
+            (
+                &[0xa2, 0x0f, 0xa0, 0x01, 0x9e, 0xfe, 0x02],
+                None,
+                0x02ff,
+                0x03,
+            ),
+            // A crossing SHY replaces the effective high byte with its value.
+            (
+                &[0xa2, 0x01, 0xa0, 0x01, 0x9c, 0xff, 0x02],
+                None,
+                0x0100,
+                0x01,
+            ),
+        ];
+
+        for (program, pointer, address, expected) in cases {
+            let rom = test_rom(program);
+            let mut nes = Nes::from_ines(&rom).unwrap();
+            if let Some((offset, low)) = pointer {
+                assert!(nes.debug_write_memory(MemorySpace::CpuRam, *offset as usize, *low));
+                assert!(nes.debug_write_memory(MemorySpace::CpuRam, *offset as usize + 1, 0x02));
+            }
+            while nes.cpu_state().program_counter < 0x8000 + program.len() as u16 {
+                nes.step_instruction().unwrap();
+            }
+            assert_eq!(nes.peek_cpu(*address), *expected, "program {program:02X?}");
+        }
+    }
+
+    #[test]
+    fn remaining_unofficial_immediates_execute_without_stopping() {
+        // XAA #$F0; LAX #$0F; SEC; SBC #$01 through the alternate $EB encoding.
+        let rom = test_rom(&[
+            0xa9, 0xff, 0xa2, 0x3c, 0x8b, 0xf0, 0xab, 0x0f, 0x38, 0xeb, 0x01,
+        ]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        for _ in 0..6 {
+            nes.step_instruction().unwrap();
+        }
+        let state = nes.cpu_state();
+        assert_eq!(state.a, 0x0e);
+        assert_eq!(state.x, 0x0f);
+    }
+
+    #[test]
+    fn jam_opcode_holds_the_cpu_until_reset() {
+        let rom = test_rom(&[0x02, 0xa9, 0x55]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert_eq!(nes.step_instruction().unwrap(), 2);
+        let jammed = nes.cpu_state();
+        assert!(jammed.jammed);
+        assert_eq!(jammed.program_counter, 0x8001);
+        assert_eq!(nes.step_instruction().unwrap(), 1);
+        assert_eq!(nes.cpu_state().program_counter, 0x8001);
+        assert_eq!(nes.cpu_state().a, 0);
+        nes.reset();
+        assert!(!nes.cpu_state().jammed);
+    }
+
+    #[test]
+    fn every_supported_opcode_completes_its_declared_bus_sequence() {
+        for opcode in 0_u8..=u8::MAX {
+            let rom = test_rom(&[opcode, 0x00, 0x00]);
+            let mut nes = Nes::from_ines(&rom).unwrap();
+            if let Ok(cycles) = nes.step_instruction() {
+                assert!((1..=8).contains(&cycles), "opcode ${opcode:02X}");
+            }
+        }
+    }
+
+    #[test]
+    fn jmp_indirect_reproduces_the_6502_page_wrap() {
+        let rom = test_rom(&[0x6c, 0xff, 0x02]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert!(nes.debug_write_memory(MemorySpace::CpuRam, 0x02ff, 0x34));
+        assert!(nes.debug_write_memory(MemorySpace::CpuRam, 0x0200, 0x12));
+        assert!(nes.debug_write_memory(MemorySpace::CpuRam, 0x0300, 0x56));
+        nes.step_instruction().unwrap();
+        assert_eq!(nes.cpu_state().program_counter, 0x1234);
+    }
+
+    #[test]
+    fn both_controller_ports_are_independently_readable() {
+        let rom = test_rom(&[
+            0xa9, 0x01, 0x8d, 0x16, 0x40, 0xa9, 0x00, 0x8d, 0x16, 0x40, 0xad, 0x16, 0x40, 0x85,
+            0x00, 0xad, 0x17, 0x40, 0x85, 0x01,
+        ]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        nes.controller_mut(1)
+            .unwrap()
+            .set_button(crate::Button::A, true);
+        for _ in 0..8 {
+            nes.step_instruction().unwrap();
+        }
+        assert_eq!(nes.peek_cpu(0) & 1, 0);
+        assert_eq!(nes.peek_cpu(1) & 1, 1);
     }
 
     #[test]

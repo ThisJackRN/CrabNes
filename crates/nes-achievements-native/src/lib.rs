@@ -103,6 +103,7 @@ unsafe extern "C" {
     ) -> usize;
     fn nes_ra_is_game_loaded(client: *mut NativeClient) -> c_int;
     fn nes_ra_is_hardcore(client: *mut NativeClient) -> c_int;
+    fn nes_ra_hash_nes_game(data: *const u8, size: usize, hash: *mut c_char) -> c_int;
 }
 
 #[derive(Debug, Clone)]
@@ -425,9 +426,15 @@ fn char_buffer(buffer: &[c_char]) -> String {
         .into_owned()
 }
 
+pub fn hash_nes_game(data: &[u8]) -> Option<String> {
+    let mut hash = [0; 33];
+    (unsafe { nes_ra_hash_nes_game(data.as_ptr(), data.len(), hash.as_mut_ptr()) } != 0)
+        .then(|| char_buffer(&hash))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Client, EventKind};
+    use super::{Client, EventKind, hash_nes_game};
 
     #[test]
     fn client_starts_in_hardcore_without_a_loaded_game() {
@@ -450,5 +457,16 @@ mod tests {
             .expect("failed login should produce an event");
         assert_eq!(event.kind, EventKind::Login);
         assert_ne!(event.result, 0);
+    }
+
+    #[test]
+    fn hashes_nes_roms_for_library_lookup() {
+        let mut rom = vec![0; 16 + 0x4000 + 0x2000];
+        rom[..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        rom[5] = 1;
+        let hash = hash_nes_game(&rom).expect("valid NES image should hash");
+        assert_eq!(hash.len(), 32);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 }

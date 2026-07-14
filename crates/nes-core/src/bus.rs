@@ -16,7 +16,12 @@ pub struct Bus {
     dma_stall: u16,
     dmc_dma: Option<DmcDma>,
     cpu_cycles: u64,
+    /// Data latch inside the 2A03. A $4015 read affects this latch without
+    /// driving the cartridge-side CPU data bus.
+    internal_data_bus: u8,
+    /// Last value driven on the cartridge-side CPU data bus.
     open_bus: u8,
+    dmc_completed_last_cpu_slot: bool,
     cpu_sequence_cycles: u16,
 }
 
@@ -30,7 +35,9 @@ pub(crate) struct BusSnapshot {
     dma_stall: u16,
     dmc_dma: Option<DmcDma>,
     cpu_cycles: u64,
+    internal_data_bus: u8,
     open_bus: u8,
+    dmc_completed_last_cpu_slot: bool,
 }
 
 impl Bus {
@@ -45,7 +52,9 @@ impl Bus {
             dma_stall: 0,
             dmc_dma: None,
             cpu_cycles: 0,
+            internal_data_bus: 0,
             open_bus: 0,
+            dmc_completed_last_cpu_slot: false,
             cpu_sequence_cycles: 0,
         }
     }
@@ -58,7 +67,9 @@ impl Bus {
         self.dma_stall = 0;
         self.dmc_dma = None;
         self.cpu_cycles = 0;
+        self.internal_data_bus = 0;
         self.open_bus = 0;
+        self.dmc_completed_last_cpu_slot = false;
         self.cpu_sequence_cycles = 0;
     }
 
@@ -68,20 +79,29 @@ impl Bus {
     }
 
     fn read_untimed(&mut self, address: u16) -> u8 {
-        let value = if let Some(value) = self.cartridge.cpu_read(address) {
-            value
+        let (value, drives_external_bus) = if let Some(value) = self.cartridge.cpu_read(address) {
+            (value, true)
         } else {
             match address {
-                0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
-                0x2000..=0x3fff => self.ppu.cpu_read(address & 7, &mut self.cartridge),
-                // Bit 5 is not driven by the APU and retains CPU open bus.
-                0x4015 => self.apu.read_status() | (self.open_bus & 0x20),
-                0x4016 => self.controllers[0].read(),
-                0x4017 => self.controllers[1].read(),
-                _ => self.open_bus,
+                0x0000..=0x1fff => (self.ram[address as usize & 0x07ff], true),
+                0x2000..=0x3fff => (self.ppu.cpu_read(address & 7, &mut self.cartridge), true),
+                // $4015 is entirely internal to the 2A03. Bit 5 retains the
+                // internal latch, and the read does not drive the external bus.
+                0x4015 => (
+                    self.apu.read_status() | (self.internal_data_bus & 0x20),
+                    false,
+                ),
+                // The controller drives only the low serial bit. The upper
+                // three bits retain CPU open bus on an NTSC NES.
+                0x4016 => (self.controllers[0].read() | (self.open_bus & 0xe0), true),
+                0x4017 => (self.controllers[1].read() | (self.open_bus & 0xe0), true),
+                _ => (self.open_bus, false),
             }
         };
-        self.open_bus = value;
+        self.internal_data_bus = value;
+        if drives_external_bus {
+            self.open_bus = value;
+        }
         value
     }
 
@@ -91,6 +111,7 @@ impl Bus {
     }
 
     fn write_untimed(&mut self, address: u16, value: u8) {
+        self.internal_data_bus = value;
         self.open_bus = value;
         if self.cartridge.cpu_write(address, value) {
             return;
@@ -129,13 +150,16 @@ impl Bus {
         self.cpu_sequence_cycles = 0;
     }
 
-    fn advance_cpu_slot(&mut self) {
-        self.service_dma_stalls();
+    fn advance_cpu_slot(&mut self) -> bool {
+        let dmc_completed = self.service_dma_stalls();
         self.clock_hardware_cycle();
         self.cpu_sequence_cycles = self.cpu_sequence_cycles.saturating_add(1);
+        self.dmc_completed_last_cpu_slot = dmc_completed;
+        dmc_completed
     }
 
-    fn service_dma_stalls(&mut self) {
+    fn service_dma_stalls(&mut self) -> bool {
+        let mut dmc_completed = false;
         while self.dma_stall != 0 || self.dmc_dma.is_some() {
             let servicing_dmc = self.dmc_dma.is_some();
             self.clock_hardware_cycle();
@@ -148,12 +172,35 @@ impl Bus {
                 if let Some(address) = completed {
                     self.dmc_dma = None;
                     let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
+                    // The DMC owns the external CPU bus during its fetch, but
+                    // does not overwrite the 2A03's internal data latch.
                     self.open_bus = value;
                     self.apu.supply_dmc_sample(value);
+                    dmc_completed = true;
                 }
             } else {
                 self.dma_stall -= 1;
             }
+        }
+        dmc_completed
+    }
+
+    /// Complete an unstable NMOS store. A DMC DMA immediately before the
+    /// write replaces the internal high-byte mask, turning these opcodes into
+    /// their unmasked store form for that cycle.
+    pub(crate) fn write_unstable_store(
+        &mut self,
+        masked_address: u16,
+        masked_value: u8,
+        unmasked_address: u16,
+        unmasked_value: u8,
+    ) {
+        let dmc_interrupted_previous_slot = self.dmc_completed_last_cpu_slot;
+        let dmc_completed = self.advance_cpu_slot();
+        if dmc_interrupted_previous_slot || dmc_completed {
+            self.write_untimed(unmasked_address, unmasked_value);
+        } else {
+            self.write_untimed(masked_address, masked_value);
         }
     }
 
@@ -207,7 +254,9 @@ impl Bus {
             dma_stall: self.dma_stall,
             dmc_dma: self.dmc_dma,
             cpu_cycles: self.cpu_cycles,
+            internal_data_bus: self.internal_data_bus,
             open_bus: self.open_bus,
+            dmc_completed_last_cpu_slot: self.dmc_completed_last_cpu_slot,
         }
     }
 
@@ -236,7 +285,9 @@ impl Bus {
         self.dma_stall = snapshot.dma_stall;
         self.dmc_dma = snapshot.dmc_dma;
         self.cpu_cycles = snapshot.cpu_cycles;
+        self.internal_data_bus = snapshot.internal_data_bus;
         self.open_bus = snapshot.open_bus;
+        self.dmc_completed_last_cpu_slot = snapshot.dmc_completed_last_cpu_slot;
         self.cpu_sequence_cycles = 0;
         true
     }
@@ -276,6 +327,67 @@ impl Bus {
         }
         self.ppu.write_oam_dma(&data);
         self.dma_stall = 513 + (self.cpu_cycles as u16 & 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nrom_cartridge() -> Cartridge {
+        let mut rom = vec![0; 16 + 0x4000 + 0x2000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        rom[5] = 1;
+        Cartridge::from_ines(&rom).unwrap()
+    }
+
+    #[test]
+    fn controller_reads_preserve_upper_cpu_open_bus_bits() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.open_bus = 0xa0;
+        bus.internal_data_bus = 0xa0;
+        assert_eq!(bus.read_untimed(0x4016), 0xa0);
+        bus.controllers[0].set_button(crate::controller::Button::A, true);
+        bus.controllers[0].write_strobe(1);
+        bus.open_bus = 0xe0;
+        bus.internal_data_bus = 0xe0;
+        assert_eq!(bus.read_untimed(0x4016), 0xe1);
+    }
+
+    #[test]
+    fn apu_status_updates_only_the_internal_data_bus() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.open_bus = 0x40;
+        bus.internal_data_bus = 0x20;
+
+        assert_eq!(bus.read_untimed(0x4015), 0x20);
+        assert_eq!(bus.open_bus, 0x40);
+        assert_eq!(bus.internal_data_bus, 0x20);
+        assert_eq!(bus.read_untimed(0x4115), 0x40);
+    }
+
+    #[test]
+    fn dmc_interrupted_unstable_store_uses_the_unmasked_value_and_address() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.dmc_dma = Some(DmcDma {
+            address: 0x8000,
+            cycles_remaining: 1,
+        });
+
+        bus.write_unstable_store(0x0001, 0x11, 0x0002, 0x22);
+        assert_eq!(bus.ram[1], 0);
+        assert_eq!(bus.ram[2], 0x22);
+
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.dmc_dma = Some(DmcDma {
+            address: 0x8000,
+            cycles_remaining: 1,
+        });
+        bus.read(0x0000);
+        bus.write_unstable_store(0x0001, 0x11, 0x0002, 0x22);
+        assert_eq!(bus.ram[1], 0);
+        assert_eq!(bus.ram[2], 0x22);
     }
 }
 

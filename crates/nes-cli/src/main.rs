@@ -6,7 +6,7 @@ use std::{
     process::ExitCode,
 };
 
-use nes_core::{FRAME_HEIGHT, FRAME_WIDTH, Nes};
+use nes_core::{Button, FRAME_HEIGHT, FRAME_WIDTH, Nes};
 
 fn main() -> ExitCode {
     match run() {
@@ -21,13 +21,37 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(rom_path) = args.next() else {
-        return Err("usage: nes-cli <game.nes> [--frames N] [--screenshot output.png]".into());
+        return Err(
+            "usage: nes-cli <game.nes> [--frames N] [--press-start] [--press-start-at N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
+                .into(),
+        );
     };
     let mut frames = 1_u64;
     let mut screenshot = None;
+    let mut press_start_at = None;
+    let mut accuracycoin_report = false;
+    let mut peek_addresses = Vec::new();
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--frames" => frames = args.next().ok_or("--frames needs a number")?.parse()?,
+            "--press-start" => press_start_at = Some(60),
+            "--press-start-at" => {
+                press_start_at = Some(
+                    args.next()
+                        .ok_or("--press-start-at needs a frame")?
+                        .parse()?,
+                )
+            }
+            "--accuracycoin-report" => accuracycoin_report = true,
+            "--peek" => {
+                let address = args.next().ok_or("--peek needs an address")?;
+                let address = address
+                    .strip_prefix("0x")
+                    .or_else(|| address.strip_prefix("0X"))
+                    .or_else(|| address.strip_prefix('$'))
+                    .unwrap_or(&address);
+                peek_addresses.push(u16::from_str_radix(address, 16)?);
+            }
             "--screenshot" => screenshot = Some(args.next().ok_or("--screenshot needs a path")?),
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
@@ -40,7 +64,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         nes.mapper_id(),
         nes.has_battery()
     );
-    for _ in 0..frames {
+    for frame in 0..frames {
+        if press_start_at == Some(frame) {
+            nes.controller_mut(0)
+                .expect("player one controller exists")
+                .set_button(Button::Start, true);
+        } else if press_start_at.is_some_and(|start| frame == start.saturating_add(1)) {
+            nes.controller_mut(0)
+                .expect("player one controller exists")
+                .set_button(Button::Start, false);
+        }
         nes.run_frame()?;
     }
     let state = nes.cpu_state();
@@ -55,6 +88,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.stack_pointer,
         nes.cpu_cycles()
     );
+    if accuracycoin_report {
+        println!(
+            "AccuracyCoin: {}/{} passed",
+            nes.peek_cpu(0x0038),
+            nes.peek_cpu(0x0037)
+        );
+    }
+    for address in peek_addresses {
+        println!("${address:04X} = ${:02X}", nes.peek_cpu(address));
+    }
     if let Some(path) = screenshot {
         write_screenshot(Path::new(&path), &nes.frame().pixels)?;
         println!("Wrote {path}");

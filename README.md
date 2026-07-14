@@ -26,11 +26,14 @@ run the workflow manually or [build from source](#build-from-source).
 
 ## What CrabNes includes
 
-- Cycle-driven NTSC and PAL CPU, PPU, and APU emulation.
+- Cycle-driven NTSC and PAL CPU, PPU, and APU emulation, including stable
+  unofficial NMOS 6502 opcodes and observable dummy bus accesses.
 - Cartridge IRQs, banked RAM/ROM, dynamic mirroring, and expansion audio.
 - Native low-latency Windows audio with per-channel controls.
 - Keyboard and hot-pluggable gamepad support for two players.
-- Searchable ROM library with custom titles and cover artwork.
+- Searchable ROM library with custom titles, automatic RetroAchievements
+  artwork, user-selected artwork overrides, and a per-ROM accuracy estimate
+  that explains mapper and timing confidence.
 - Versioned save states with screenshots and ROM validation.
 - LZ4-compressed rewind: two minutes by default, configurable up to ten minutes.
 - TAS recording, playback, rerecording, frame editing, seeking, and checkpoints.
@@ -67,6 +70,12 @@ does not award hardcore unlocks to an unknown emulator. The Achievements window
 pins client and game-version limitations as warnings instead of presenting them
 as game achievements or unlock notifications.
 
+On startup and whenever the library is refreshed, CrabNes scans new ROMs and
+caches artwork for games recognized by RetroAchievements. This happens in the
+background without launching the game or signing in. Use **Set Custom
+Artwork…** from a library entry's menu to override it; removing the custom image
+restores the cached one.
+
 ## Compatibility
 
 | Area | Current support |
@@ -80,11 +89,13 @@ as game achievements or unlock notifications.
 | Battery RAM | `.sav` beside the ROM |
 | Save states | Versioned, validated, and separated by ROM hash |
 
-The PPU is not yet dot-perfect for every sprite evaluation and fetch-pipeline
-quirk. MMC5 extended attributes and vertical split rendering, exact VRC7 FM
-operator/envelope behavior, and unusual board variants still need accuracy
-work. PAL/Dendy timing, unofficial CPU opcodes, light guns, Four Score, and
-cartridge families outside the table are not implemented yet.
+The PPU models rendering-time VRAM increments, palette bus behavior, VBlank/NMI
+suppression, OAM access restrictions, grayscale masking, and timed sprite
+overflow, but is not yet dot-perfect for every sprite-evaluation and
+fetch-pipeline quirk. MMC5 extended attributes and vertical split rendering,
+exact VRC7 FM operator/envelope behavior, and unusual board variants still need
+accuracy work. Dendy timing, light guns, Four Score, and cartridge families
+outside the table are not implemented yet.
 
 ## Controls
 
@@ -147,7 +158,7 @@ CrabNes stores user data under:
   settings.json                 Global settings and play profile
   per-game-settings.json        ROM-specific presentation overrides
   library.json                  Library metadata and recent games
-  library-covers\               Copied custom cover artwork
+  library-covers\               Cached automatic and copied custom artwork
   achievement-archive.json      Local RetroAchievements unlock history
   palettes\                     Imported custom palettes
   states\<rom-hash>\             Save-state slots and previews

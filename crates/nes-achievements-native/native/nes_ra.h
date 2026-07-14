@@ -92,6 +92,7 @@ int nes_ra_get_game(nes_ra_client* client, nes_ra_game_out* game);
 size_t nes_ra_get_achievements(nes_ra_client* client, nes_ra_achievement_out* achievements, size_t capacity);
 int nes_ra_is_game_loaded(nes_ra_client* client);
 int nes_ra_is_hardcore(nes_ra_client* client);
+int nes_ra_hash_nes_game(const uint8_t* data, size_t size, char hash[33]);
 
 #ifdef __cplusplus
 }

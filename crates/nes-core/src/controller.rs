@@ -55,7 +55,7 @@ impl Controller {
         if !self.strobe {
             self.shift = (self.shift >> 1) | 0x80;
         }
-        value | 0x40
+        value
     }
 
     pub fn total_reads(&self) -> u64 {
