@@ -1,4 +1,5 @@
 use super::{DMC_PERIODS, LENGTH_TABLE, NOISE_PERIODS};
+use serde::{Deserialize, Serialize};
 
 const DUTY_TABLE: [[u8; 8]; 4] = [
     [0, 1, 0, 0, 0, 0, 0, 0],
@@ -11,6 +12,7 @@ const TRIANGLE_TABLE: [u8; 32] = [
     13, 14, 15,
 ];
 
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Pulse {
     enabled: bool,
     first_channel: bool,
@@ -18,7 +20,7 @@ pub(super) struct Pulse {
     sequence: u8,
     timer: u16,
     timer_counter: u16,
-    length: u8,
+    length: LengthCounter,
     envelope: Envelope,
     sweep_enabled: bool,
     sweep_period: u8,
@@ -37,7 +39,7 @@ impl Pulse {
             sequence: 0,
             timer: 0,
             timer_counter: 0,
-            length: 0,
+            length: LengthCounter::new(),
             envelope: Envelope::new(),
             sweep_enabled: false,
             sweep_period: 0,
@@ -53,6 +55,7 @@ impl Pulse {
             0 => {
                 self.duty = value >> 6;
                 self.envelope.write(value);
+                self.length.set_halt(value & 0x20 != 0);
             }
             1 => {
                 self.sweep_enabled = value & 0x80 != 0;
@@ -64,9 +67,7 @@ impl Pulse {
             2 => self.timer = (self.timer & 0x0700) | u16::from(value),
             3 => {
                 self.timer = (self.timer & 0x00ff) | ((u16::from(value) & 7) << 8);
-                if self.enabled {
-                    self.length = LENGTH_TABLE[(value >> 3) as usize];
-                }
+                self.length.write(value >> 3);
                 self.sequence = 0;
                 self.envelope.start = true;
             }
@@ -76,9 +77,7 @@ impl Pulse {
 
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-        if !enabled {
-            self.length = 0;
-        }
+        self.length.set_enabled(enabled);
     }
 
     pub(super) fn clock_timer(&mut self) {
@@ -95,9 +94,7 @@ impl Pulse {
     }
 
     pub(super) fn clock_half(&mut self) {
-        if !self.envelope.loop_flag && self.length > 0 {
-            self.length -= 1;
-        }
+        self.length.clock();
 
         if self.sweep_divider == 0 {
             if self.sweep_enabled && self.sweep_shift > 0 {
@@ -117,9 +114,6 @@ impl Pulse {
     }
 
     fn sweep_target(&self) -> u16 {
-        if self.sweep_shift == 0 && self.sweep_negate {
-            return self.timer;
-        }
         let change = self.timer >> self.sweep_shift;
         if self.sweep_negate {
             self.timer
@@ -132,7 +126,7 @@ impl Pulse {
 
     pub(super) fn output(&self) -> u8 {
         let muted = !self.enabled
-            || self.length == 0
+            || self.length.value() == 0
             || self.timer < 8
             || self.sweep_target() > 0x07ff
             || DUTY_TABLE[self.duty as usize][self.sequence as usize] == 0;
@@ -140,11 +134,15 @@ impl Pulse {
     }
 
     pub(super) fn length(&self) -> u8 {
-        self.length
+        self.length.value()
     }
 
     pub(super) fn timer(&self) -> u16 {
         self.timer
+    }
+
+    pub(super) fn apply_length_pending(&mut self) {
+        self.length.apply_pending();
     }
 
     #[cfg(test)]
@@ -159,7 +157,7 @@ impl Pulse {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct Triangle {
     enabled: bool,
     control: bool,
@@ -169,13 +167,14 @@ pub(super) struct Triangle {
     timer: u16,
     timer_counter: u16,
     sequence: u8,
-    length: u8,
+    length: LengthCounter,
 }
 
 impl Triangle {
     pub(super) fn write_control(&mut self, value: u8) {
         self.control = value & 0x80 != 0;
         self.linear_reload = value & 0x7f;
+        self.length.set_halt(self.control);
     }
 
     pub(super) fn write_timer_low(&mut self, value: u8) {
@@ -184,23 +183,22 @@ impl Triangle {
 
     pub(super) fn write_timer_high(&mut self, value: u8) {
         self.timer = (self.timer & 0x00ff) | ((u16::from(value) & 7) << 8);
-        if self.enabled {
-            self.length = LENGTH_TABLE[(value >> 3) as usize];
-        }
+        self.length.write(value >> 3);
         self.linear_reload_flag = true;
     }
 
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-        if !enabled {
-            self.length = 0;
-        }
+        self.length.set_enabled(enabled);
     }
 
     pub(super) fn clock_timer(&mut self) {
         if self.timer_counter == 0 {
             self.timer_counter = self.timer;
-            if self.length > 0 && self.linear_counter > 0 && self.timer >= 2 {
+            // The sequencer still runs for timer periods 0 and 1. On hardware
+            // those ultrasonic steps average to 7.5 through the analog filter;
+            // freezing the DAC here creates the wrong DC interaction with DMC.
+            if self.length.value() > 0 && self.linear_counter > 0 {
                 self.sequence = (self.sequence + 1) & 31;
             }
         } else {
@@ -220,9 +218,7 @@ impl Triangle {
     }
 
     pub(super) fn clock_half(&mut self) {
-        if !self.control && self.length > 0 {
-            self.length -= 1;
-        }
+        self.length.clock();
     }
 
     pub(super) fn output(&self) -> u8 {
@@ -230,11 +226,15 @@ impl Triangle {
     }
 
     pub(super) fn length(&self) -> u8 {
-        self.length
+        self.length.value()
     }
 
     pub(super) fn timer(&self) -> u16 {
         self.timer
+    }
+
+    pub(super) fn apply_length_pending(&mut self) {
+        self.length.apply_pending();
     }
 
     #[cfg(test)]
@@ -243,13 +243,14 @@ impl Triangle {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Noise {
     enabled: bool,
     mode: bool,
     period_index: u8,
     timer_counter: u16,
     shift_register: u16,
-    length: u8,
+    length: LengthCounter,
     envelope: Envelope,
 }
 
@@ -261,7 +262,7 @@ impl Default for Noise {
             period_index: 0,
             timer_counter: 0,
             shift_register: 1,
-            length: 0,
+            length: LengthCounter::new(),
             envelope: Envelope::new(),
         }
     }
@@ -270,6 +271,7 @@ impl Default for Noise {
 impl Noise {
     pub(super) fn write_control(&mut self, value: u8) {
         self.envelope.write(value);
+        self.length.set_halt(value & 0x20 != 0);
     }
 
     pub(super) fn write_period(&mut self, value: u8) {
@@ -278,17 +280,13 @@ impl Noise {
     }
 
     pub(super) fn write_length(&mut self, value: u8) {
-        if self.enabled {
-            self.length = LENGTH_TABLE[(value >> 3) as usize];
-        }
+        self.length.write(value >> 3);
         self.envelope.start = true;
     }
 
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-        if !enabled {
-            self.length = 0;
-        }
+        self.length.set_enabled(enabled);
     }
 
     pub(super) fn clock_timer(&mut self) {
@@ -307,13 +305,11 @@ impl Noise {
     }
 
     pub(super) fn clock_half(&mut self) {
-        if !self.envelope.loop_flag && self.length > 0 {
-            self.length -= 1;
-        }
+        self.length.clock();
     }
 
     pub(super) fn output(&self) -> u8 {
-        if !self.enabled || self.length == 0 || self.shift_register & 1 != 0 {
+        if !self.enabled || self.length.value() == 0 || self.shift_register & 1 != 0 {
             0
         } else {
             self.envelope.volume()
@@ -321,11 +317,15 @@ impl Noise {
     }
 
     pub(super) fn length(&self) -> u8 {
-        self.length
+        self.length.value()
     }
 
     pub(super) fn period(&self) -> u16 {
         NOISE_PERIODS[self.period_index as usize]
+    }
+
+    pub(super) fn apply_length_pending(&mut self) {
+        self.length.apply_pending();
     }
 
     #[cfg(test)]
@@ -340,6 +340,7 @@ impl Noise {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Dmc {
     enabled: bool,
     irq_enabled: bool,
@@ -357,6 +358,8 @@ pub(super) struct Dmc {
     bits_remaining: u8,
     silence: bool,
     dma_pending: bool,
+    dma_in_progress: bool,
+    start_delay: u8,
 }
 
 impl Default for Dmc {
@@ -378,6 +381,8 @@ impl Default for Dmc {
             bits_remaining: 8,
             silence: true,
             dma_pending: false,
+            dma_in_progress: false,
+            start_delay: 0,
         }
     }
 }
@@ -404,27 +409,36 @@ impl Dmc {
         self.sample_length = (u16::from(value) << 4) | 1;
     }
 
-    pub(super) fn set_enabled(&mut self, enabled: bool) {
+    pub(super) fn set_enabled(&mut self, enabled: bool, cpu_cycle: u64) {
         self.enabled = enabled;
         self.irq_flag = false;
         if enabled {
             if self.bytes_remaining == 0 {
                 self.restart_sample();
+                // Adapted from TetaNES's DMC initialization timing: enabling
+                // an empty reader does not assert DMA immediately. The request
+                // appears after 2 CPU clocks on an even cycle or 3 on an odd.
+                self.start_delay = if cpu_cycle & 1 == 0 { 2 } else { 3 };
             }
         } else {
             self.bytes_remaining = 0;
             self.dma_pending = false;
+            self.dma_in_progress = false;
+            self.start_delay = 0;
         }
     }
 
     fn restart_sample(&mut self) {
         self.current_address = self.sample_address;
         self.bytes_remaining = self.sample_length;
-        self.request_dma_if_needed();
     }
 
     fn request_dma_if_needed(&mut self) {
-        if self.enabled && self.sample_buffer.is_none() && self.bytes_remaining > 0 {
+        if self.enabled
+            && self.sample_buffer.is_none()
+            && self.bytes_remaining > 0
+            && !self.dma_in_progress
+        {
             self.dma_pending = true;
         }
     }
@@ -436,7 +450,12 @@ impl Dmc {
         } else {
             self.timer_counter -= 1;
         }
-        self.request_dma_if_needed();
+        if self.start_delay > 0 {
+            self.start_delay -= 1;
+        }
+        if self.start_delay == 0 {
+            self.request_dma_if_needed();
+        }
     }
 
     fn clock_output(&mut self) {
@@ -465,6 +484,7 @@ impl Dmc {
     pub(super) fn take_dma_request(&mut self) -> Option<u16> {
         if self.dma_pending {
             self.dma_pending = false;
+            self.dma_in_progress = true;
             Some(self.current_address)
         } else {
             None
@@ -472,6 +492,7 @@ impl Dmc {
     }
 
     pub(super) fn supply_sample(&mut self, value: u8) {
+        self.dma_in_progress = false;
         if self.bytes_remaining == 0 {
             return;
         }
@@ -508,6 +529,72 @@ impl Dmc {
     }
 }
 
+/// Length-counter write collision behavior, adapted from TetaNES's
+/// `LengthCounter` (Copyright 2021 Luke Petherbridge; MIT/Apache-2.0).
+/// See the repository's THIRD_PARTY_NOTICES.md.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct LengthCounter {
+    enabled: bool,
+    halt: bool,
+    pending_halt: bool,
+    counter: u8,
+    previous_counter: u8,
+    reload: u8,
+}
+
+impl LengthCounter {
+    const fn new() -> Self {
+        Self {
+            enabled: false,
+            halt: false,
+            pending_halt: false,
+            counter: 0,
+            previous_counter: 0,
+            reload: 0,
+        }
+    }
+
+    fn write(&mut self, table_index: u8) {
+        if self.enabled {
+            self.reload = LENGTH_TABLE[table_index as usize];
+            self.previous_counter = self.counter;
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.counter = 0;
+            self.reload = 0;
+        }
+    }
+
+    fn set_halt(&mut self, halt: bool) {
+        self.pending_halt = halt;
+    }
+
+    fn clock(&mut self) {
+        if self.counter > 0 && !self.halt {
+            self.counter -= 1;
+        }
+    }
+
+    fn apply_pending(&mut self) {
+        if self.reload > 0 {
+            if self.counter == self.previous_counter {
+                self.counter = self.reload;
+            }
+            self.reload = 0;
+        }
+        self.halt = self.pending_halt;
+    }
+
+    const fn value(&self) -> u8 {
+        self.counter
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Envelope {
     loop_flag: bool,
     constant: bool,

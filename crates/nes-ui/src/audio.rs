@@ -1,6 +1,5 @@
 use nes_audio_native::NativeAudio;
 
-const STARTUP_BUFFER_MILLISECONDS: u32 = 40;
 const CAPACITY_MILLISECONDS: u32 = 250;
 
 pub struct AudioOutput {
@@ -12,14 +11,16 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn new(source_rate: u32) -> Result<Self, String> {
-        let target_frames = source_rate * STARTUP_BUFFER_MILLISECONDS / 1_000;
+    pub fn new(source_rate: u32, startup_buffer_milliseconds: u32) -> Result<Self, String> {
+        let target_frames = source_rate * startup_buffer_milliseconds.clamp(10, 100) / 1_000;
         let capacity_frames = source_rate * CAPACITY_MILLISECONDS / 1_000;
         Ok(Self {
             native: NativeAudio::new(source_rate, target_frames, capacity_frames)?,
             volume: 0.75,
             muted: false,
-            reference_mastering: true,
+            // Keep the default path faithful to the APU. The optional tanh
+            // stage is a user effect, not part of NES hardware.
+            reference_mastering: false,
             scratch: Vec::with_capacity(1_024),
         })
     }

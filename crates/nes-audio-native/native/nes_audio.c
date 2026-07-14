@@ -11,6 +11,8 @@ typedef struct nes_audio_device {
     ma_uint32 target_frames;
     ma_uint32 capacity_frames;
     ma_bool32 callback_primed;
+    ma_uint32 fade_in_remaining;
+    float last_output;
     ma_atomic_uint32 underflows;
     ma_atomic_uint32 overflows;
     char device_name[MA_MAX_DEVICE_NAME_LENGTH + 32];
@@ -24,7 +26,9 @@ static void nes_audio_callback(
 ) {
     nes_audio_device* audio = (nes_audio_device*)device->pUserData;
     float* destination = (float*)output;
+    float* output_start = destination;
     ma_uint32 available;
+    ma_uint32 read_frames;
     ma_uint32 remaining;
 
     (void)input;
@@ -36,29 +40,55 @@ static void nes_audio_callback(
             return;
         }
         audio->callback_primed = MA_TRUE;
+        audio->fade_in_remaining = 64;
+        audio->last_output = 0.0f;
     }
 
-    if (available < frame_count) {
-        audio->callback_primed = MA_FALSE;
-        ma_atomic_uint32_fetch_add(&audio->underflows, 1);
-        memset(destination, 0, sizeof(float) * frame_count * 2);
-        return;
-    }
-
-    remaining = frame_count;
+    read_frames = available < frame_count ? available : frame_count;
+    remaining = read_frames;
     while (remaining > 0) {
         void* source = NULL;
         ma_uint32 chunk = remaining;
         if (ma_pcm_rb_acquire_read(&audio->ring, &chunk, &source) != MA_SUCCESS || chunk == 0) {
-            audio->callback_primed = MA_FALSE;
-            ma_atomic_uint32_fetch_add(&audio->underflows, 1);
-            memset(destination, 0, sizeof(float) * remaining * 2);
-            return;
+            read_frames -= remaining;
+            break;
         }
         memcpy(destination, source, sizeof(float) * chunk * 2);
         ma_pcm_rb_commit_read(&audio->ring, chunk);
         destination += chunk * 2;
         remaining -= chunk;
+    }
+
+    {
+        ma_uint32 i;
+        for (i = 0; i < read_frames; ++i) {
+            if (audio->fade_in_remaining > 0) {
+                const float gain = (float)(65 - audio->fade_in_remaining) / 64.0f;
+                output_start[i * 2 + 0] *= gain;
+                output_start[i * 2 + 1] *= gain;
+                audio->fade_in_remaining -= 1;
+            }
+            audio->last_output = output_start[i * 2];
+        }
+    }
+
+    if (read_frames < frame_count) {
+        ma_uint32 i;
+        const ma_uint32 missing = frame_count - read_frames;
+        const ma_uint32 fade_frames = missing < 32 ? missing : 32;
+        float* tail = output_start + read_frames * 2;
+        for (i = 0; i < fade_frames; ++i) {
+            const float gain = 1.0f - ((float)(i + 1) / (float)fade_frames);
+            tail[i * 2 + 0] = audio->last_output * gain;
+            tail[i * 2 + 1] = audio->last_output * gain;
+        }
+        if (missing > fade_frames) {
+            memset(tail + fade_frames * 2, 0, sizeof(float) * (missing - fade_frames) * 2);
+        }
+        audio->callback_primed = MA_FALSE;
+        audio->fade_in_remaining = 0;
+        audio->last_output = 0.0f;
+        ma_atomic_uint32_fetch_add(&audio->underflows, 1);
     }
 }
 
@@ -172,6 +202,8 @@ uint32_t nes_audio_push(nes_audio_device* audio, const float* mono_samples, uint
     if (ma_device_get_state(&audio->device) == ma_device_state_stopped &&
         ma_pcm_rb_available_read(&audio->ring) >= audio->target_frames) {
         audio->callback_primed = MA_TRUE;
+        audio->fade_in_remaining = 64;
+        audio->last_output = 0.0f;
         ma_device_start(&audio->device);
     }
 
@@ -186,6 +218,8 @@ void nes_audio_clear(nes_audio_device* audio) {
         ma_device_stop(&audio->device);
     }
     audio->callback_primed = MA_FALSE;
+    audio->fade_in_remaining = 0;
+    audio->last_output = 0.0f;
     ma_pcm_rb_reset(&audio->ring);
 }
 
