@@ -370,6 +370,18 @@ mod tests {
     }
 
     #[test]
+    fn executes_a_multi_region_nes2_nrom_program_with_ntsc_timing() {
+        let mut rom = test_rom(&[0xa9, 0x5a, 0x85, 0x00, 0x4c, 0x04, 0x80]);
+        rom[7] = 0x08;
+        rom[12] = 2;
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        nes.step_instruction().unwrap();
+        nes.step_instruction().unwrap();
+        assert_eq!(nes.peek_cpu(0), 0x5a);
+        assert_eq!(nes.cpu_cycles(), 12);
+    }
+
+    #[test]
     fn advances_to_a_complete_ntsc_frame() {
         // JMP $8000, an intentionally tiny forever loop.
         let rom = test_rom(&[0x4c, 0x00, 0x80]);
