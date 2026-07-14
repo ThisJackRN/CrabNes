@@ -1,4 +1,4 @@
-use super::{DMC_PERIODS, LENGTH_TABLE, NOISE_PERIODS};
+use super::LENGTH_TABLE;
 use serde::{Deserialize, Serialize};
 
 const DUTY_TABLE: [[u8; 8]; 4] = [
@@ -289,9 +289,9 @@ impl Noise {
         self.length.set_enabled(enabled);
     }
 
-    pub(super) fn clock_timer(&mut self) {
+    pub(super) fn clock_timer(&mut self, period: u16) {
         if self.timer_counter == 0 {
-            self.timer_counter = self.period() - 1;
+            self.timer_counter = period - 1;
             let tap = if self.mode { 6 } else { 1 };
             let feedback = (self.shift_register & 1) ^ ((self.shift_register >> tap) & 1);
             self.shift_register = (self.shift_register >> 1) | (feedback << 14);
@@ -320,8 +320,8 @@ impl Noise {
         self.length.value()
     }
 
-    pub(super) fn period(&self) -> u16 {
-        NOISE_PERIODS[self.period_index as usize]
+    pub(super) const fn period_index(&self) -> usize {
+        self.period_index as usize
     }
 
     pub(super) fn apply_length_pending(&mut self) {
@@ -331,7 +331,7 @@ impl Noise {
     #[cfg(test)]
     pub(super) fn prepare_timer_test(&mut self, period_index: u8) {
         self.period_index = period_index;
-        self.timer_counter = self.period() - 1;
+        self.timer_counter = super::NTSC_NOISE_PERIODS[self.period_index()] - 1;
     }
 
     #[cfg(test)]
@@ -364,13 +364,19 @@ pub(super) struct Dmc {
 
 impl Default for Dmc {
     fn default() -> Self {
+        Self::new(super::NTSC_DMC_PERIODS[0])
+    }
+}
+
+impl Dmc {
+    pub(super) const fn new(initial_period: u16) -> Self {
         Self {
             enabled: false,
             irq_enabled: false,
             loop_flag: false,
             irq_flag: false,
             rate_index: 0,
-            timer_counter: DMC_PERIODS[0] - 1,
+            timer_counter: initial_period - 1,
             output_level: 0,
             sample_address: 0xc000,
             sample_length: 1,
@@ -385,9 +391,6 @@ impl Default for Dmc {
             start_delay: 0,
         }
     }
-}
-
-impl Dmc {
     pub(super) fn write_control(&mut self, value: u8) {
         self.irq_enabled = value & 0x80 != 0;
         self.loop_flag = value & 0x40 != 0;
@@ -443,9 +446,9 @@ impl Dmc {
         }
     }
 
-    pub(super) fn clock_timer(&mut self) {
+    pub(super) fn clock_timer(&mut self, period: u16) {
         if self.timer_counter == 0 {
-            self.timer_counter = DMC_PERIODS[self.rate_index as usize] - 1;
+            self.timer_counter = period - 1;
             self.clock_output();
         } else {
             self.timer_counter -= 1;
@@ -524,8 +527,8 @@ impl Dmc {
         self.irq_flag
     }
 
-    pub(super) fn rate_period(&self) -> u16 {
-        DMC_PERIODS[self.rate_index as usize]
+    pub(super) const fn rate_index(&self) -> usize {
+        self.rate_index as usize
     }
 }
 

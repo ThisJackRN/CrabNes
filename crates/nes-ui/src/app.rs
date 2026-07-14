@@ -11,10 +11,12 @@ use std::{
 use eframe::egui::{self, ColorImage, Key, TextureHandle, TextureOptions, Vec2};
 use gilrs::{Axis, Button as GamepadButton, EventType, Gamepad, Gilrs};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
-use nes_achievements_native::{Event as AchievementEvent, EventKind as AchievementEventKind};
+use nes_achievements_native::{
+    AchievementBucket, Event as AchievementEvent, EventKind as AchievementEventKind,
+};
 use nes_core::{
     ApuChannel, Button, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace, NTSC_2C02_PALETTE, NTSC_FRAME_RATE,
-    Nes, OutputPalette, RGB_2C03_PALETTE,
+    Nes, OutputPalette, RGB_2C03_PALETTE, Region,
 };
 use rfd::FileDialog;
 
@@ -36,8 +38,8 @@ use crate::{
 const SPEEDS: &[f64] = &[0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0];
 const NORMAL_SPEED_INDEX: usize = 2;
 const REWIND_UPDATES_PER_SECOND: f64 = 60.0;
-// Permit a normal-speed frame to begin up to this fraction early. This keeps a
-// 60 Hz presentation callback phase-locked to the 60.0988 Hz NES cadence instead
+// Permit a normal-speed frame to begin up to this fraction early. This keeps
+// presentation callbacks phase-locked to the console's native cadence instead
 // of alternating between zero frames and a two-frame catch-up due to timer jitter.
 const NORMAL_SPEED_FRAME_TOLERANCE: f64 = 0.08;
 
@@ -426,6 +428,7 @@ impl App {
         let elapsed = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
         self.last_tick = now;
         let speed = self.current_speed();
+        let frame_rate = self.emulation_frame_rate();
         let held_frame_advance =
             self.frame_advance_held && ctx.input(|input| input.pointer.any_down()) && self.powered;
         let rewind_held = self.play_mode() == PlayMode::Standard
@@ -440,7 +443,7 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(1));
         } else if held_frame_advance {
             self.frame_budget = 0.0;
-            let interval = Duration::from_secs_f64(1.0 / NTSC_FRAME_RATE);
+            let interval = Duration::from_secs_f64(1.0 / frame_rate);
             let repeating = self
                 .frame_advance_hold_started
                 .is_some_and(|started| started.elapsed() >= Duration::from_millis(275));
@@ -451,7 +454,7 @@ impl App {
             }
             ctx.request_repaint_after(Duration::from_millis(1));
         } else if !self.paused && self.powered && self.nes.is_some() {
-            self.frame_budget += elapsed * NTSC_FRAME_RATE * speed;
+            self.frame_budget += elapsed * frame_rate * speed;
             let mut frames = 0;
             let pacing_tolerance = if speed == 1.0 {
                 NORMAL_SPEED_FRAME_TOLERANCE
@@ -1061,6 +1064,14 @@ impl App {
                         ui.label(format!("{:.1} FPS", self.measured_fps));
                         ui.separator();
                     }
+                    if let Some(nes) = &self.nes {
+                        let region = match nes.region() {
+                            Region::Ntsc => "NTSC",
+                            Region::Pal => "PAL",
+                        };
+                        ui.label(format!("{region} · {:.2} Hz", nes.frame_rate()));
+                        ui.separator();
+                    }
                     let frame = self.nes.as_ref().map_or(0, |nes| nes.frame().number);
                     ui.label(format!("Frame {frame} · Lag {}", self.lag_frames));
                     ui.separator();
@@ -1451,10 +1462,11 @@ impl App {
         } else {
             Vec::new()
         };
-        let client_warning = achievement_rows
+        let client_warnings: Vec<_> = achievement_rows
             .iter()
-            .find(|achievement| is_achievement_client_warning(achievement))
-            .cloned();
+            .filter(|achievement| is_achievement_client_warning(achievement))
+            .cloned()
+            .collect();
         achievement_rows.retain(|achievement| !is_achievement_client_warning(achievement));
         achievement_rows.sort_by_key(|achievement| !achievement.unlocked);
         for achievement in &achievement_rows {
@@ -1469,7 +1481,7 @@ impl App {
             .achievement_archive
             .entries
             .iter()
-            .filter(|entry| entry.achievement_id != 0 && !entry.title.starts_with("Warning:"))
+            .filter(|entry| !is_archived_achievement_warning(entry))
             .cloned()
             .collect();
         for entry in &archive_entries {
@@ -1506,7 +1518,7 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let color = if client_warning.is_some() {
+                                    let color = if !client_warnings.is_empty() {
                                         egui::Color32::from_rgb(232, 174, 61)
                                     } else if hardcore && game_loaded {
                                         egui::Color32::from_rgb(82, 196, 112)
@@ -1515,7 +1527,7 @@ impl App {
                                     };
                                     ui.colored_label(
                                         color,
-                                        if client_warning.is_some() {
+                                        if !client_warnings.is_empty() {
                                             "HARDCORE UNAVAILABLE"
                                         } else if hardcore && game_loaded {
                                             "HARDCORE ACTIVE"
@@ -1530,39 +1542,8 @@ impl App {
                         });
                     });
 
-                if let Some(warning) = &client_warning {
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(55, 43, 22))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(184, 130, 39),
-                        ))
-                        .corner_radius(7)
-                        .inner_margin(10)
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("!")
-                                        .size(22.0)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(244, 191, 73)),
-                                );
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Emulator verification required")
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(246, 208, 125)),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(&warning.description)
-                                            .small()
-                                            .color(egui::Color32::from_rgb(220, 205, 174)),
-                                    );
-                                });
-                            });
-                        });
+                for warning in &client_warnings {
+                    achievement_warning_banner(ui, warning);
                 }
 
                 if user.is_none() {
@@ -2205,6 +2186,7 @@ impl App {
         if !self.show_time {
             return;
         }
+        let frame_rate = self.emulation_frame_rate();
         let mut open = self.show_time;
         egui::Window::new("Rewind & Speed")
             .open(&mut open)
@@ -2226,7 +2208,7 @@ impl App {
                     self.rewind.len(),
                     self.rewind.len() as f64
                         * self.settings.emulation.rewind_interval_frames.max(1) as f64
-                        / NTSC_FRAME_RATE,
+                        / frame_rate,
                     format_bytes(
                         self.rewind
                             .iter()
@@ -2255,7 +2237,7 @@ impl App {
     fn held_frame_advance_button(&mut self, ui: &mut egui::Ui, label: &str) {
         let response = ui
             .add_enabled(self.powered, egui::Button::new(label))
-            .on_hover_text("Click for one frame, or hold for continuous NTSC-rate frame advance");
+            .on_hover_text("Click for one frame, or hold for continuous native-rate frame advance");
         if response.is_pointer_button_down_on() {
             self.frame_advance_held = true;
             self.paused = true;
@@ -3502,7 +3484,7 @@ impl App {
         else {
             return false;
         };
-        let Ok(mut verifier) = Nes::from_ines(&self.rom_bytes) else {
+        let Ok(mut verifier) = nes_from_rom_path(&self.rom_bytes, self.rom_path.as_deref()) else {
             return false;
         };
         if verifier.load_state(&previous.state).is_err() {
@@ -3634,7 +3616,13 @@ impl App {
             }
         }
         let interval = self.settings.emulation.rewind_interval_frames.max(1) as usize;
-        let max = self.settings.emulation.rewind_seconds.saturating_mul(60) / interval;
+        let native_frames_per_second = self.emulation_frame_rate().ceil() as usize;
+        let max = self
+            .settings
+            .emulation
+            .rewind_seconds
+            .saturating_mul(native_frames_per_second)
+            / interval;
         while self.rewind.len() > max.max(1) {
             self.rewind.pop_front();
         }
@@ -3878,7 +3866,8 @@ impl App {
     fn load_rom(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
         self.save_battery()?;
         let bytes = fs::read(&path)?;
-        let mut replacement = Nes::from_ines(&bytes)?;
+        let inferred_region = inferred_region_from_rom_path(&path);
+        let mut replacement = nes_from_rom_path(&bytes, Some(&path))?;
         load_battery(&mut replacement, &path)?;
         let hash = replacement.rom_hash();
         self.per_game = settings::load_per_game(hash);
@@ -3916,9 +3905,14 @@ impl App {
         self.library.refresh(Some(&self.settings.paths.rom_folder));
         self.clear_audio_pipeline();
         self.page = MainPage::Game;
-        self.status = palette_note
-            .map(|note| format!("ROM loaded; {note}"))
-            .unwrap_or_else(|| "ROM loaded".into());
+        self.status = match (inferred_region, palette_note) {
+            (Some(Region::Pal), Some(note)) => {
+                format!("ROM loaded with PAL timing inferred from filename; {note}")
+            }
+            (Some(Region::Pal), None) => "ROM loaded with PAL timing inferred from filename".into(),
+            (_, Some(note)) => format!("ROM loaded; {note}"),
+            (_, None) => "ROM loaded".into(),
+        };
         if self.play_mode() == PlayMode::Achievement && self.achievements.user().is_some() {
             if let Err(error) = self.achievements.load_game(&path, &self.rom_bytes) {
                 self.status = format!("ROM loaded; achievements could not start: {error}");
@@ -4029,7 +4023,7 @@ impl App {
             return;
         }
         if start_type == TasStartType::PowerOn {
-            match Nes::from_ines(&self.rom_bytes) {
+            match nes_from_rom_path(&self.rom_bytes, self.rom_path.as_deref()) {
                 Ok(nes) => self.nes = Some(nes),
                 Err(error) => {
                     self.status = format!("Could not create power-on state: {error}");
@@ -4087,7 +4081,10 @@ impl App {
             .ok_or_else(|| "no TAS movie loaded".to_owned())?;
         match start_type {
             TasStartType::PowerOn => {
-                self.nes = Some(Nes::from_ines(&self.rom_bytes).map_err(|e| e.to_string())?);
+                self.nes = Some(
+                    nes_from_rom_path(&self.rom_bytes, self.rom_path.as_deref())
+                        .map_err(|e| e.to_string())?,
+                );
             }
             TasStartType::Reset | TasStartType::SaveState => {
                 let nes = self
@@ -4475,21 +4472,23 @@ impl App {
                         format!("Achievement set not loaded: {}", event.message)
                     };
                 }
-                AchievementEventKind::Achievement
-                    if event.id == 0 || event.title.starts_with("Warning:") =>
-                {
-                    self.status = if event.message.is_empty() {
-                        event.title
-                    } else {
-                        event.message
-                    };
-                }
                 AchievementEventKind::Achievement => {
                     let details = self
                         .achievements
                         .achievements()
                         .into_iter()
                         .find(|achievement| achievement.id == event.id);
+                    if event.id == 0
+                        || is_achievement_warning_title(&event.title)
+                        || details.as_ref().is_some_and(is_achievement_client_warning)
+                    {
+                        self.status = if event.message.is_empty() {
+                            event.title
+                        } else {
+                            event.message
+                        };
+                        continue;
+                    }
                     let game = self.achievements.game();
                     let description = details
                         .as_ref()
@@ -4714,6 +4713,9 @@ impl App {
                 .min(SPEEDS.len() - 1)]
         }
     }
+    fn emulation_frame_rate(&self) -> f64 {
+        self.nes.as_ref().map_or(NTSC_FRAME_RATE, Nes::frame_rate)
+    }
     fn effective_volume(&self) -> f32 {
         self.per_game
             .volume
@@ -4733,8 +4735,102 @@ impl App {
     }
 }
 
+fn inferred_region_from_rom_path(path: &Path) -> Option<Region> {
+    let file_name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    const PAL_TAGS: [&str; 11] = [
+        "(europe)",
+        "(australia)",
+        "(pal)",
+        "[pal]",
+        "(france)",
+        "(germany)",
+        "(italy)",
+        "(spain)",
+        "(sweden)",
+        "(netherlands)",
+        "(united kingdom)",
+    ];
+    PAL_TAGS
+        .iter()
+        .any(|tag| file_name.contains(tag))
+        .then_some(Region::Pal)
+}
+
+fn nes_from_rom_path(bytes: &[u8], path: Option<&Path>) -> Result<Nes, nes_core::EmulationError> {
+    match path.and_then(inferred_region_from_rom_path) {
+        Some(region) => Nes::from_ines_with_region(bytes, region),
+        None => Nes::from_ines(bytes),
+    }
+}
+
 fn is_achievement_client_warning(achievement: &nes_achievements_native::Achievement) -> bool {
-    achievement.id == 0 || achievement.title.starts_with("Warning:")
+    achievement.bucket == AchievementBucket::Unsupported
+        || achievement.id == 0
+        || is_achievement_warning_title(&achievement.title)
+}
+
+fn is_achievement_warning_title(title: &str) -> bool {
+    title
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Warning:"))
+        || title.eq_ignore_ascii_case("Unsupported Game Version")
+}
+
+fn is_archived_achievement_warning(entry: &UnlockEntry) -> bool {
+    entry.achievement_id == 0 || is_achievement_warning_title(&entry.title)
+}
+
+fn achievement_warning_banner(ui: &mut egui::Ui, warning: &nes_achievements_native::Achievement) {
+    let warning_title = warning
+        .title
+        .get(8..)
+        .filter(|_| {
+            warning
+                .title
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Warning:"))
+        })
+        .unwrap_or(&warning.title)
+        .trim();
+    let heading = if warning_title.eq_ignore_ascii_case("Unknown Emulator") {
+        "Emulator verification required"
+    } else if warning_title.is_empty() {
+        "RetroAchievements warning"
+    } else {
+        warning_title
+    };
+    ui.add_space(8.0);
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(55, 43, 22))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(184, 130, 39),
+        ))
+        .corner_radius(7)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("!")
+                        .size(22.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(244, 191, 73)),
+                );
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(heading)
+                            .strong()
+                            .color(egui::Color32::from_rgb(246, 208, 125)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&warning.description)
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 205, 174)),
+                    );
+                });
+            });
+        });
 }
 
 fn achievement_card(
@@ -5435,12 +5531,19 @@ fn load_battery(nes: &mut Nes, rom_path: &Path) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod input_filter_tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        RewindCapture, RewindPoint, advance_rewind_deadline, low_input_active,
+        RewindCapture, RewindPoint, advance_rewind_deadline, inferred_region_from_rom_path,
+        is_achievement_client_warning, is_archived_achievement_warning, low_input_active,
         neutralize_opposite_directions,
     };
+    use crate::achievement_archive::UnlockEntry;
+    use nes_achievements_native::{Achievement, AchievementBucket};
+    use nes_core::Region;
 
     #[test]
     fn opposite_dpad_directions_cancel_without_touching_buttons() {
@@ -5497,6 +5600,49 @@ mod input_filter_tests {
         assert_eq!(
             advance_rewind_deadline(start, badly_late, interval),
             badly_late + interval
+        );
+    }
+
+    #[test]
+    fn unsupported_ra_entries_are_warnings_not_achievements() {
+        let warning = Achievement {
+            id: 123,
+            points: 0,
+            unlocked: true,
+            bucket: AchievementBucket::Unsupported,
+            measured_percent: 0.0,
+            title: "Unsupported Game Version".into(),
+            description: "This version has not been tested".into(),
+            measured_progress: String::new(),
+            badge_url: String::new(),
+            badge_locked_url: String::new(),
+        };
+        assert!(is_achievement_client_warning(&warning));
+
+        let archived = UnlockEntry {
+            game_id: 1,
+            achievement_id: 123,
+            game_title: "Game".into(),
+            title: warning.title,
+            description: warning.description,
+            points: 0,
+            badge_url: String::new(),
+            unlocked_at: 0,
+        };
+        assert!(is_archived_achievement_warning(&archived));
+    }
+
+    #[test]
+    fn european_filename_corrects_a_missing_pal_header_flag() {
+        assert_eq!(
+            inferred_region_from_rom_path(Path::new(
+                "25th Anniversary Super Mario Bros. (Europe) (Promo, Virtual Console).nes"
+            )),
+            Some(Region::Pal)
+        );
+        assert_eq!(
+            inferred_region_from_rom_path(Path::new("Palace of Power (USA).nes")),
+            None
         );
     }
 }

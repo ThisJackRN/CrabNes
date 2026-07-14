@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::cartridge::{Cartridge, Mirroring};
+use crate::{
+    Region,
+    cartridge::{Cartridge, Mirroring},
+};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
@@ -256,6 +259,10 @@ impl Ppu {
     }
 
     pub fn clock(&mut self, cartridge: &mut Cartridge) {
+        self.clock_for_region(cartridge, Region::Ntsc);
+    }
+
+    pub(crate) fn clock_for_region(&mut self, cartridge: &mut Cartridge, region: Region) {
         let rendering = self.mask & 0x18 != 0;
         if rendering && self.scanline >= 0 && self.scanline < 240 && self.dot == 1 {
             self.capture_line_origin();
@@ -293,13 +300,18 @@ impl Ppu {
         }
 
         self.dot += 1;
-        if self.scanline == -1 && self.dot == 340 && self.odd_frame && rendering {
+        if region == Region::Ntsc
+            && self.scanline == -1
+            && self.dot == 340
+            && self.odd_frame
+            && rendering
+        {
             self.dot = 0;
             self.scanline = 0;
         } else if self.dot >= 341 {
             self.dot = 0;
             self.scanline += 1;
-            if self.scanline >= 261 {
+            if self.scanline >= region.ppu_scanlines() - 1 {
                 self.scanline = -1;
                 self.odd_frame = !self.odd_frame;
             }

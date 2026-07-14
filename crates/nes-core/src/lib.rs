@@ -10,6 +10,7 @@ pub mod controller;
 pub mod cpu;
 pub mod emulator;
 pub mod ppu;
+pub mod timing;
 
 pub use apu::{ApuChannel, ApuState};
 pub use cartridge::{Cartridge, CartridgeError, Mirroring};
@@ -18,7 +19,7 @@ pub use emulator::{EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VER
 pub use ppu::{
     FRAME_HEIGHT, FRAME_WIDTH, Frame, NTSC_2C02_PALETTE, OutputPalette, PpuState, RGB_2C03_PALETTE,
 };
+pub use timing::{NTSC_CPU_CLOCK_HZ, NTSC_FRAME_RATE, PAL_CPU_CLOCK_HZ, PAL_FRAME_RATE, Region};
 
-/// NTSC NES master-derived CPU frequency.
-pub const CPU_CLOCK_HZ: u32 = 1_789_773;
-pub const NTSC_FRAME_RATE: f64 = 60.098_813_897_440_5;
+/// Backwards-compatible alias for the NTSC CPU frequency.
+pub const CPU_CLOCK_HZ: u32 = NTSC_CPU_CLOCK_HZ;

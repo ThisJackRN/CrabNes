@@ -26,7 +26,7 @@ run the workflow manually or [build from source](#build-from-source).
 
 ## What CrabNes includes
 
-- Cycle-driven NTSC 2A03 CPU, 2C02 PPU, and APU emulation.
+- Cycle-driven NTSC and PAL CPU, PPU, and APU emulation.
 - Cartridge IRQs, banked RAM/ROM, dynamic mirroring, and expansion audio.
 - Native low-latency Windows audio with per-channel controls.
 - Keyboard and hot-pluggable gamepad support for two players.
@@ -64,13 +64,14 @@ side-effect-free memory snapshot once per emulated frame.
 CrabNes is not yet an approved RetroAchievements client. Normal account sign-in,
 game identification, sets, badges, progress, and unlock UI work, but the service
 does not award hardcore unlocks to an unknown emulator. The Achievements window
-pins that limitation as a warning instead of presenting it as a game achievement.
+pins client and game-version limitations as warnings instead of presenting them
+as game achievements or unlock notifications.
 
 ## Compatibility
 
 | Area | Current support |
 |---|---|
-| Region | NTSC; multi-region NES 2.0 images default to NTSC |
+| Region | NTSC and PAL; standard Europe/Australia/PAL filename tags correct legacy ROMs with missing timing flags; multi-region NES 2.0 images default to NTSC |
 | ROM format | iNES 1.0 and NES 2.0 for supported boards |
 | Mapper | 0 NROM; 1 MMC1; 2 UxROM; 3 CNROM; 4 MMC3; 5 MMC5; 7 AxROM; 9 MMC2; 10 MMC4; 19 Namco 163; 21/22/23/25 VRC2/VRC4; 24/26 VRC6; 69 FME-7/5B; 85 VRC7 |
 | Expansion audio | Sunsoft 5B, VRC6, Namco 163, MMC5, and VRC7 FM |
