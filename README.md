@@ -1,5 +1,7 @@
 # My Own NES Emulator
 
+[![Windows build](https://github.com/ThisJackRN/MyNesEmulator/actions/workflows/windows-build.yml/badge.svg)](https://github.com/ThisJackRN/MyNesEmulator/actions/workflows/windows-build.yml)
+
 A from-scratch NES emulator in Rust with a platform-independent emulation core,
 a native Windows audio backend, a headless CLI, and a desktop front end. The
 current cartridge implementation supports iNES 1.0 Mapper 0 (NROM-128 and
@@ -10,28 +12,79 @@ for save states, rewind, TAS playback, and side-effect-free debug memory access;
 keyboard events, file paths, audio devices, and wall-clock scheduling stay out of
 `nes-core`.
 
-## Run it
+Highlights include:
 
-Use a legally obtained or homebrew `.nes` ROM.
+- Cycle-driven NTSC CPU, PPU, and APU emulation with native audio output
+- A searchable ROM library with custom game titles and cover images
+- Versioned per-game save states, screenshot previews, quick save/load, and rewind
+- Deterministic TAS recording, playback, editing, frame advance, and FM2 import
+- CPU/PPU memory tools, a debugger, custom palettes, and configurable CRT filters
+
+No commercial games or copyrighted ROM images are included. Use legally obtained
+or homebrew ROMs.
+
+## Download the Windows build
+
+Ready-to-run 64-bit Windows builds are produced automatically by GitHub Actions:
+
+1. Open the [Windows build workflow](https://github.com/ThisJackRN/MyNesEmulator/actions/workflows/windows-build.yml).
+2. Select the newest successful run (the one with a green check mark).
+3. Download `MyOwnNesEmulator-windows-x64` from the **Artifacts** section.
+4. Extract the ZIP and run `nes-ui.exe`.
+
+The artifact is retained for 30 days. If there is no current artifact, use **Run
+workflow** on the Actions page or build the emulator from source. Builds run for
+pushes and pull requests, and each build runs the complete Rust test suite first.
+
+## Build and run from source
+
+Install the [stable Rust toolchain](https://www.rust-lang.org/tools/install). The
+desktop build currently targets 64-bit Windows; the MSVC Rust toolchain may also
+require the Visual Studio C++ Build Tools.
+
+Test the workspace and start the desktop application:
 
 ```powershell
-cargo test --workspace
-cargo run --release -p nes-ui
+cargo test --workspace --locked
+cargo run --release -p nes-ui --locked
 ```
 
 Starting without a ROM opens the Library page. A ROM can also be supplied on the
 command line:
 
 ```powershell
-cargo run --release -p nes-ui -- path\to\game.nes
+cargo run --release -p nes-ui --locked -- path\to\game.nes
 ```
 
-On Windows, `Play NES.bat` starts the same desktop application. The headless CLI
-is useful for smoke tests and screenshots:
+The optimized executable is written to `target\release\nes-ui.exe`. The included
+`Play NES.bat` launcher starts the same desktop application. The headless CLI is
+useful for automated smoke tests and screenshots:
 
 ```powershell
-cargo run -p nes-cli -- path\to\game.nes --frames 120 --screenshot frame.png
+cargo run -p nes-cli --locked -- path\to\game.nes --frames 120 --screenshot frame.png
 ```
+
+## Compatibility status
+
+| Area | Current support |
+|---|---|
+| Region | NTSC |
+| ROM container | iNES 1.0 |
+| Cartridge mapper | Mapper 0 / NROM-128 / NROM-256 |
+| Desktop platform | Windows x64 |
+| Controllers | Two standard NES controllers through remappable keyboard input |
+| Save states | Versioned and separated by ROM hash |
+
+Mapper support is intentionally limited for now; see [Current
+limitations](#current-limitations) before reporting a game-specific problem.
+
+## Documentation
+
+- [TAS movie format](docs/TAS_FORMAT.md)
+- [TAS Control View and external movie conversion](docs/TAS_CONTROL_VIEW.md)
+- [CRT filters](docs/CRT_FILTER.md)
+- [Custom palettes](docs/CUSTOM_PALETTES.md)
+- [Third-party licenses and notices](THIRD_PARTY_NOTICES.md)
 
 ## Keyboard shortcuts
 
