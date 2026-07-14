@@ -1,4 +1,11 @@
-use crate::{apu::Apu, cartridge::Cartridge, controller::Controller, ppu::Ppu};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    apu::Apu,
+    cartridge::{Cartridge, CartridgeSnapshot},
+    controller::Controller,
+    ppu::Ppu,
+};
 
 pub struct Bus {
     ram: [u8; 0x800],
@@ -7,6 +14,20 @@ pub struct Bus {
     pub cartridge: Cartridge,
     pub controllers: [Controller; 2],
     dma_stall: u16,
+    dmc_dma: Option<DmcDma>,
+    cpu_cycles: u64,
+    open_bus: u8,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct BusSnapshot {
+    ram: Vec<u8>,
+    ppu: Ppu,
+    apu: Apu,
+    cartridge: CartridgeSnapshot,
+    controllers: [Controller; 2],
+    dma_stall: u16,
+    dmc_dma: Option<DmcDma>,
     cpu_cycles: u64,
     open_bus: u8,
 }
@@ -20,6 +41,7 @@ impl Bus {
             cartridge,
             controllers: [Controller::default(), Controller::default()],
             dma_stall: 0,
+            dmc_dma: None,
             cpu_cycles: 0,
             open_bus: 0,
         }
@@ -29,6 +51,7 @@ impl Bus {
         self.ppu.reset();
         self.apu.reset();
         self.dma_stall = 0;
+        self.dmc_dma = None;
         self.cpu_cycles = 0;
         self.open_bus = 0;
     }
@@ -40,7 +63,8 @@ impl Bus {
             match address {
                 0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
                 0x2000..=0x3fff => self.ppu.cpu_read(address & 7, &mut self.cartridge),
-                0x4015 => self.apu.read_status(),
+                // Bit 5 is not driven by the APU and retains CPU open bus.
+                0x4015 => self.apu.read_status() | (self.open_bus & 0x20),
                 0x4016 => self.controllers[0].read(),
                 0x4017 => self.controllers[1].read(),
                 _ => self.open_bus,
@@ -72,11 +96,31 @@ impl Bus {
         let mut remaining = u32::from(count + std::mem::take(&mut self.dma_stall));
         while remaining > 0 {
             self.apu.clock();
-            if let Some(address) = self.apu.take_dmc_dma_request() {
+
+            let completed_dmc_dma = if let Some(dma) = &mut self.dmc_dma {
+                dma.cycles_remaining -= 1;
+                (dma.cycles_remaining == 0).then_some(dma.address)
+            } else {
+                None
+            };
+            if let Some(address) = completed_dmc_dma {
+                self.dmc_dma = None;
                 let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
                 self.open_bus = value;
                 self.apu.supply_dmc_sample(value);
-                // A DMC fetch halts the 2A03 CPU while the APU and PPU continue.
+            }
+
+            if self.dmc_dma.is_none()
+                && let Some(address) = self.apu.take_dmc_dma_request()
+            {
+                // Model the DMC halt as four CPU clocks and perform the memory
+                // read at the end, rather than filling the sample buffer before
+                // the stalled clocks have elapsed. A cycle-stepped CPU can
+                // refine this to the hardware's 3/4-cycle read/write cases.
+                self.dmc_dma = Some(DmcDma {
+                    address,
+                    cycles_remaining: 4,
+                });
                 remaining += 4;
             }
             for _ in 0..3 {
@@ -95,6 +139,57 @@ impl Bus {
         self.cpu_cycles
     }
 
+    pub(crate) fn snapshot(&self) -> BusSnapshot {
+        let mut ppu = self.ppu.clone();
+        // Frame RGB bytes are part of the legacy snapshot layout. Normalize
+        // them so a visual palette preference cannot change TAS state hashes.
+        ppu.canonicalize_output_for_snapshot();
+        BusSnapshot {
+            ram: self.ram.to_vec(),
+            ppu,
+            apu: self.apu.clone(),
+            cartridge: self.cartridge.snapshot(),
+            controllers: self.controllers.clone(),
+            dma_stall: self.dma_stall,
+            dmc_dma: self.dmc_dma,
+            cpu_cycles: self.cpu_cycles,
+            open_bus: self.open_bus,
+        }
+    }
+
+    pub(crate) fn restore_snapshot(&mut self, snapshot: BusSnapshot) -> bool {
+        if snapshot.ram.len() != self.ram.len()
+            || !self.cartridge.restore_snapshot(&snapshot.cartridge)
+        {
+            return false;
+        }
+        self.ram.copy_from_slice(&snapshot.ram);
+        let output_palette = self.ppu.output_palette();
+        self.ppu = snapshot.ppu;
+        // Output colors are a front-end preference, not machine state. Keep
+        // the active palette when loading save states, rewind, or TAS points.
+        self.ppu.set_output_palette(output_palette);
+        self.apu = snapshot.apu;
+        self.apu.clear_samples();
+        self.controllers = snapshot.controllers;
+        self.dma_stall = snapshot.dma_stall;
+        self.dmc_dma = snapshot.dmc_dma;
+        self.cpu_cycles = snapshot.cpu_cycles;
+        self.open_bus = snapshot.open_bus;
+        true
+    }
+
+    pub(crate) fn cpu_ram(&self) -> &[u8] {
+        &self.ram
+    }
+
+    pub(crate) fn debug_write_cpu_ram(&mut self, offset: usize, value: u8) -> bool {
+        self.ram.get_mut(offset).is_some_and(|byte| {
+            *byte = value;
+            true
+        })
+    }
+
     fn perform_oam_dma(&mut self, page: u8) {
         let mut data = [0; 256];
         let base = (page as u16) << 8;
@@ -104,4 +199,10 @@ impl Bus {
         self.ppu.write_oam_dma(&data);
         self.dma_stall = 513 + (self.cpu_cycles as u16 & 1);
     }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct DmcDma {
+    address: u16,
+    cycles_remaining: u8,
 }

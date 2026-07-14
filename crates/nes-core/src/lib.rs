@@ -11,10 +11,13 @@ pub mod cpu;
 pub mod emulator;
 pub mod ppu;
 
+pub use apu::{ApuChannel, ApuState};
 pub use cartridge::{Cartridge, CartridgeError, Mirroring};
 pub use controller::{Button, Controller};
-pub use emulator::{EmulationError, Nes};
-pub use ppu::{FRAME_HEIGHT, FRAME_WIDTH, Frame, PpuState};
+pub use emulator::{EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VERSION, StateError};
+pub use ppu::{
+    FRAME_HEIGHT, FRAME_WIDTH, Frame, NTSC_2C02_PALETTE, OutputPalette, PpuState, RGB_2C03_PALETTE,
+};
 
 /// NTSC NES master-derived CPU frequency.
 pub const CPU_CLOCK_HZ: u32 = 1_789_773;

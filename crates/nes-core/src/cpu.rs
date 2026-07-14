@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 use crate::bus::Bus;
 
 const C: u8 = 1 << 0;
@@ -39,6 +41,7 @@ impl fmt::Display for CpuError {
 }
 impl Error for CpuError {}
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Cpu {
     a: u8,
     x: u8,

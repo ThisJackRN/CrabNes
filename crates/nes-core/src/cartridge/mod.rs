@@ -4,8 +4,10 @@ mod nrom;
 
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 pub use ines::InesHeader;
-use mapper::Mapper;
+use mapper::{Mapper, MapperSnapshot};
 use nrom::Nrom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,12 @@ pub struct Cartridge {
     battery_backed: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CartridgeSnapshot {
+    mapper_id: u16,
+    mapper: MapperSnapshot,
+}
+
 impl Cartridge {
     pub fn from_ines(bytes: &[u8]) -> Result<Self, CartridgeError> {
         let (header, prg, chr) = ines::parse(bytes)?;
@@ -97,5 +105,32 @@ impl Cartridge {
     }
     pub fn load_battery_ram(&mut self, data: &[u8]) {
         self.mapper.load_battery_ram(data);
+    }
+
+    pub(crate) fn snapshot(&self) -> CartridgeSnapshot {
+        CartridgeSnapshot {
+            mapper_id: self.mapper_id,
+            mapper: self.mapper.snapshot(),
+        }
+    }
+
+    pub(crate) fn restore_snapshot(&mut self, snapshot: &CartridgeSnapshot) -> bool {
+        snapshot.mapper_id == self.mapper_id && self.mapper.restore_snapshot(&snapshot.mapper)
+    }
+
+    pub(crate) fn prg_rom(&self) -> &[u8] {
+        self.mapper.prg_rom()
+    }
+
+    pub(crate) fn chr(&self) -> &[u8] {
+        self.mapper.chr()
+    }
+
+    pub(crate) fn chr_is_writable(&self) -> bool {
+        self.mapper.chr_is_writable()
+    }
+
+    pub(crate) fn debug_write_chr(&mut self, offset: usize, value: u8) -> bool {
+        self.mapper.debug_write_chr(offset, value)
     }
 }

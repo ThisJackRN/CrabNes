@@ -1,4 +1,15 @@
-use super::{CartridgeError, mapper::Mapper};
+use serde::{Deserialize, Serialize};
+
+use super::{
+    CartridgeError,
+    mapper::{Mapper, MapperSnapshot},
+};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct NromSnapshot {
+    prg_ram: Vec<u8>,
+    chr: Vec<u8>,
+}
 
 pub struct Nrom {
     prg_rom: Vec<u8>,
@@ -67,6 +78,48 @@ impl Mapper for Nrom {
     fn load_battery_ram(&mut self, data: &[u8]) {
         let count = data.len().min(self.prg_ram.len());
         self.prg_ram[..count].copy_from_slice(&data[..count]);
+    }
+
+    fn snapshot(&self) -> MapperSnapshot {
+        MapperSnapshot::Nrom(NromSnapshot {
+            prg_ram: self.prg_ram.clone(),
+            chr: self.chr.clone(),
+        })
+    }
+
+    fn restore_snapshot(&mut self, snapshot: &MapperSnapshot) -> bool {
+        let MapperSnapshot::Nrom(snapshot) = snapshot;
+        if snapshot.prg_ram.len() != self.prg_ram.len() || snapshot.chr.len() != self.chr.len() {
+            return false;
+        }
+        self.prg_ram.copy_from_slice(&snapshot.prg_ram);
+        if self.chr_is_ram {
+            self.chr.copy_from_slice(&snapshot.chr);
+        }
+        true
+    }
+
+    fn prg_rom(&self) -> &[u8] {
+        &self.prg_rom
+    }
+
+    fn chr(&self) -> &[u8] {
+        &self.chr
+    }
+
+    fn chr_is_writable(&self) -> bool {
+        self.chr_is_ram
+    }
+
+    fn debug_write_chr(&mut self, offset: usize, value: u8) -> bool {
+        if self.chr_is_ram
+            && let Some(byte) = self.chr.get_mut(offset)
+        {
+            *byte = value;
+            true
+        } else {
+            false
+        }
     }
 }
 

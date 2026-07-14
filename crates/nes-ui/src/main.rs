@@ -2,13 +2,20 @@
 
 mod app;
 mod audio;
+mod crt;
+mod library;
+mod palettes;
 mod persistence;
+mod save_states;
 mod screenshot;
+mod settings;
+mod tas;
+mod tas_control;
 
 use std::{env, error::Error, path::PathBuf, process::ExitCode};
 
 use app::App;
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
 fn main() -> ExitCode {
     match run() {
@@ -27,11 +34,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let rom_path = env::args_os().nth(1).map(PathBuf::from).or_else(pick_rom);
-    let Some(rom_path) = rom_path else {
-        println!("No ROM selected.");
-        return Ok(());
-    };
+    let rom_path = env::args_os().nth(1).map(PathBuf::from);
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 820.0])
@@ -48,11 +51,4 @@ fn run() -> Result<(), Box<dyn Error>> {
         }),
     )?;
     Ok(())
-}
-
-fn pick_rom() -> Option<PathBuf> {
-    FileDialog::new()
-        .set_title("Open an NES ROM")
-        .add_filter("NES ROM", &["nes"])
-        .pick_file()
 }

@@ -1,7 +1,13 @@
 use crate::cartridge::{Cartridge, Mirroring};
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 pub const FRAME_WIDTH: usize = 256;
 pub const FRAME_HEIGHT: usize = 240;
+
+/// The front end may replace this 64-color RGB888 lookup without changing
+/// emulated PPU memory or timing. It is deliberately presentation-only state.
+pub type OutputPalette = [[u8; 3]; 64];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PpuState {
@@ -17,7 +23,7 @@ pub struct PpuState {
     pub dot: u16,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Frame {
     /// RGB888 pixels, row major.
     pub pixels: Vec<u8>,
@@ -33,9 +39,12 @@ impl Default for Frame {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Ppu {
+    #[serde(with = "BigArray")]
     nametable: [u8; 0x1000],
     palette: [u8; 32],
+    #[serde(with = "BigArray")]
     oam: [u8; 256],
     control: u8,
     mask: u8,
@@ -57,6 +66,10 @@ pub struct Ppu {
     nmi_pending: bool,
     odd_frame: bool,
     frame: Frame,
+    #[serde(skip, default = "default_output_palette")]
+    output_palette: OutputPalette,
+    #[serde(skip, default)]
+    frame_color_indices: Vec<u8>,
 }
 
 impl Default for Ppu {
@@ -85,11 +98,50 @@ impl Default for Ppu {
             nmi_pending: false,
             odd_frame: false,
             frame: Frame::default(),
+            output_palette: default_output_palette(),
+            frame_color_indices: vec![0; FRAME_WIDTH * FRAME_HEIGHT],
         }
     }
 }
 
 impl Ppu {
+    pub fn set_output_palette(&mut self, palette: OutputPalette) {
+        if self.frame_color_indices.len() == FRAME_WIDTH * FRAME_HEIGHT {
+            for (pixel, &index) in self
+                .frame
+                .pixels
+                .chunks_exact_mut(3)
+                .zip(&self.frame_color_indices)
+            {
+                pixel.copy_from_slice(&palette[index as usize & 0x3f]);
+            }
+        } else {
+            // Older/deserialized snapshots do not contain the transient index
+            // buffer. Recolor their already-rendered RGB frame as closely as
+            // possible; the next rendered frame repopulates exact indices.
+            self.frame_color_indices.clear();
+            self.frame_color_indices.reserve(FRAME_WIDTH * FRAME_HEIGHT);
+            for pixel in self.frame.pixels.chunks_exact_mut(3) {
+                let index = self
+                    .output_palette
+                    .iter()
+                    .position(|color| color == pixel)
+                    .unwrap_or_default();
+                pixel.copy_from_slice(&palette[index]);
+                self.frame_color_indices.push(index as u8);
+            }
+        }
+        self.output_palette = palette;
+    }
+
+    pub fn output_palette(&self) -> OutputPalette {
+        self.output_palette
+    }
+
+    pub(crate) fn canonicalize_output_for_snapshot(&mut self) {
+        self.set_output_palette(NTSC_2C02_PALETTE);
+    }
+
     pub fn reset(&mut self) {
         self.control = 0;
         self.mask = 0;
@@ -268,6 +320,39 @@ impl Ppu {
         self.dot
     }
 
+    pub(crate) fn nametable_memory(&self) -> &[u8] {
+        &self.nametable
+    }
+
+    pub(crate) fn palette_memory(&self) -> &[u8] {
+        &self.palette
+    }
+
+    pub(crate) fn oam_memory(&self) -> &[u8] {
+        &self.oam
+    }
+
+    pub(crate) fn debug_write_nametable(&mut self, offset: usize, value: u8) -> bool {
+        self.nametable.get_mut(offset).is_some_and(|byte| {
+            *byte = value;
+            true
+        })
+    }
+
+    pub(crate) fn debug_write_palette(&mut self, offset: usize, value: u8) -> bool {
+        self.palette.get_mut(offset).is_some_and(|byte| {
+            *byte = value & 0x3f;
+            true
+        })
+    }
+
+    pub(crate) fn debug_write_oam(&mut self, offset: usize, value: u8) -> bool {
+        self.oam.get_mut(offset).is_some_and(|byte| {
+            *byte = value;
+            true
+        })
+    }
+
     fn increment_vram(&mut self) {
         self.vram_address =
             self.vram_address
@@ -395,8 +480,9 @@ impl Ppu {
             }
         }
 
-        let rgb = NES_PALETTE[color as usize];
+        let rgb = self.output_palette[color as usize];
         let offset = (y * FRAME_WIDTH + x) * 3;
+        self.frame_color_indices[y * FRAME_WIDTH + x] = color;
         self.frame.pixels[offset..offset + 3].copy_from_slice(&rgb);
     }
 
@@ -468,7 +554,7 @@ fn mirror_palette(address: u16) -> usize {
 
 // Common 2C02 palette approximation. Palette output is a presentation detail;
 // games select only the six-bit indices emulated above.
-const NES_PALETTE: [[u8; 3]; 64] = [
+pub const NTSC_2C02_PALETTE: OutputPalette = [
     [84, 84, 84],
     [0, 30, 116],
     [8, 16, 144],
@@ -535,6 +621,89 @@ const NES_PALETTE: [[u8; 3]; 64] = [
     [0, 0, 0],
 ];
 
+const fn rgb_3bit(red: u8, green: u8, blue: u8) -> [u8; 3] {
+    const fn expand(value: u8) -> u8 {
+        ((value as u16 * 255 + 3) / 7) as u8
+    }
+    [expand(red), expand(green), expand(blue)]
+}
+
+/// RP2C03/RP2C05 RGB DAC palette used by PlayChoice-10 hardware.
+///
+/// The three-bit DAC codes come from the NESdev PPU palettes documentation.
+/// This selects RGB output colors only; it does not pretend to change this
+/// emulator's PPU register behavior or timing into another hardware variant.
+pub const RGB_2C03_PALETTE: OutputPalette = [
+    rgb_3bit(3, 3, 3),
+    rgb_3bit(0, 1, 4),
+    rgb_3bit(0, 0, 6),
+    rgb_3bit(3, 2, 6),
+    rgb_3bit(4, 0, 3),
+    rgb_3bit(5, 0, 3),
+    rgb_3bit(5, 1, 0),
+    rgb_3bit(4, 2, 0),
+    rgb_3bit(3, 2, 0),
+    rgb_3bit(1, 2, 0),
+    rgb_3bit(0, 3, 1),
+    rgb_3bit(0, 4, 0),
+    rgb_3bit(0, 2, 2),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(5, 5, 5),
+    rgb_3bit(0, 3, 6),
+    rgb_3bit(0, 2, 7),
+    rgb_3bit(4, 0, 7),
+    rgb_3bit(5, 0, 7),
+    rgb_3bit(7, 0, 4),
+    rgb_3bit(7, 0, 0),
+    rgb_3bit(6, 3, 0),
+    rgb_3bit(4, 3, 0),
+    rgb_3bit(1, 4, 0),
+    rgb_3bit(0, 4, 0),
+    rgb_3bit(0, 5, 3),
+    rgb_3bit(0, 4, 4),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(7, 7, 7),
+    rgb_3bit(3, 5, 7),
+    rgb_3bit(4, 4, 7),
+    rgb_3bit(6, 3, 7),
+    rgb_3bit(7, 0, 7),
+    rgb_3bit(7, 3, 7),
+    rgb_3bit(7, 4, 0),
+    rgb_3bit(7, 5, 0),
+    rgb_3bit(6, 6, 0),
+    rgb_3bit(3, 6, 0),
+    rgb_3bit(0, 7, 0),
+    rgb_3bit(2, 7, 6),
+    rgb_3bit(0, 7, 7),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(7, 7, 7),
+    rgb_3bit(5, 6, 7),
+    rgb_3bit(6, 5, 7),
+    rgb_3bit(7, 5, 7),
+    rgb_3bit(7, 4, 7),
+    rgb_3bit(7, 5, 5),
+    rgb_3bit(7, 6, 4),
+    rgb_3bit(7, 7, 2),
+    rgb_3bit(7, 7, 3),
+    rgb_3bit(5, 7, 2),
+    rgb_3bit(4, 7, 3),
+    rgb_3bit(2, 7, 6),
+    rgb_3bit(4, 6, 7),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(0, 0, 0),
+];
+
+fn default_output_palette() -> OutputPalette {
+    NTSC_2C02_PALETTE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +719,13 @@ mod tests {
     fn mirrors_universal_sprite_palette_entries() {
         assert_eq!(mirror_palette(0x3f10), 0);
         assert_eq!(mirror_palette(0x3f24), 4);
+    }
+
+    #[test]
+    fn rgb_2c03_palette_uses_documented_dac_values() {
+        assert_eq!(RGB_2C03_PALETTE[0x00], [109, 109, 109]);
+        assert_eq!(RGB_2C03_PALETTE[0x01], [0, 36, 146]);
+        assert_eq!(RGB_2C03_PALETTE[0x2d], [0, 0, 0]);
+        assert_eq!(RGB_2C03_PALETTE[0x3d], [0, 0, 0]);
     }
 }

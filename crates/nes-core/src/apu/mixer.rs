@@ -1,4 +1,5 @@
 use crate::CPU_CLOCK_HZ;
+use serde::{Deserialize, Serialize};
 
 use super::OUTPUT_SAMPLE_RATE;
 
@@ -11,60 +12,78 @@ pub(super) struct Levels {
     pub dmc: u8,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Sampler {
     phase: u32,
-    pulse: [f64; 2],
-    triangle: f64,
-    noise: f64,
-    dmc: f64,
-    clocks: u32,
-    dc_blocker: DcBlocker,
+    integrated: f64,
+    anti_alias: [LowPass; 2],
+    high_pass: [HighPass; 2],
+    output_low_pass: LowPass,
 }
 
 impl Default for Sampler {
     fn default() -> Self {
         Self {
             phase: 0,
-            pulse: [0.0; 2],
-            triangle: 0.0,
-            noise: 0.0,
-            dmc: 0.0,
-            clocks: 0,
-            dc_blocker: DcBlocker::default(),
+            integrated: 0.0,
+            // Mix at the CPU clock before resampling. Two gentle CPU-rate
+            // stages reduce ultrasonic timer energy before the exact rational
+            // sample-rate conversion below.
+            anti_alias: [
+                LowPass::new(CPU_CLOCK_HZ as f32, 20_000.0),
+                LowPass::new(CPU_CLOCK_HZ as f32, 20_000.0),
+            ],
+            // NES-style output chain. These cutoff choices follow the common
+            // 90 Hz HP -> 440 Hz HP -> 14 kHz LP model also used by TetaNES.
+            high_pass: [
+                HighPass::new(OUTPUT_SAMPLE_RATE as f32, 90.0),
+                HighPass::new(OUTPUT_SAMPLE_RATE as f32, 440.0),
+            ],
+            output_low_pass: LowPass::new(OUTPUT_SAMPLE_RATE as f32, 14_000.0),
         }
     }
 }
 
 impl Sampler {
     pub(super) fn clock(&mut self, levels: Levels) -> Option<f32> {
-        self.pulse[0] += f64::from(levels.pulse_1);
-        self.pulse[1] += f64::from(levels.pulse_2);
-        self.triangle += f64::from(levels.triangle);
-        self.noise += f64::from(levels.noise);
-        self.dmc += f64::from(levels.dmc);
-        self.clocks += 1;
-
-        self.phase += OUTPUT_SAMPLE_RATE;
-        if self.phase < CPU_CLOCK_HZ {
-            return None;
-        }
-        self.phase -= CPU_CLOCK_HZ;
-
-        let divisor = f64::from(self.clocks);
-        let mixed = nonlinear_mix(
-            (self.pulse[0] / divisor) as f32,
-            (self.pulse[1] / divisor) as f32,
-            (self.triangle / divisor) as f32,
-            (self.noise / divisor) as f32,
-            (self.dmc / divisor) as f32,
+        // The mixer is nonlinear, so averaging each channel first (the old
+        // behavior) is not equivalent and changes transients and timbre.
+        let mut mixed = nonlinear_mix(
+            f32::from(levels.pulse_1),
+            f32::from(levels.pulse_2),
+            f32::from(levels.triangle),
+            f32::from(levels.noise),
+            f32::from(levels.dmc),
         );
-        self.pulse = [0.0; 2];
-        self.triangle = 0.0;
-        self.noise = 0.0;
-        self.dmc = 0.0;
-        self.clocks = 0;
+        for filter in &mut self.anti_alias {
+            mixed = filter.process(mixed);
+        }
 
-        Some((self.dc_blocker.process(mixed) * 2.0).clamp(-1.0, 1.0))
+        // Exact rational, area-preserving CPU-clock -> output-rate conversion.
+        // A CPU value is held for one CPU cycle and split at a sample boundary
+        // when needed; this produces exactly OUTPUT_SAMPLE_RATE samples per
+        // CPU_CLOCK_HZ clocks without frame-rate coupling or repeated samples.
+        let mut units_left = OUTPUT_SAMPLE_RATE;
+        let mut output = None;
+        while units_left > 0 {
+            let to_boundary = CPU_CLOCK_HZ - self.phase;
+            let units = units_left.min(to_boundary);
+            self.integrated += f64::from(mixed) * f64::from(units);
+            self.phase += units;
+            units_left -= units;
+
+            if self.phase == CPU_CLOCK_HZ {
+                let mut sample = (self.integrated / f64::from(CPU_CLOCK_HZ)) as f32;
+                self.phase = 0;
+                self.integrated = 0.0;
+                for filter in &mut self.high_pass {
+                    sample = filter.process(sample);
+                }
+                sample = self.output_low_pass.process(sample);
+                output = Some(sample.clamp(-1.0, 1.0));
+            }
+        }
+        output
     }
 }
 
@@ -85,27 +104,51 @@ fn nonlinear_mix(pulse_1: f32, pulse_2: f32, triangle: f32, noise: f32, dmc: f32
     pulse + tnd
 }
 
-struct DcBlocker {
+#[derive(Clone, Serialize, Deserialize)]
+struct HighPass {
+    alpha: f32,
     previous_input: f32,
     previous_output: f32,
 }
 
-impl Default for DcBlocker {
-    fn default() -> Self {
+impl HighPass {
+    fn new(sample_rate: f32, cutoff: f32) -> Self {
+        let dt = 1.0 / sample_rate;
+        let rc = 1.0 / (std::f32::consts::TAU * cutoff);
         Self {
+            alpha: rc / (rc + dt),
             previous_input: 0.0,
             previous_output: 0.0,
         }
     }
-}
 
-impl DcBlocker {
     fn process(&mut self, input: f32) -> f32 {
-        const POLE: f32 = 1.0 - 3.0 / 32_768.0;
-        let output = input - self.previous_input + POLE * self.previous_output;
+        let output = self.alpha * (self.previous_output + input - self.previous_input);
         self.previous_input = input;
         self.previous_output = output;
         output
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LowPass {
+    alpha: f32,
+    output: f32,
+}
+
+impl LowPass {
+    fn new(sample_rate: f32, cutoff: f32) -> Self {
+        let dt = 1.0 / sample_rate;
+        let rc = 1.0 / (std::f32::consts::TAU * cutoff);
+        Self {
+            alpha: dt / (rc + dt),
+            output: 0.0,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        self.output += self.alpha * (input - self.output);
+        self.output
     }
 }
 
