@@ -25,7 +25,7 @@ use crate::{
     achievements,
     audio::AudioOutput,
     crt::{CrtParameters, CrtRenderer},
-    library::{EntryStatus, LibraryEntry, RomLibrary},
+    library::{CoverSource, EntryStatus, LibraryEntry, RomLibrary},
     palettes, persistence, save_states, screenshot,
     settings::{
         self, CrtMask, CrtProfile, GamepadBinding, KeyBinding, PaletteMode, PerGameSettings,
@@ -225,6 +225,7 @@ pub struct App {
     library_search: String,
     library_sort: LibrarySort,
     library_cover_textures: HashMap<PathBuf, TextureHandle>,
+    library_artwork: achievements::LibraryArtworkLoader,
     library_rename_path: Option<PathBuf>,
     library_rename_text: String,
     page: MainPage,
@@ -282,6 +283,7 @@ impl App {
             Err(error) => (None, Some(error.to_string())),
         };
         let achievements = achievements::Manager::new()?;
+        let library_artwork = achievements::LibraryArtworkLoader::new()?;
         let mut tas_manager = TasManager::default();
         tas_manager.checkpoint_interval = settings.tas.checkpoint_interval.max(1);
         let migrate_legacy_recents = !crate::library::library_path().is_file();
@@ -360,6 +362,7 @@ impl App {
             library_search: String::new(),
             library_sort: LibrarySort::Title,
             library_cover_textures: HashMap::new(),
+            library_artwork,
             library_rename_path: None,
             library_rename_text: String::new(),
             page: if initial.is_some() {
@@ -402,6 +405,7 @@ impl App {
         if play_mode == PlayMode::Achievement {
             app.start_achievement_session();
         }
+        app.queue_library_artwork();
         if let Some(path) = initial
             && let Err(error) = app.load_rom(path)
         {
@@ -416,6 +420,10 @@ impl App {
     }
 
     fn emulate(&mut self, ctx: &egui::Context) {
+        self.collect_library_artwork();
+        if self.library_artwork.has_pending() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         if self.play_mode() == PlayMode::Achievement {
             let events = self.achievements.pump(self.paused || !self.powered);
             self.handle_achievement_events(events);
@@ -1187,10 +1195,14 @@ impl App {
                 {
                     self.settings.paths.rom_folder = folder;
                     self.settings_dirty = true;
-                    self.library.refresh(Some(&self.settings.paths.rom_folder));
+                    self.refresh_library_and_artwork();
                 }
                 if ui.button("Refresh").clicked() {
-                    self.library.refresh(Some(&self.settings.paths.rom_folder));
+                    self.refresh_library_and_artwork();
+                }
+                if self.library_artwork.has_pending() {
+                    ui.spinner();
+                    ui.small("Fetching artwork…");
                 }
                 ui.separator();
                 ui.add(
@@ -1273,7 +1285,42 @@ impl App {
                                     )
                                     .wrap(),
                                 );
-                                ui.add_space(12.0);
+                                if entry.cover_source == Some(CoverSource::RetroAchievements) {
+                                    ui.small("Artwork from RetroAchievements");
+                                } else if entry.cover_source == Some(CoverSource::Custom) {
+                                    ui.small("Custom artwork");
+                                }
+                                if let Some(accuracy) = &entry.accuracy {
+                                    ui.add_space(6.0);
+                                    ui.small("Estimated accuracy");
+                                    let color = match accuracy.score {
+                                        90..=u8::MAX => egui::Color32::from_rgb(72, 184, 104),
+                                        80..=89 => egui::Color32::from_rgb(64, 155, 210),
+                                        70..=79 => egui::Color32::from_rgb(216, 170, 55),
+                                        _ => egui::Color32::from_rgb(220, 112, 52),
+                                    };
+                                    ui.add(
+                                        egui::ProgressBar::new(f32::from(accuracy.score) / 100.0)
+                                            .desired_width(ui.available_width().clamp(130.0, 220.0))
+                                            .fill(color)
+                                            .text(format!(
+                                                "{}% - {}",
+                                                accuracy.score, accuracy.rating
+                                            )),
+                                    )
+                                    .on_hover_ui(|ui| {
+                                        ui.set_max_width(380.0);
+                                        ui.strong("Compatibility confidence estimate");
+                                        ui.label(
+                                            "This is based on CrabNes mapper and timing coverage. It is not a measurement against original hardware and does not guarantee a game is bug-free.",
+                                        );
+                                        ui.add_space(4.0);
+                                        for detail in &accuracy.details {
+                                            ui.label(format!("- {detail}"));
+                                        }
+                                    });
+                                }
+                                ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     let (ready, unavailable) = match &entry.status {
                                         EntryStatus::Ready => (true, String::new()),
@@ -1298,14 +1345,14 @@ impl App {
                                             ));
                                             ui.close();
                                         }
-                                        if ui.button("Change Cover Image…").clicked() {
+                                        if ui.button("Set Custom Artwork…").clicked() {
                                             action = Some(LibraryAction::ChooseCover(
                                                 entry.path.clone(),
                                             ));
                                             ui.close();
                                         }
-                                        if entry.cover_image.is_some()
-                                            && ui.button("Remove Cover Image").clicked()
+                                        if entry.cover_source == Some(CoverSource::Custom)
+                                            && ui.button("Remove Custom Cover").clicked()
                                         {
                                             action = Some(LibraryAction::RemoveCover(
                                                 entry.path.clone(),
@@ -1336,7 +1383,7 @@ impl App {
             }
             Some(LibraryAction::ChooseCover(path)) => {
                 if let Some(image_path) = FileDialog::new()
-                    .set_title("Choose game cover image")
+                    .set_title("Choose custom game artwork")
                     .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
                     .pick_file()
                 {
@@ -1347,7 +1394,7 @@ impl App {
                     }) {
                         Ok(_) => {
                             self.library_cover_textures.clear();
-                            self.status = "Library cover image updated".into();
+                            self.status = "Custom library artwork updated".into();
                         }
                         Err(error) => {
                             self.status = format!("Could not use cover image: {error}");
@@ -1359,7 +1406,7 @@ impl App {
                 match self.library.remove_cover_image(&path) {
                     Ok(()) => {
                         self.library_cover_textures.clear();
-                        self.status = "Library cover image removed".into();
+                        self.status = "Custom artwork removed".into();
                     }
                     Err(error) => self.status = format!("Could not remove cover: {error}"),
                 }
@@ -1417,6 +1464,41 @@ impl App {
         self.library_cover_textures
             .insert(path.to_path_buf(), texture.clone());
         Some(texture)
+    }
+
+    fn refresh_library_and_artwork(&mut self) {
+        let folder = self.settings.paths.rom_folder.clone();
+        self.library.refresh(Some(&folder));
+        self.queue_library_artwork();
+    }
+
+    fn queue_library_artwork(&mut self) {
+        let paths: Vec<_> = self
+            .library
+            .entries
+            .iter()
+            .filter(|entry| matches!(&entry.status, EntryStatus::Ready))
+            .filter(|entry| !self.library.has_retro_cover(&entry.path))
+            .map(|entry| entry.path.clone())
+            .collect();
+        for path in paths {
+            self.library_artwork.request(path);
+        }
+    }
+
+    fn collect_library_artwork(&mut self) {
+        for result in self.library_artwork.take_results() {
+            let Some(image) = result.image else {
+                continue;
+            };
+            if self
+                .library
+                .set_retro_cover_image(&result.path, image.size, &image.rgba)
+                .is_ok()
+            {
+                self.library_cover_textures.clear();
+            }
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1503,40 +1585,34 @@ impl App {
                     .corner_radius(8)
                     .inner_margin(12)
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.heading("RetroAchievements");
-                                if let Some(user) = &user {
-                                    ui.label(format!(
-                                        "{}  ·  {} hardcore points",
-                                        user.display_name, user.score
-                                    ));
+                        ui.vertical(|ui| {
+                            ui.heading("RetroAchievements");
+                            if let Some(user) = &user {
+                                ui.label(format!(
+                                    "{}  ·  {} hardcore points",
+                                    user.display_name, user.score
+                                ));
+                            } else {
+                                ui.label("Sign in to unlock achievements and leaderboards");
+                            }
+                            ui.add_space(3.0);
+                            let color = if !client_warnings.is_empty() {
+                                egui::Color32::from_rgb(232, 174, 61)
+                            } else if hardcore && game_loaded {
+                                egui::Color32::from_rgb(82, 196, 112)
+                            } else {
+                                egui::Color32::from_rgb(230, 174, 64)
+                            };
+                            ui.colored_label(
+                                color,
+                                if !client_warnings.is_empty() {
+                                    "HARDCORE UNAVAILABLE"
+                                } else if hardcore && game_loaded {
+                                    "HARDCORE ACTIVE"
+                                } else if hardcore {
+                                    "HARDCORE READY"
                                 } else {
-                                    ui.label("Sign in to unlock achievements and leaderboards");
-                                }
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let color = if !client_warnings.is_empty() {
-                                        egui::Color32::from_rgb(232, 174, 61)
-                                    } else if hardcore && game_loaded {
-                                        egui::Color32::from_rgb(82, 196, 112)
-                                    } else {
-                                        egui::Color32::from_rgb(230, 174, 64)
-                                    };
-                                    ui.colored_label(
-                                        color,
-                                        if !client_warnings.is_empty() {
-                                            "HARDCORE UNAVAILABLE"
-                                        } else if hardcore && game_loaded {
-                                            "HARDCORE ACTIVE"
-                                        } else if hardcore {
-                                            "HARDCORE READY"
-                                        } else {
-                                            "OFFLINE"
-                                        },
-                                    );
+                                    "OFFLINE"
                                 },
                             );
                         });
@@ -1960,14 +2036,14 @@ impl App {
                             && let Some(path) = FileDialog::new().pick_folder()
                         {
                             self.settings.paths.rom_folder = path;
-                            self.library.refresh(Some(&self.settings.paths.rom_folder));
+                            self.refresh_library_and_artwork();
                             changed = true;
                         }
                         ui.label(format!("States: {}", settings::state_root().display()));
                         ui.label(format!("TAS: {}", settings::tas_root().display()));
                         if ui.button("Restore Paths defaults").clicked() {
                             self.settings.paths = Default::default();
-                            self.library.refresh(Some(&self.settings.paths.rom_folder));
+                            self.refresh_library_and_artwork();
                             changed = true;
                         }
                     }
@@ -3902,7 +3978,7 @@ impl App {
         self.state_preview = None;
         self.preview_slot = None;
         self.library.remember(&path)?;
-        self.library.refresh(Some(&self.settings.paths.rom_folder));
+        self.refresh_library_and_artwork();
         self.clear_audio_pipeline();
         self.page = MainPage::Game;
         self.status = match (inferred_region, palette_note) {

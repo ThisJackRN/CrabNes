@@ -3,6 +3,7 @@
 #include "rcheevos/include/rc_api_request.h"
 #include "rcheevos/include/rc_client.h"
 #include "rcheevos/include/rc_consoles.h"
+#include "rcheevos/include/rc_hash.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -369,6 +370,12 @@ int nes_ra_get_game(nes_ra_client* owner, nes_ra_game_out* output) {
     nes_ra_copy(output->title, sizeof(output->title), game->title);
     nes_ra_copy(output->hash, sizeof(output->hash), game->hash);
     return 1;
+}
+
+int nes_ra_hash_nes_game(const uint8_t* data, size_t size, char hash[33]) {
+    if (!data || !size || !hash) return 0;
+    memset(hash, 0, 33);
+    return rc_hash_generate_from_buffer(hash, RC_CONSOLE_NINTENDO, data, size);
 }
 
 size_t nes_ra_get_achievements(nes_ra_client* owner, nes_ra_achievement_out* output, size_t capacity) {

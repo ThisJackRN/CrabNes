@@ -10,6 +10,16 @@ use serde_big_array::BigArray;
 pub const FRAME_WIDTH: usize = 256;
 pub const FRAME_HEIGHT: usize = 240;
 
+// PPU I/O-bus retention is analogue and varies between consoles. AccuracyCoin
+// recommends a deterministic value between 5 and 30 frames; use the long end
+// so ordinary register traffic retains its value while still decaying well
+// before the test ROM's two-second timeout.
+const PPU_OPEN_BUS_DECAY_CYCLES: u32 = 30 * 341 * 262;
+
+fn restored_open_bus_decay() -> [u32; 8] {
+    [PPU_OPEN_BUS_DECAY_CYCLES; 8]
+}
+
 /// The front end may replace this 64-color RGB888 lookup without changing
 /// emulated PPU memory or timing. It is deliberately presentation-only state.
 pub type OutputPalette = [[u8; 3]; 64];
@@ -61,6 +71,8 @@ pub struct Ppu {
     write_latch: bool,
     read_buffer: u8,
     open_bus: u8,
+    #[serde(skip, default = "restored_open_bus_decay")]
+    open_bus_decay: [u32; 8],
     scroll_x: u8,
     scroll_y: u8,
     line_origin_x: usize,
@@ -69,6 +81,8 @@ pub struct Ppu {
     dot: u16,
     frame_complete: bool,
     nmi_pending: bool,
+    #[serde(default)]
+    suppress_vblank: bool,
     odd_frame: bool,
     frame: Frame,
     #[serde(skip, default = "default_output_palette")]
@@ -93,6 +107,7 @@ impl Default for Ppu {
             write_latch: false,
             read_buffer: 0,
             open_bus: 0,
+            open_bus_decay: [0; 8],
             scroll_x: 0,
             scroll_y: 0,
             line_origin_x: 0,
@@ -101,6 +116,7 @@ impl Default for Ppu {
             dot: 0,
             frame_complete: false,
             nmi_pending: false,
+            suppress_vblank: false,
             odd_frame: false,
             frame: Frame::default(),
             output_palette: default_output_palette(),
@@ -171,40 +187,57 @@ impl Ppu {
         self.dot = 0;
         self.frame_complete = false;
         self.nmi_pending = false;
+        self.suppress_vblank = false;
     }
 
     pub fn cpu_read(&mut self, register: u16, cartridge: &mut Cartridge) -> u8 {
-        let value = match register & 7 {
+        match register & 7 {
             2 => {
                 let value = (self.status & 0xe0) | (self.open_bus & 0x1f);
+                if self.scanline == 241 && self.dot <= 1 {
+                    self.suppress_vblank = true;
+                }
                 self.status &= !0x80;
                 self.write_latch = false;
                 self.nmi_pending = false;
+                self.update_open_bus(value, 0xe0);
                 value
             }
-            4 => self.oam[self.oam_address as usize],
+            4 if self.rendering_oam_access() => {
+                self.update_open_bus(0xff, 0xff);
+                0xff
+            }
+            4 => {
+                let value = self.oam[self.oam_address as usize];
+                self.update_open_bus(value, 0xff);
+                value
+            }
             7 => {
                 let address = self.vram_address & 0x3fff;
                 let fetched = self.read_memory(address, cartridge);
-                let value = if address < 0x3f00 {
+                let (value, driven_bits) = if address < 0x3f00 {
                     let old = self.read_buffer;
                     self.read_buffer = fetched;
-                    old
+                    (old, 0xff)
                 } else {
                     self.read_buffer = self.read_memory(address.wrapping_sub(0x1000), cartridge);
-                    fetched
+                    let palette_value = if self.mask & 0x01 != 0 {
+                        fetched & 0x30
+                    } else {
+                        fetched
+                    };
+                    (palette_value | (self.open_bus & 0xc0), 0x3f)
                 };
-                self.increment_vram();
+                self.increment_vram_after_cpu_access();
+                self.update_open_bus(value, driven_bits);
                 value
             }
             _ => self.open_bus,
-        };
-        self.open_bus = value;
-        value
+        }
     }
 
     pub fn cpu_write(&mut self, register: u16, value: u8, cartridge: &mut Cartridge) {
-        self.open_bus = value;
+        self.update_open_bus(value, 0xff);
         match register & 7 {
             0 => {
                 let nmi_was_off = self.control & 0x80 == 0;
@@ -212,13 +245,21 @@ impl Ppu {
                 self.temp_address = (self.temp_address & !0x0c00) | (((value as u16) & 3) << 10);
                 if nmi_was_off && value & 0x80 != 0 && self.status & 0x80 != 0 {
                     self.nmi_pending = true;
+                } else if value & 0x80 == 0 {
+                    self.nmi_pending = false;
                 }
             }
             1 => self.mask = value,
             3 => self.oam_address = value,
             4 => {
-                self.oam[self.oam_address as usize] = value;
-                self.oam_address = self.oam_address.wrapping_add(1);
+                if self.rendering_oam_access() {
+                    // During rendering OAM is owned by sprite evaluation. CPU
+                    // writes do not reach OAM and advance the address by four.
+                    self.oam_address = self.oam_address.wrapping_add(4);
+                } else {
+                    self.oam[self.oam_address as usize] = value;
+                    self.oam_address = self.oam_address.wrapping_add(1);
+                }
             }
             5 => {
                 if !self.write_latch {
@@ -245,7 +286,7 @@ impl Ppu {
             }
             7 => {
                 self.write_memory(self.vram_address & 0x3fff, value, cartridge);
-                self.increment_vram();
+                self.increment_vram_after_cpu_access();
             }
             _ => {}
         }
@@ -263,6 +304,7 @@ impl Ppu {
     }
 
     pub(crate) fn clock_for_region(&mut self, cartridge: &mut Cartridge, region: Region) {
+        self.clock_open_bus_decay();
         let rendering = self.mask & 0x18 != 0;
         if rendering && self.scanline >= 0 && self.scanline < 240 && self.dot == 1 {
             self.capture_line_origin();
@@ -274,15 +316,23 @@ impl Ppu {
         if self.scanline == -1 && self.dot == 1 {
             self.status &= !0xe0;
         } else if self.scanline == 241 && self.dot == 1 {
-            self.status |= 0x80;
+            if self.suppress_vblank {
+                self.suppress_vblank = false;
+                self.status &= !0x80;
+            } else {
+                self.status |= 0x80;
+            }
             self.frame_complete = true;
             self.frame.number = self.frame.number.wrapping_add(1);
-            if self.control & 0x80 != 0 {
+            if self.status & 0x80 != 0 && self.control & 0x80 != 0 {
                 self.nmi_pending = true;
             }
         }
 
         if rendering && (self.scanline == -1 || (0..240).contains(&self.scanline)) {
+            if (0..240).contains(&self.scanline) && self.dot == 65 {
+                self.evaluate_sprite_overflow(self.scanline as usize);
+            }
             if (8..=256).contains(&self.dot) && self.dot.is_multiple_of(8) {
                 self.increment_coarse_x();
             }
@@ -387,6 +437,62 @@ impl Ppu {
                 .wrapping_add(if self.control & 4 != 0 { 32 } else { 1 });
     }
 
+    fn update_open_bus(&mut self, value: u8, driven_bits: u8) {
+        self.open_bus = (self.open_bus & !driven_bits) | (value & driven_bits);
+        for bit in 0..8 {
+            let mask = 1 << bit;
+            if driven_bits & mask != 0 {
+                self.open_bus_decay[bit] = if value & mask != 0 {
+                    PPU_OPEN_BUS_DECAY_CYCLES
+                } else {
+                    0
+                };
+            }
+        }
+    }
+
+    fn clock_open_bus_decay(&mut self) {
+        for (bit, remaining) in self.open_bus_decay.iter_mut().enumerate() {
+            if *remaining == 0 {
+                continue;
+            }
+            *remaining -= 1;
+            if *remaining == 0 {
+                self.open_bus &= !(1 << bit);
+            }
+        }
+    }
+
+    fn increment_vram_after_cpu_access(&mut self) {
+        if self.mask & 0x18 != 0 && (self.scanline == -1 || (0..240).contains(&self.scanline)) {
+            self.increment_coarse_x();
+            self.increment_render_y();
+        } else {
+            self.increment_vram();
+        }
+    }
+
+    fn rendering_oam_access(&self) -> bool {
+        self.mask & 0x18 != 0
+            && (self.scanline == -1 || (0..240).contains(&self.scanline))
+            && (1..=320).contains(&self.dot)
+    }
+
+    fn evaluate_sprite_overflow(&mut self, scanline: usize) {
+        let sprite_height = if self.control & 0x20 != 0 { 16 } else { 8 };
+        let mut sprites = 0;
+        for sprite in self.oam.chunks_exact(4) {
+            let top = sprite[0] as usize + 1;
+            if scanline >= top && scanline < top + sprite_height {
+                sprites += 1;
+                if sprites > 8 {
+                    self.status |= 0x20;
+                    break;
+                }
+            }
+        }
+    }
+
     fn read_memory(&mut self, address: u16, cartridge: &mut Cartridge) -> u8 {
         let address = address & 0x3fff;
         match address {
@@ -469,7 +575,6 @@ impl Ppu {
                 }
                 sprites_on_line += 1;
                 if sprites_on_line > 8 {
-                    self.status |= 0x20;
                     break;
                 }
 
@@ -505,7 +610,7 @@ impl Ppu {
                     continue;
                 }
 
-                if sprite_index == 0 && background_pixel != 0 && x != 255 {
+                if sprite_index == 0 && background_pixel != 0 && x != 0 && x != 255 {
                     self.status |= 0x40;
                 }
                 let behind_background = attributes & 0x20 != 0;
@@ -518,6 +623,9 @@ impl Ppu {
             }
         }
 
+        if self.mask & 0x01 != 0 {
+            color &= 0x30;
+        }
         let rgb = self.output_palette[color as usize];
         let offset = (y * FRAME_WIDTH + x) * 3;
         self.frame_color_indices[y * FRAME_WIDTH + x] = color;
@@ -748,6 +856,21 @@ fn default_output_palette() -> OutputPalette {
 mod tests {
     use super::*;
 
+    fn test_cartridge() -> Cartridge {
+        let mut rom = vec![0; 16 + 0x4000 + 0x2000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        rom[5] = 1;
+        Cartridge::from_ines(&rom).unwrap()
+    }
+
+    fn chr_ram_cartridge() -> Cartridge {
+        let mut rom = vec![0; 16 + 0x4000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        Cartridge::from_ines(&rom).unwrap()
+    }
+
     #[test]
     fn mirrors_nametables() {
         assert_eq!(mirror_nametable(0x2800, Mirroring::Vertical), 0);
@@ -767,5 +890,151 @@ mod tests {
         assert_eq!(RGB_2C03_PALETTE[0x01], [0, 36, 146]);
         assert_eq!(RGB_2C03_PALETTE[0x2d], [0, 0, 0]);
         assert_eq!(RGB_2C03_PALETTE[0x3d], [0, 0, 0]);
+    }
+
+    #[test]
+    fn palette_reads_preserve_the_ppu_io_latch_high_bits() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.debug_write_palette(0, 0x2a);
+        ppu.cpu_write(6, 0x3f, &mut cartridge);
+        ppu.cpu_write(6, 0x00, &mut cartridge);
+        ppu.cpu_write(0, 0xc0, &mut cartridge);
+        assert_eq!(ppu.cpu_read(7, &mut cartridge), 0xea);
+    }
+
+    #[test]
+    fn ppu_open_bus_bits_decay_independently() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.cpu_write(2, 0x81, &mut cartridge);
+        ppu.open_bus_decay[0] = 1;
+        ppu.open_bus_decay[7] = 2;
+
+        ppu.clock(&mut cartridge);
+        assert_eq!(ppu.cpu_read(0, &mut cartridge), 0x80);
+        ppu.clock(&mut cartridge);
+        assert_eq!(ppu.cpu_read(0, &mut cartridge), 0x00);
+    }
+
+    #[test]
+    fn grayscale_masks_palette_reads_but_not_writes() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.debug_write_palette(0x0c, 0x5a);
+        ppu.vram_address = 0x3f1c;
+        ppu.mask = 0x01;
+        assert_eq!(ppu.cpu_read(7, &mut cartridge), 0x10);
+
+        ppu.vram_address = 0x3f1d;
+        ppu.cpu_write(7, 0x16, &mut cartridge);
+        ppu.vram_address = 0x3f1d;
+        ppu.mask = 0;
+        assert_eq!(ppu.cpu_read(7, &mut cartridge), 0x16);
+    }
+
+    #[test]
+    fn ppudata_access_during_rendering_increments_both_scroll_axes() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.mask = 0x18;
+        ppu.scanline = 0;
+        ppu.dot = 100;
+        ppu.vram_address = 0x2000;
+        ppu.cpu_read(7, &mut cartridge);
+        assert_eq!(ppu.vram_address, 0x3001);
+    }
+
+    #[test]
+    fn oamdata_writes_are_blocked_during_sprite_evaluation() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.mask = 0x10;
+        ppu.scanline = 0;
+        ppu.dot = 10;
+        ppu.oam_address = 1;
+        ppu.oam[1] = 0x12;
+        ppu.cpu_write(4, 0xaa, &mut cartridge);
+        assert_eq!(ppu.oam[1], 0x12);
+        assert_eq!(ppu.oam_address, 5);
+        assert_eq!(ppu.cpu_read(4, &mut cartridge), 0xff);
+    }
+
+    #[test]
+    fn status_read_on_the_vblank_edge_suppresses_vblank_and_nmi() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.control = 0x80;
+        ppu.scanline = 241;
+        ppu.dot = 0;
+        ppu.cpu_read(2, &mut cartridge);
+        ppu.clock(&mut cartridge);
+        ppu.clock(&mut cartridge);
+        assert_eq!(ppu.status & 0x80, 0);
+        assert!(!ppu.take_nmi());
+        assert!(ppu.take_frame_complete());
+    }
+
+    #[test]
+    fn sprite_overflow_is_evaluated_during_the_sprite_window() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.mask = 0x10;
+        ppu.scanline = 1;
+        ppu.dot = 65;
+        ppu.clock(&mut cartridge);
+        assert_ne!(ppu.status & 0x20, 0);
+    }
+
+    #[test]
+    fn grayscale_mask_limits_output_to_the_current_color_emphasis() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.palette[0] = 0x2f;
+        ppu.mask = 0x01;
+        ppu.scanline = 0;
+        ppu.dot = 1;
+        ppu.clock(&mut cartridge);
+        assert_eq!(&ppu.frame.pixels[0..3], &ppu.output_palette[0x20]);
+    }
+
+    #[test]
+    fn ppudata_chr_reads_have_the_hardware_one_byte_delay() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = chr_ram_cartridge();
+        assert!(cartridge.debug_write_chr(0, 0xab));
+        ppu.vram_address = 0;
+        assert_eq!(ppu.cpu_read(7, &mut cartridge), 0);
+        assert_eq!(ppu.cpu_read(7, &mut cartridge), 0xab);
+    }
+
+    #[test]
+    fn ppuctrl_nametable_bits_feed_both_scroll_transfer_axes() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.cpu_write(0, 0x03, &mut cartridge);
+        ppu.vram_address = 0;
+        ppu.copy_horizontal_scroll();
+        assert_eq!(ppu.vram_address & 0x0400, 0x0400);
+        ppu.copy_vertical_scroll();
+        assert_eq!(ppu.vram_address & 0x0c00, 0x0c00);
+    }
+
+    #[test]
+    fn sprite_zero_hit_starts_after_pixel_zero_and_requires_opaque_overlap() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = chr_ram_cartridge();
+        assert!(cartridge.debug_write_chr(0, 0xff));
+        ppu.mask = 0x1e;
+        ppu.palette[1] = 1;
+        ppu.palette[0x11] = 2;
+        ppu.oam[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        ppu.scanline = 1;
+        ppu.dot = 1;
+
+        ppu.clock(&mut cartridge);
+        assert_eq!(ppu.status & 0x40, 0);
+        ppu.clock(&mut cartridge);
+        assert_ne!(ppu.status & 0x40, 0);
     }
 }
