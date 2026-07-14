@@ -17,6 +17,7 @@ pub struct Bus {
     dmc_dma: Option<DmcDma>,
     cpu_cycles: u64,
     open_bus: u8,
+    cpu_sequence_cycles: u16,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -44,6 +45,7 @@ impl Bus {
             dmc_dma: None,
             cpu_cycles: 0,
             open_bus: 0,
+            cpu_sequence_cycles: 0,
         }
     }
 
@@ -54,9 +56,15 @@ impl Bus {
         self.dmc_dma = None;
         self.cpu_cycles = 0;
         self.open_bus = 0;
+        self.cpu_sequence_cycles = 0;
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
+        self.advance_cpu_slot();
+        self.read_untimed(address)
+    }
+
+    fn read_untimed(&mut self, address: u16) -> u8 {
         let value = if let Some(value) = self.cartridge.cpu_read(address) {
             value
         } else {
@@ -75,6 +83,11 @@ impl Bus {
     }
 
     pub fn write(&mut self, address: u16, value: u8) {
+        self.advance_cpu_slot();
+        self.write_untimed(address, value);
+    }
+
+    fn write_untimed(&mut self, address: u16, value: u8) {
         self.open_bus = value;
         if self.cartridge.cpu_write(address, value) {
             return;
@@ -92,42 +105,72 @@ impl Bus {
         }
     }
 
-    pub fn clock_cpu_cycles(&mut self, count: u16) {
-        let mut remaining = u32::from(count + std::mem::take(&mut self.dma_stall));
-        while remaining > 0 {
-            self.apu.clock();
+    pub(crate) fn begin_cpu_sequence(&mut self) {
+        debug_assert_eq!(self.cpu_sequence_cycles, 0);
+        self.cpu_sequence_cycles = 0;
+    }
 
-            let completed_dmc_dma = if let Some(dma) = &mut self.dmc_dma {
-                dma.cycles_remaining -= 1;
-                (dma.cycles_remaining == 0).then_some(dma.address)
-            } else {
-                None
-            };
-            if let Some(address) = completed_dmc_dma {
-                self.dmc_dma = None;
-                let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
-                self.open_bus = value;
-                self.apu.supply_dmc_sample(value);
-            }
+    /// Completes the idle slots in a CPU instruction, reset, or interrupt
+    /// sequence. Memory accesses have already advanced their individual slots.
+    pub(crate) fn finish_cpu_sequence(&mut self, target_cycles: u16) -> u16 {
+        while self.cpu_sequence_cycles < target_cycles {
+            self.advance_cpu_slot();
+        }
+        let actual = self.cpu_sequence_cycles;
+        debug_assert_eq!(actual, target_cycles);
+        self.cpu_sequence_cycles = 0;
+        actual
+    }
 
-            if self.dmc_dma.is_none()
-                && let Some(address) = self.apu.take_dmc_dma_request()
-            {
-                // Model the DMC halt as four CPU clocks and perform the memory
-                // read at the end, rather than filling the sample buffer before
-                // the stalled clocks have elapsed. A cycle-stepped CPU can
-                // refine this to the hardware's 3/4-cycle read/write cases.
-                self.dmc_dma = Some(DmcDma {
-                    address,
-                    cycles_remaining: 4,
+    pub(crate) fn cancel_cpu_sequence(&mut self) {
+        self.cpu_sequence_cycles = 0;
+    }
+
+    fn advance_cpu_slot(&mut self) {
+        self.service_dma_stalls();
+        self.clock_hardware_cycle();
+        self.cpu_sequence_cycles = self.cpu_sequence_cycles.saturating_add(1);
+    }
+
+    fn service_dma_stalls(&mut self) {
+        while self.dma_stall != 0 || self.dmc_dma.is_some() {
+            let servicing_dmc = self.dmc_dma.is_some();
+            self.clock_hardware_cycle();
+
+            if servicing_dmc {
+                let completed = self.dmc_dma.as_mut().and_then(|dma| {
+                    dma.cycles_remaining -= 1;
+                    (dma.cycles_remaining == 0).then_some(dma.address)
                 });
-                remaining += 4;
+                if let Some(address) = completed {
+                    self.dmc_dma = None;
+                    let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
+                    self.open_bus = value;
+                    self.apu.supply_dmc_sample(value);
+                }
+            } else {
+                self.dma_stall -= 1;
             }
-            for _ in 0..3 {
-                self.ppu.clock(&mut self.cartridge);
-            }
-            self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
-            remaining -= 1;
+        }
+    }
+
+    fn clock_hardware_cycle(&mut self) {
+        self.apu.clock();
+        for _ in 0..3 {
+            self.ppu.clock(&mut self.cartridge);
+        }
+        self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
+
+        if self.dmc_dma.is_none()
+            && let Some(address) = self.apu.take_dmc_dma_request()
+        {
+            // The request halts the CPU before its next bus slot. More exact
+            // read/write collision behavior can now be expressed here without
+            // changing the CPU instruction decoder.
+            self.dmc_dma = Some(DmcDma {
+                address,
+                cycles_remaining: 4,
+            });
         }
     }
 
@@ -183,6 +226,7 @@ impl Bus {
         self.dmc_dma = snapshot.dmc_dma;
         self.cpu_cycles = snapshot.cpu_cycles;
         self.open_bus = snapshot.open_bus;
+        self.cpu_sequence_cycles = 0;
         true
     }
 
@@ -192,17 +236,18 @@ impl Bus {
 
     pub(crate) fn copy_achievement_memory(&self, output: &mut [u8]) {
         for (address, byte) in output.iter_mut().take(0x1_0000).enumerate() {
-            let address = address as u16;
-            *byte = self
-                .cartridge
-                .cpu_peek(address)
-                .unwrap_or_else(|| match address {
-                    0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
-                    // Avoid side effects from PPU, APU, and controller reads.
-                    // Achievement definitions are expected to target RAM.
-                    _ => 0,
-                });
+            *byte = self.peek_cpu(address as u16);
         }
+    }
+
+    pub(crate) fn peek_cpu(&self, address: u16) -> u8 {
+        self.cartridge
+            .cpu_peek(address)
+            .unwrap_or_else(|| match address {
+                0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
+                // Avoid side effects from PPU, APU, and controller reads.
+                _ => 0,
+            })
     }
 
     pub(crate) fn debug_write_cpu_ram(&mut self, offset: usize, value: u8) -> bool {
@@ -216,7 +261,7 @@ impl Bus {
         let mut data = [0; 256];
         let base = (page as u16) << 8;
         for (offset, slot) in data.iter_mut().enumerate() {
-            *slot = self.read(base.wrapping_add(offset as u16));
+            *slot = self.read_untimed(base.wrapping_add(offset as u16));
         }
         self.ppu.write_oam_dma(&data);
         self.dma_stall = 513 + (self.cpu_cycles as u16 & 1);
