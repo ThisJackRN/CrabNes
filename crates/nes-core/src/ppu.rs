@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::cartridge::{Cartridge, Mirroring};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
@@ -119,14 +121,17 @@ impl Ppu {
             // Older/deserialized snapshots do not contain the transient index
             // buffer. Recolor their already-rendered RGB frame as closely as
             // possible; the next rendered frame repopulates exact indices.
+            let mut palette_indices = HashMap::with_capacity(self.output_palette.len());
+            for (index, color) in self.output_palette.iter().copied().enumerate() {
+                // Match the old linear search's first-index behavior when a
+                // palette contains duplicate RGB colors.
+                palette_indices.entry(color).or_insert(index as u8);
+            }
             self.frame_color_indices.clear();
             self.frame_color_indices.reserve(FRAME_WIDTH * FRAME_HEIGHT);
             for pixel in self.frame.pixels.chunks_exact_mut(3) {
-                let index = self
-                    .output_palette
-                    .iter()
-                    .position(|color| color == pixel)
-                    .unwrap_or_default();
+                let color = [pixel[0], pixel[1], pixel[2]];
+                let index = palette_indices.get(&color).copied().unwrap_or_default() as usize;
                 pixel.copy_from_slice(&palette[index]);
                 self.frame_color_indices.push(index as u8);
             }
@@ -140,6 +145,14 @@ impl Ppu {
 
     pub(crate) fn canonicalize_output_for_snapshot(&mut self) {
         self.set_output_palette(NTSC_2C02_PALETTE);
+    }
+
+    pub(crate) fn prepare_default_output_after_snapshot_restore(&mut self) {
+        // This transient buffer is skipped by serde. Rendering overwrites each
+        // visible entry, so a zero-filled buffer is sufficient and avoids an
+        // unnecessary full-frame palette reverse lookup on every rewind step.
+        self.frame_color_indices
+            .resize(FRAME_WIDTH * FRAME_HEIGHT, 0);
     }
 
     pub fn reset(&mut self) {

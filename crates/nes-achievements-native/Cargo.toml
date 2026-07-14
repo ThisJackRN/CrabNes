@@ -1,0 +1,13 @@
+[package]
+name = "nes-achievements-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "nes_rcheevos_native"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"
+
+[lints.rust]
+unsafe_code = "allow"

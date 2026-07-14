@@ -168,7 +168,14 @@ impl Bus {
         self.ppu = snapshot.ppu;
         // Output colors are a front-end preference, not machine state. Keep
         // the active palette when loading save states, rewind, or TAS points.
-        self.ppu.set_output_palette(output_palette);
+        // Serialized snapshots are already normalized to the default palette.
+        // Avoid remapping every framebuffer pixel when that is also the active
+        // palette; this is the hot path during continuous rewind.
+        if self.ppu.output_palette() != output_palette {
+            self.ppu.set_output_palette(output_palette);
+        } else {
+            self.ppu.prepare_default_output_after_snapshot_restore();
+        }
         self.apu = snapshot.apu;
         self.apu.clear_samples();
         self.controllers = snapshot.controllers;
@@ -181,6 +188,21 @@ impl Bus {
 
     pub(crate) fn cpu_ram(&self) -> &[u8] {
         &self.ram
+    }
+
+    pub(crate) fn copy_achievement_memory(&self, output: &mut [u8]) {
+        for (address, byte) in output.iter_mut().take(0x1_0000).enumerate() {
+            let address = address as u16;
+            *byte = self
+                .cartridge
+                .cpu_peek(address)
+                .unwrap_or_else(|| match address {
+                    0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
+                    // Avoid side effects from PPU, APU, and controller reads.
+                    // Achievement definitions are expected to target RAM.
+                    _ => 0,
+                });
+        }
     }
 
     pub(crate) fn debug_write_cpu_ram(&mut self, offset: usize, value: u8) -> bool {

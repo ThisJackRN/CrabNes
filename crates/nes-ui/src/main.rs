@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod achievement_archive;
+mod achievements;
 mod app;
 mod audio;
 mod crt;
@@ -24,7 +26,7 @@ fn main() -> ExitCode {
             eprintln!("error: {error}");
             MessageDialog::new()
                 .set_level(MessageLevel::Error)
-                .set_title("My Own NES Emulator")
+                .set_title("CrabNes")
                 .set_description(error.to_string())
                 .set_buttons(MessageButtons::Ok)
                 .show();
@@ -42,7 +44,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     eframe::run_native(
-        "My Own NES Emulator",
+        "CrabNes",
         native_options,
         Box::new(move |cc| {
             App::new(rom_path, cc)

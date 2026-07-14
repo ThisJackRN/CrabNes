@@ -45,6 +45,17 @@ impl Mapper for Nrom {
         }
     }
 
+    fn cpu_peek(&self, address: u16) -> Option<u8> {
+        match address {
+            0x6000..=0x7fff => Some(self.prg_ram[(address - 0x6000) as usize]),
+            0x8000..=0xffff => {
+                let offset = (address - 0x8000) as usize % self.prg_rom.len();
+                Some(self.prg_rom[offset])
+            }
+            _ => None,
+        }
+    }
+
     fn cpu_write(&mut self, address: u16, value: u8) -> bool {
         match address {
             0x6000..=0x7fff => {

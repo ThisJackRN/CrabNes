@@ -1,348 +1,219 @@
-# My Own NES Emulator
+# CrabNes
 
-A from-scratch NES emulator in Rust with a platform-independent emulation core,
-a native Windows audio backend, a headless CLI, and a desktop front end. The
-current cartridge implementation supports iNES 1.0 Mapper 0 (NROM-128 and
-NROM-256) games.
+[![Windows build](https://github.com/ThisJackRN/CrabNes/actions/workflows/windows-build.yml/badge.svg)](https://github.com/ThisJackRN/CrabNes/actions/workflows/windows-build.yml)
 
-The core owns all emulated state and timing. The desktop UI uses public core APIs
-for save states, rewind, TAS playback, and side-effect-free debug memory access;
-keyboard events, file paths, audio devices, and wall-clock scheduling stay out of
-`nes-core`.
+CrabNes is a from-scratch NES emulator written in Rust. It combines a
+deterministic emulation core with a native Windows desktop interface, responsive
+audio, long smooth rewind, TAS tools, speedrun-safe play profiles, and
+RetroAchievements support.
 
-## Run it
+> [!IMPORTANT]
+> CrabNes currently supports NTSC iNES Mapper 0 games (NROM-128 and NROM-256).
+> More mappers and accuracy work are planned. No commercial ROMs are included;
+> use legally obtained games or homebrew.
 
-Use a legally obtained or homebrew `.nes` ROM.
+## Download for Windows
 
-```powershell
-cargo test --workspace
-cargo run --release -p nes-ui
-```
+Automated 64-bit Windows builds are available from GitHub Actions:
 
-Starting without a ROM opens the Library page. A ROM can also be supplied on the
-command line:
+1. Open the [Windows build workflow](https://github.com/ThisJackRN/CrabNes/actions/workflows/windows-build.yml).
+2. Select the newest successful run.
+3. Download the `CrabNes-windows-x64` artifact.
+4. Extract it and run `CrabNes.exe`.
 
-```powershell
-cargo run --release -p nes-ui -- path\to\game.nes
-```
+Artifacts are retained by GitHub for 30 days. If no artifact is available yet,
+run the workflow manually or [build from source](#build-from-source).
 
-On Windows, `Play NES.bat` starts the same desktop application. The headless CLI
-is useful for smoke tests and screenshots:
+## What CrabNes includes
 
-```powershell
-cargo run -p nes-cli -- path\to\game.nes --frames 120 --screenshot frame.png
-```
+- Cycle-driven NTSC 2A03 CPU, 2C02 PPU, and APU emulation.
+- Native low-latency Windows audio with per-channel controls.
+- Keyboard and hot-pluggable gamepad support for two players.
+- Searchable ROM library with custom titles and cover artwork.
+- Versioned save states with screenshots and ROM validation.
+- LZ4-compressed rewind: two minutes by default, configurable up to ten minutes.
+- TAS recording, playback, rerecording, frame editing, seeking, and checkpoints.
+- FCEUX `.fm2` and BizHawk `.bk2`/`Input Log.txt` movie import.
+- Debugger, guarded hex editor, custom palettes, and optional CRT rendering.
+- Standard, Speedrun, and Achievement play profiles.
+- RetroAchievements sign-in, badge artwork, progress, unlock archive, and
+  animated in-game notifications.
 
-## Keyboard shortcuts
+## Play profiles
 
-| Key | Action |
+Choose a profile under **Settings > General**.
+
+| Profile | Intended use | Emulator assists |
+|---|---|---|
+| Standard | Normal play, debugging, and TAS work | Available |
+| Speedrun | Clean real-time runs at normal speed | Disabled |
+| Achievements | RetroAchievements play at normal speed | Disabled |
+
+Speedrun and Achievement profiles lock the emulator to 1x and remove pause,
+frame advance, rewind, save states, TAS tools, debugger/hex editing, impossible
+D-pad combinations, and their hotkeys. Reset, power controls, input mapping,
+screenshots, and presentation settings remain available.
+
+### RetroAchievements status
+
+CrabNes vendors the official rcheevos 12.3.0 client. Networking and badge image
+loading run off the emulation thread, while achievement evaluation uses a
+side-effect-free memory snapshot once per emulated frame.
+
+CrabNes is not yet an approved RetroAchievements client. Normal account sign-in,
+game identification, sets, badges, progress, and unlock UI work, but the service
+does not award hardcore unlocks to an unknown emulator. The Achievements window
+pins that limitation as a warning instead of presenting it as a game achievement.
+
+## Compatibility
+
+| Area | Current support |
 |---|---|
-| Arrow keys | D-pad (remappable) |
-| Z / X | A / B (remappable) |
-| Enter / Shift | Start / Select (remappable) |
-| I/J/K/L | Player 2 Up/Left/Down/Right (remappable) |
-| C / V | Player 2 A / B (remappable) |
-| E / Q | Player 2 Start / Select (remappable) |
+| Region | NTSC |
+| ROM format | iNES 1.0 |
+| Mapper | Mapper 0 / NROM-128 / NROM-256 |
+| Desktop | Windows x64 |
+| Controllers | Two NES controllers through keyboard and gamepads |
+| Battery RAM | `.sav` beside the ROM |
+| Save states | Versioned, validated, and separated by ROM hash |
+
+The PPU is not yet dot-perfect for every sprite evaluation and fetch-pipeline
+quirk. PAL/Dendy timing, unofficial CPU opcodes, light guns, Four Score, and
+additional cartridge mappers are not implemented yet.
+
+## Controls
+
+All gameplay bindings can be changed in **Settings > Input**.
+
+| Default key | Action |
+|---|---|
+| Arrow keys | Player 1 D-pad |
+| Z / X | Player 1 A / B |
+| Shift / Enter | Player 1 Select / Start |
+| I / J / K / L | Player 2 Up / Left / Down / Right |
+| C / V | Player 2 A / B |
+| Q / E | Player 2 Select / Start |
 | Ctrl+O | Open ROM |
 | Space | Pause or resume |
 | R | Reset |
 | P | Power off or on |
 | Ctrl+P | Power cycle |
-| F5 | Quick-save selected slot |
-| F8 | Quick-load selected slot |
-| Shift+F5 | Open Save States |
-| N | Advance one frame and pause |
-| Hold Advance button | Continuously frame-advance at roughly NTSC frame rate |
+| F5 / F8 | Quick save / quick load |
+| N | Advance one frame |
 | Backspace (hold) | Rewind |
-| Tab (hold) | 4x fast-forward; audio is muted |
+| Tab (hold) | 4x fast-forward |
 | Num0 | Return to 1x speed |
-| F1 | Open debugger |
-| F2 | Open hex editor and pause |
-| F11 | Toggle fullscreen |
-| F12 | Save a PNG in a `screenshots` folder beside the ROM |
+| F1 / F2 | Debugger / hex editor |
+| F11 | Fullscreen |
+| F12 | Screenshot |
 
-Hotkeys are ignored while typing into a text field so editing an address, search,
-or TAS value does not accidentally control the console.
+Assist hotkeys are ignored in Speedrun and Achievement profiles. Hotkeys are
+also ignored while typing in a text field.
 
-## Desktop features
+## Save states and rewind
 
-### ROM library and recent games
+Each game has ten save-state slots by default. States include the full CPU, PPU,
+APU, mapper, controller, DMA, interrupt, power, timing, and framebuffer state.
+They carry a ROM hash and format version, so incompatible states are rejected
+before they can alter the running console.
 
-The dedicated Library page combines games previously opened by the user with
-supported `.nes` files found in the configured ROM folder. A persistent Library
-tab opens a compact cover/title card view with Play and a `...` menu. Each game can
-have a custom library title and a PNG, JPEG, WebP, or BMP cover image. Selected
-images are validated and copied into the application data folder. The menu can
-also remove a game from the library without deleting its ROM file. Search,
-title/recent sorting, refresh, path and ROM de-duplication, and safe handling of
-missing or invalid files remain available.
+Rewind stores periodic full-machine snapshots in a bounded, LZ4-compressed ring.
+Compression happens on a background worker, and reverse playback uses a
+drift-free 60 Hz schedule. Releasing Backspace resumes play when appropriate.
 
-The default ROM folder is `%USERPROFILE%\Documents\NES ROMs`. Choose another
-folder on the Library page or under Settings > Paths. The selection persists.
-The old `recent-roms.txt` list is imported once when upgrading from an earlier
-build.
+## TAS tools
 
-### Save states and rewind
+The TAS editor records both controllers once per emulated frame. It supports
+power-on, reset, and embedded-state starting conditions; read-only playback;
+held input; insertion/deletion; range editing; bookmarks; rerecord counts; and
+deterministic seeking through cached checkpoints.
 
-Each game has 10 slots by default (configurable from 1 through 20). A slot shows
-its local creation time and an RGB screenshot preview. F5 and F8 quick-save and
-quick-load the selected slot. States are versioned and include the ROM hash, so a
-state from a different game or incompatible emulator version is rejected before
-it can alter the machine.
+Native `.tas` files are readable text and include the ROM SHA-256. CrabNes still
+accepts movies created before the rename with the legacy emulator identifier.
+See the [TAS format specification](docs/TAS_FORMAT.md) and
+[TAS Control View guide](docs/TAS_CONTROL_VIEW.md).
 
-The core snapshot includes CPU registers/internal state, CPU RAM, PPU state,
-nametables/palette/OAM/framebuffer, APU channels/sequencer/filter/resampler state,
-mapper RAM/CHR RAM, controllers, DMA, open bus, CPU timing, power state, and
-pending interrupt state. Presentation audio already queued to the host is cleared
-after loading so old samples cannot pop or play after the restored frame.
+## Settings and existing data
 
-Rewind uses the same core snapshot API in a bounded in-memory ring. The rewind
-duration and snapshot interval are configurable. TAS position and lag-tool
-counters are restored with each rewind point, which permits deterministic
-rerecording after rewinding. Rewinding during a live TAS recording is destructive:
-the restored frame and all later recorded inputs are removed, future checkpoints
-are invalidated, and the movie's rerecord count is incremented.
-
-### TAS tools
-
-The TAS editor records complete Player 1 and Player 2 controller states once per
-emulated frame. Movies can begin from deterministic power-on, reset, or an
-embedded save state. Playback ignores normal gameplay input while pause, frame
-advance, seek, save/load, and stop hotkeys remain active. Live recording is locked
-to 1x; playback can use the normal speed controls.
-
-The virtualized timeline shows every frame and both controllers' A/B/Select/Start/
-D-pad states. Clicking a row selects it without moving the emulator. A stable
-selected-frame panel provides large input toggles, previous/next row navigation,
-copy-previous, and clear controls. Range clearing/filling, insertion, deletion,
-duplication, and internal copy/paste are also available. Manual editing pauses the
-emulator and invalidates later checkpoints but never seeks automatically; `Seek
-selected` enters non-destructive preview mode, and `Rerecord from here` explicitly
-switches back to live-input recording. Frame advance follows the next movie row;
-the timeline includes a visible `next new frame / end of movie` row.
-
-The TAS playhead is always the next input frame to execute. Pausing or frame
-advancing selects that exact frame, including the editable end row. Writing input
-to the end row creates the new current frame; it never modifies the frame that
-just finished. Selecting a row only moves the editor highlight and never scrolls
-or seeks behind the user's back. `Seek selected` explicitly moves and pauses the
-machine; writing input to a non-current selected row also aligns the machine there
-so the edit can be previewed safely.
-
-Frame advance previews recorded rows until it reaches the end row, then
-automatically continues recording. Each click or repeat therefore appends a new
-row, including blank-input frames, instead of leaving the movie inactive. A
-read-only movie remains protected and stops at its end.
-
-The GUI controller buttons also act as a held-input latch. A selected button is
-combined with live keyboard input and written into every new or rerecorded frame
-while frame advance is held. The end-row buttons remain visibly selected until
-the user unselects them; clearing the latch releases the buttons on subsequent
-frames.
-
-Bookmarks link directly to marked frames. Previous, Next, Seek selected, rewind,
-and held frame advance move through the movie. Automatic full-machine checkpoints
-default to every 300 frames and are configurable under Settings > TAS. Seeking
-loads the nearest earlier checkpoint, replays recorded inputs to the target,
-pauses there, and clears queued presentation audio. Optional checkpoint SHA-256
-values detect state divergence during later playback where reference hashes exist.
-The frame-advance control advances once on click and repeats at the NTSC frame rate
-while held, including when both the top-bar and TAS-window controls are visible.
-Controller bindings are sampled even while the mouse-held advance button has UI
-focus, so live rerecord input is not replaced with an empty controller state.
-
-`Play read-only` disables timeline, metadata, marker, paste, and rerecord changes.
-The TAS debug log reports mode transitions, frame progress, recording/rerecord
-events, loads/saves, checkpoint activity, invalid data, ROM mismatches, and detected
-desyncs.
-
-### TAS Control View and external movie conversion
-
-The separate TAS Control View opens FCEUX text `.fm2`, BizHawk `.bk2`, extracted
-BizHawk `Input Log.txt`, and native `.tas` files without immediately changing the
-running movie. It provides a virtualized two-controller input list, hexadecimal
-masks, button names, frame jump, source metadata, rerecord count, and explicit
-warnings for conversion differences.
-
-After loading the matching NES ROM, choose power-on, reset, or current state and
-use `Convert and open in TAS Editor`. The controller log becomes a native movie
-and can then be edited, replayed, or saved normally. FM2/BK2 reset, power, disk,
-and coin commands are displayed and preserved as warning markers but are not
-executed. PAL timing, Four Score players 3/4, Zapper input, binary FM2 logs, and
-foreign emulator save states are not silently approximated. See
-[`docs/TAS_CONTROL_VIEW.md`](docs/TAS_CONTROL_VIEW.md).
-
-### Hex editor and debugger
-
-F2 opens the hex editor and pauses emulation. It exposes:
-
-- CPU RAM, PPU nametable memory, palette RAM, and OAM as guarded writable views.
-- PRG ROM as read-only.
-- CHR as read-only for CHR-ROM games and writable for CHR-RAM games.
-- Hexadecimal and ASCII columns, paging, byte selection/editing, and hexadecimal
-  address jump.
-
-All reads are side-effect-free snapshots. Writes use bounds-checked core methods;
-invalid hexadecimal values, out-of-range offsets, and read-only writes are
-rejected. The debugger reports CPU/PPU registers and timing, frame count, lag
-count, and controller-read activity, with pause/resume and frame-step controls.
-
-### Settings, input, audio, and video
-
-Settings are grouped into General, Video, Audio, Input, Emulation, Paths, Save
-States, TAS, and Debugging. Every category has a restore-default button. New
-fields receive defaults when an older settings file is loaded without resetting
-the existing known values. The Settings window can be closed with its explicit
-button, its title-bar control, or Escape, and can be dragged outside the game area.
-
-Safe changes apply immediately, including volume/mute, optional soft clipping,
-integer scaling, FPS-target display, input mapping, speed, rewind limits, ROM
-folder, slot count, and hex-page size. Native audio startup-buffer changes are
-clearly marked as restart-required. Per-game overrides are available for volume,
-mute, and speed without modifying the global defaults.
-
-Controller settings default to hardware-style D-pad conflict handling: pressing
-Left+Right or Up+Down together produces neutral direction input, matching the
-stock NES controller's rocker. **Allow opposite D-pad directions** can be enabled
-for specialized TAS/debug use. Existing TAS movie playback is not rewritten by
-this live-controller preference.
-
-Video settings include the default NTSC 2C02 approximation, the documented
-RP2C03 RGB DAC palette used by PlayChoice-10, and imported custom palettes. The
-palette applies immediately and remains a presentation preference across save
-states, rewind, and TAS playback. See
-[`docs/CUSTOM_PALETTES.md`](docs/CUSTOM_PALETTES.md) for supported formats.
-
-The optional CRT display now includes a Royale-style advanced profile inspired
-by CRT-Royale's documented rendering model. It adds gamma-correct luminance-
-dependent beams, aperture-grille/slot/shadow masks, RGB convergence, faceplate
-halation, glass diffusion, bloom, vignette, and barrel-curved edges. PVM and
-consumer-TV presets are included, while the original lightweight profile remains
-available for slower systems. The filter changes presentation only and does not
-affect screenshots, save states, rewind, or TAS determinism. See
-[`docs/CRT_FILTER.md`](docs/CRT_FILTER.md).
-
-The separate **Flat CRT** profile keeps the advanced beam, phosphor, analog
-softness, bloom, halation, diffusion, and convergence effects while disabling
-curvature, vignette, and curved black screen borders.
-
-Advanced CRT rows are processed in parallel, and normal-speed presentation uses
-a small phase-lock tolerance to prevent timer jitter from producing a missed
-frame followed by a two-frame catch-up. The FPS display uses a rolling two-second
-measurement so short sampling-window quantization does not appear as false dips.
-
-The Audio / Video window also has independent Pulse 1, Pulse 2, Triangle, Noise,
-and DMC output gates. Muted channels still clock and DMC DMA/IRQ behavior remains
-active, so channel isolation does not change emulated timing. Audio diagnostics
-show the native device, sample rate, queued frames, underruns, and overflows.
-
-## Persistent files and formats
-
-On Windows, application data defaults to:
+CrabNes stores user data under:
 
 ```text
-%LOCALAPPDATA%\MyOwnNesEmulator\
-  settings.json                 Global categorized settings
-  per-game-settings.json        ROM-hash-keyed volume/mute/speed overrides
-  library.json                  Opened games and recently played timestamps
-  library-covers\               Copied custom game cover images
-  palettes\                     Validated, normalized custom RGB palettes
-  recent-roms.txt               Legacy list, read only for one-time migration
-  states\<rom-hash>\slot-N.moss Versioned state + timestamp + RGB preview
-  tas\<rom-hash>\               Default TAS import/export folder
+%LOCALAPPDATA%\CrabNes\
+  settings.json                 Global settings and play profile
+  per-game-settings.json        ROM-specific presentation overrides
+  library.json                  Library metadata and recent games
+  library-covers\               Copied custom cover artwork
+  achievement-archive.json      Local RetroAchievements unlock history
+  palettes\                     Imported custom palettes
+  states\<rom-hash>\             Save-state slots and previews
+  tas\<rom-hash>\                Default TAS folder
 ```
 
-`.moss` files have a versioned `MONESUI` wrapper around the versioned core
-`MONESST` snapshot. Both store a 64-bit hash of the complete iNES file. `.tas`
-movies use the emulator's readable `TAS_FORMAT 1` text format with a full ROM
-SHA-256, emulator version, NTSC region, start type, rerecord count, optional author
-and description, optional base64 embedded starting state, markers, checkpoint state
-hashes, and one `frame|player1|player2` hexadecimal input line per frame. JSON
-settings use `version: 1` and Serde defaults for forward additions. Files are
-written through a temporary file and renamed to reduce partial-write risk.
+On first launch, CrabNes automatically moves an existing
+`%LOCALAPPDATA%\MyOwnNesEmulator` directory to the new location. If Windows blocks
+the move, CrabNes safely continues using the legacy directory for that session.
+Battery saves and screenshots remain beside the ROM.
 
-Example:
+## Build from source
 
-```text
-TAS_FORMAT 1
-EMULATOR MyOwnNesEmulator
-EMULATOR_VERSION 0.1.0
-ROM_SHA256 0123456789abcdef...
-REGION NTSC
-START_TYPE POWER_ON
-RERECORDS 12
-PLAYERS 2
+Install the [stable Rust toolchain](https://www.rust-lang.org/tools/install).
+Windows builds may also require the Visual Studio C++ Build Tools because the
+native audio backend and rcheevos runtime include C code.
 
-[INPUT]
-0|00|00
-1|80|00
-2|80|01
+```powershell
+git clone https://github.com/ThisJackRN/CrabNes.git
+cd CrabNes
+cargo test --workspace --locked
+cargo run --release -p nes-ui --locked
 ```
 
-The complete field and section specification is in
-[`docs/TAS_FORMAT.md`](docs/TAS_FORMAT.md).
+You can pass a ROM path on the command line:
 
-Battery-backed PRG RAM remains a `.sav` beside the ROM. Screenshots go into a
-`screenshots` directory beside the ROM. Save states are not battery saves and are
-never substituted for them.
+```powershell
+cargo run --release -p nes-ui --locked -- path\to\game.nes
+```
 
-## Project structure
+The included `Play CrabNes.bat` launcher runs the optimized desktop application.
+The headless runner can be used for smoke tests and screenshots:
+
+```powershell
+cargo run -p nes-cli --locked -- path\to\game.nes --frames 120 --screenshot frame.png
+```
+
+## Documentation
+
+- [TAS movie format](docs/TAS_FORMAT.md)
+- [TAS Control View and external movie conversion](docs/TAS_CONTROL_VIEW.md)
+- [CRT filters](docs/CRT_FILTER.md)
+- [Custom palettes](docs/CUSTOM_PALETTES.md)
+- [Third-party licenses and acknowledgements](THIRD_PARTY_NOTICES.md)
+
+## Project layout
 
 ```text
 crates/
-  nes-core/                 Platform-independent deterministic console
-    src/
-      apu/                  Channels, frame sequencer, mixer, filters, resampler
-      bus.rs                CPU map, CPU/APU/PPU clocks, OAM and DMC DMA
-      cartridge/            iNES parser, mapper interface, Mapper 0
-      controller.rs         NES serial controllers
-      cpu.rs                2A03/6502 CPU
-      emulator.rs           Console facade, snapshots, debug memory APIs
-      ppu.rs                2C02 timing, memory, and RGB frame generation
-  nes-audio-native/         Native miniaudio backend and PCM ring buffer
-  nes-cli/                  Headless frame runner
-  nes-ui/                   Library, settings, states, TAS, hex/debug, A/V UI
+  nes-core/                    Platform-independent emulation core
+  nes-audio-native/            Native miniaudio output
+  nes-achievements-native/     Safe Rust wrapper around vendored rcheevos
+  nes-cli/                     Headless frame runner
+  nes-ui/                      CrabNes desktop application
 ```
 
-CPU instruction cycles clock the APU once and PPU three times. Front-end frame
-scheduling only decides how much emulated work to request; it does not act as an
-emulation clock. The APU generates samples from the NTSC CPU clock, uses nonlinear
-pulse/TND mixing and NES-style filters, and the native ring buffer handles device
-synchronization independently of Unity or UI frame timing.
+The core contains no window, input-device, filesystem, audio-device, or
+wall-clock dependencies. Front ends decide how much emulated work to request;
+they do not act as the emulation clock.
 
-## Current limitations
-
-- Only NTSC iNES 1.0 Mapper 0 is supported. PAL and Dendy are intentionally not
-  mixed into the NTSC timing path.
-- Only keyboard controller mapping is exposed; gamepad/device binding is not yet
-  implemented.
-- Library scans the selected folder's top level, not subdirectories, and ROM
-  titles are derived from file names rather than an external metadata database.
-- TAS checkpoints and embedded reset/save-state starts are intentionally
-  uncompressed, so long sessions trade disk or memory for simple deterministic
-  inspection. The editor has one active branch rather than a branch tree.
-- Rewind uses periodic full snapshots, so longer buffers trade memory for history.
-- The hex editor changes live machine memory but does not provide undo or ROM
-  patch export.
-- The PPU is not yet dot-perfect for every sprite evaluation/overflow and fetch
-  pipeline quirk; unofficial CPU opcodes and mapper expansion remain future core
-  accuracy work.
-
-## Verification
+## Development checks
 
 ```powershell
-cargo test --workspace
+cargo fmt --all -- --check
+cargo test --workspace --locked
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release --workspace
+cargo build --release --workspace --locked
 ```
 
-Core tests include save/load round trips, incompatible-state rejection, guarded
-memory editing, and deterministic replay of an identical controller sequence from
-the same starting snapshot, in addition to CPU/PPU/APU timing tests.
+## License
 
-## Third-party notice
-
-`nes-audio-native` vendors miniaudio 0.11.25 for native device access. Its license
-is at `crates/nes-audio-native/native/LICENSE-miniaudio`. Selected APU timing and
-filter behavior was adapted from the permissively licensed TetaNES project; the
-attribution and MIT license are in `THIRD_PARTY_NOTICES.md`.
+CrabNes is available under the [MIT License](LICENSE). Vendored libraries,
+adapted permissive code, and interoperability references are documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

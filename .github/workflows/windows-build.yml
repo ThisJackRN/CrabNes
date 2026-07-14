@@ -1,4 +1,4 @@
-name: Windows build
+name: CrabNes Windows build
 
 on:
   push:
@@ -27,12 +27,20 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Build optimized emulator
-        run: cargo build --release -p nes-ui --locked
+        run: cargo build --release -p nes-ui --bin CrabNes --locked
+
+      - name: Package CrabNes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target/release/CrabNes.exe dist/
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/
 
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
-          name: MyOwnNesEmulator-windows-x64
-          path: target/release/nes-ui.exe
+          name: CrabNes-windows-x64
+          path: dist/
           if-no-files-found: error
           retention-days: 30

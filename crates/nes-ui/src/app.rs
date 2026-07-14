@@ -1,12 +1,17 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fs,
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    thread,
     time::{Duration, Instant},
 };
 
 use eframe::egui::{self, ColorImage, Key, TextureHandle, TextureOptions, Vec2};
+use gilrs::{Axis, Button as GamepadButton, EventType, Gamepad, Gilrs};
+use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
+use nes_achievements_native::{Event as AchievementEvent, EventKind as AchievementEventKind};
 use nes_core::{
     ApuChannel, Button, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace, NTSC_2C02_PALETTE, NTSC_FRAME_RATE,
     Nes, OutputPalette, RGB_2C03_PALETTE,
@@ -14,13 +19,15 @@ use nes_core::{
 use rfd::FileDialog;
 
 use crate::{
+    achievement_archive::{Archive as AchievementArchive, UnlockEntry},
+    achievements,
     audio::AudioOutput,
     crt::{CrtParameters, CrtRenderer},
     library::{EntryStatus, LibraryEntry, RomLibrary},
     palettes, persistence, save_states, screenshot,
     settings::{
-        self, CrtMask, CrtProfile, KeyBinding, PaletteMode, PerGameSettings, Settings,
-        VideoSettings,
+        self, CrtMask, CrtProfile, GamepadBinding, KeyBinding, PaletteMode, PerGameSettings,
+        PlayMode, Settings, VideoSettings,
     },
     tas::{self, TasEditor, TasFrame, TasManager, TasMode, TasMovie, TasStartType},
     tas_control::{self, ControlMovie},
@@ -28,6 +35,7 @@ use crate::{
 
 const SPEEDS: &[f64] = &[0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0];
 const NORMAL_SPEED_INDEX: usize = 2;
+const REWIND_UPDATES_PER_SECOND: f64 = 60.0;
 // Permit a normal-speed frame to begin up to this fraction early. This keeps a
 // 60 Hz presentation callback phase-locked to the 60.0988 Hz NES cadence instead
 // of alternating between zero frames and a two-frame catch-up due to timer jitter.
@@ -68,11 +76,100 @@ enum TasTimelineAction {
     InsertPaste,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BindingCapture {
+    Keyboard { player: usize, button: usize },
+    Gamepad { player: usize, button: usize },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AchievementPanel {
+    CurrentSet,
+    Archive,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AchievementFilter {
+    All,
+    Locked,
+    Unlocked,
+}
+
+#[derive(Clone)]
+struct AchievementToast {
+    title: String,
+    description: String,
+    points: u32,
+    badge_url: String,
+    started_at: Option<Instant>,
+}
+
 struct RewindPoint {
-    machine: Vec<u8>,
+    compressed_machine: Vec<u8>,
+    uncompressed_len: usize,
+    generation: u64,
     tas_cursor: usize,
     lag_frames: u64,
     controller_reads: u64,
+}
+
+struct RewindCapture {
+    machine: Vec<u8>,
+    generation: u64,
+    tas_cursor: usize,
+    lag_frames: u64,
+    controller_reads: u64,
+}
+
+impl RewindPoint {
+    fn compress(capture: RewindCapture) -> Self {
+        Self {
+            compressed_machine: compress_prepend_size(&capture.machine),
+            uncompressed_len: capture.machine.len(),
+            generation: capture.generation,
+            tas_cursor: capture.tas_cursor,
+            lag_frames: capture.lag_frames,
+            controller_reads: capture.controller_reads,
+        }
+    }
+
+    fn decompress(&self) -> Result<Vec<u8>, lz4_flex::block::DecompressError> {
+        decompress_size_prepended(&self.compressed_machine)
+    }
+}
+
+struct RewindCompressor {
+    captures: SyncSender<RewindCapture>,
+    points: Receiver<RewindPoint>,
+}
+
+impl RewindCompressor {
+    fn new() -> Self {
+        // A short bounded queue prevents compression from ever building an
+        // unbounded latency or memory backlog behind live emulation.
+        let (capture_tx, capture_rx) = mpsc::sync_channel::<RewindCapture>(2);
+        let (point_tx, point_rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("rewind-compressor".into())
+            .spawn(move || {
+                while let Ok(capture) = capture_rx.recv() {
+                    if point_tx.send(RewindPoint::compress(capture)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("could not start rewind compression worker");
+        Self {
+            captures: capture_tx,
+            points: point_rx,
+        }
+    }
+
+    fn submit(&self, capture: RewindCapture) {
+        match self.captures.try_send(capture) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
 }
 
 pub struct App {
@@ -90,9 +187,11 @@ pub struct App {
     frame_budget: f64,
     last_tick: Instant,
     fps_window_start: Instant,
-    emulated_frames_in_window: u64,
+    presented_frames_in_window: u64,
     measured_fps: f64,
-    last_rewind: Instant,
+    next_rewind_step: Instant,
+    rewind_active: bool,
+    resume_after_rewind: bool,
     last_held_frame_advance: Instant,
     frame_advance_hold_started: Option<Instant>,
     frame_advance_held: bool,
@@ -101,7 +200,22 @@ pub struct App {
     audio: Option<AudioOutput>,
     audio_error: Option<String>,
     audio_scratch: Vec<f32>,
+    gamepads: Option<Gilrs>,
+    gamepad_error: Option<String>,
+    last_gamepad_activity: Option<String>,
+    binding_capture: Option<BindingCapture>,
+    achievements: achievements::Manager,
+    show_achievements: bool,
+    achievement_password: String,
+    achievement_feed: VecDeque<String>,
+    achievement_panel: AchievementPanel,
+    achievement_filter: AchievementFilter,
+    achievement_archive: AchievementArchive,
+    achievement_badges: HashMap<String, TextureHandle>,
+    achievement_badges_requested: HashSet<String>,
+    achievement_toasts: VecDeque<AchievementToast>,
     settings: Settings,
+    active_play_mode: PlayMode,
     per_game: PerGameSettings,
     settings_dirty: bool,
     settings_category: SettingsCategory,
@@ -134,6 +248,8 @@ pub struct App {
     tas_control_start: TasStartType,
     tas_control_status: String,
     rewind: VecDeque<RewindPoint>,
+    rewind_compressor: RewindCompressor,
+    rewind_generation: u64,
     lag_frames: u64,
     last_controller_reads: u64,
     hex_space: MemorySpace,
@@ -146,6 +262,7 @@ pub struct App {
 impl App {
     pub fn new(path: Option<PathBuf>, cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
         let settings = settings::load();
+        let play_mode = settings.general.play_mode;
         let image = ColorImage::from_rgb(
             [FRAME_WIDTH, FRAME_HEIGHT],
             &vec![0; FRAME_WIDTH * FRAME_HEIGHT * 3],
@@ -158,6 +275,11 @@ impl App {
             Ok(audio) => (Some(audio), None),
             Err(error) => (None, Some(error)),
         };
+        let (gamepads, gamepad_error) = match Gilrs::new() {
+            Ok(gamepads) => (Some(gamepads), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let achievements = achievements::Manager::new()?;
         let mut tas_manager = TasManager::default();
         tas_manager.checkpoint_interval = settings.tas.checkpoint_interval.max(1);
         let migrate_legacy_recents = !crate::library::library_path().is_file();
@@ -191,14 +313,20 @@ impl App {
             paused: true,
             powered: false,
             fullscreen: settings.video.fullscreen_on_start,
-            speed_index: settings.emulation.speed_index.min(SPEEDS.len() - 1),
+            speed_index: if play_mode.restricts_assists() {
+                NORMAL_SPEED_INDEX
+            } else {
+                settings.emulation.speed_index.min(SPEEDS.len() - 1)
+            },
             fast_forward: false,
             frame_budget: 0.0,
             last_tick: Instant::now(),
             fps_window_start: Instant::now(),
-            emulated_frames_in_window: 0,
+            presented_frames_in_window: 0,
             measured_fps: 0.0,
-            last_rewind: Instant::now(),
+            next_rewind_step: Instant::now(),
+            rewind_active: false,
+            resume_after_rewind: false,
             last_held_frame_advance: Instant::now(),
             frame_advance_hold_started: None,
             frame_advance_held: false,
@@ -207,7 +335,22 @@ impl App {
             audio,
             audio_error,
             audio_scratch: Vec::with_capacity(1_024),
+            gamepads,
+            gamepad_error,
+            last_gamepad_activity: None,
+            binding_capture: None,
+            achievements,
+            show_achievements: false,
+            achievement_password: String::new(),
+            achievement_feed: VecDeque::new(),
+            achievement_panel: AchievementPanel::CurrentSet,
+            achievement_filter: AchievementFilter::All,
+            achievement_archive: AchievementArchive::load(),
+            achievement_badges: HashMap::new(),
+            achievement_badges_requested: HashSet::new(),
+            achievement_toasts: VecDeque::new(),
             settings,
+            active_play_mode: play_mode,
             per_game: PerGameSettings::default(),
             settings_dirty: false,
             settings_category: SettingsCategory::General,
@@ -244,6 +387,8 @@ impl App {
             tas_control_start: TasStartType::PowerOn,
             tas_control_status: "Open an external TAS movie to inspect its inputs".into(),
             rewind: VecDeque::new(),
+            rewind_compressor: RewindCompressor::new(),
+            rewind_generation: 0,
             lag_frames: 0,
             last_controller_reads: 0,
             hex_space: MemorySpace::CpuRam,
@@ -252,6 +397,9 @@ impl App {
             hex_selected: None,
             hex_value: String::new(),
         };
+        if play_mode == PlayMode::Achievement {
+            app.start_achievement_session();
+        }
         if let Some(path) = initial
             && let Err(error) = app.load_rom(path)
         {
@@ -266,6 +414,13 @@ impl App {
     }
 
     fn emulate(&mut self, ctx: &egui::Context) {
+        if self.play_mode() == PlayMode::Achievement {
+            let events = self.achievements.pump(self.paused || !self.powered);
+            self.handle_achievement_events(events);
+            self.collect_achievement_badges(ctx);
+        }
+        self.collect_compressed_rewind_points();
+        self.poll_input_devices(ctx);
         self.handle_hotkeys(ctx);
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
@@ -273,7 +428,17 @@ impl App {
         let speed = self.current_speed();
         let held_frame_advance =
             self.frame_advance_held && ctx.input(|input| input.pointer.any_down()) && self.powered;
-        if held_frame_advance {
+        let rewind_held = self.play_mode() == PlayMode::Standard
+            && !self.key_is_controller_binding(Key::Backspace)
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|input| input.key_down(Key::Backspace))
+            && self.powered
+            && self.nes.is_some();
+        self.update_continuous_rewind(rewind_held);
+        if rewind_held {
+            self.frame_budget = 0.0;
+            ctx.request_repaint_after(Duration::from_millis(1));
+        } else if held_frame_advance {
             self.frame_budget = 0.0;
             let interval = Duration::from_secs_f64(1.0 / NTSC_FRAME_RATE);
             let repeating = self
@@ -305,21 +470,15 @@ impl App {
                 self.frame_budget = self.frame_budget.min(1.0);
             }
         }
-        if ctx.input(|input| input.key_down(Key::Backspace))
-            && self.last_rewind.elapsed() >= Duration::from_millis(35)
-        {
-            self.rewind_step();
-            self.last_rewind = Instant::now();
-        }
         let fps_elapsed = self.fps_window_start.elapsed();
         if fps_elapsed >= Duration::from_secs(2) {
-            let sample = self.emulated_frames_in_window as f64 / fps_elapsed.as_secs_f64();
+            let sample = self.presented_frames_in_window as f64 / fps_elapsed.as_secs_f64();
             self.measured_fps = if self.measured_fps == 0.0 {
                 sample
             } else {
                 self.measured_fps * 0.35 + sample * 0.65
             };
-            self.emulated_frames_in_window = 0;
+            self.presented_frames_in_window = 0;
             self.fps_window_start = Instant::now();
         }
         let volume = self.effective_volume();
@@ -342,23 +501,23 @@ impl App {
     }
 
     fn run_one_frame(&mut self, live_input: TasFrame, present_audio: bool) -> bool {
+        let achievement_mode = self.play_mode() == PlayMode::Achievement;
         let interval = self.settings.emulation.rewind_interval_frames.max(1);
-        if let Some(nes) = &self.nes
+        if self.play_mode() == PlayMode::Standard
+            && let Some(nes) = &self.nes
             && nes.frame().number.is_multiple_of(interval)
             && let Ok(machine) = nes.save_state()
         {
-            self.rewind.push_back(RewindPoint {
+            self.rewind_compressor.submit(RewindCapture {
                 machine,
+                generation: self.rewind_generation,
                 tas_cursor: self.tas.cursor,
                 lag_frames: self.lag_frames,
                 controller_reads: self.last_controller_reads,
             });
-            let max = self.settings.emulation.rewind_seconds * 60 / interval as usize;
-            while self.rewind.len() > max.max(1) {
-                self.rewind.pop_front();
-            }
         }
-        if self.tas.mode != TasMode::Inactive
+        if self.play_mode() == PlayMode::Standard
+            && self.tas.mode != TasMode::Inactive
             && self
                 .tas
                 .cursor
@@ -416,12 +575,15 @@ impl App {
             self.last_controller_reads = reads_after;
             self.audio_scratch.clear();
             nes.drain_audio_samples(&mut self.audio_scratch);
+            if achievement_mode {
+                self.achievements.do_frame(nes);
+            }
         }
         if present_audio && let Some(audio) = &mut self.audio {
             audio.push(&self.audio_scratch);
         }
         self.frame_dirty = true;
-        self.emulated_frames_in_window = self.emulated_frames_in_window.wrapping_add(1);
+        self.presented_frames_in_window = self.presented_frames_in_window.wrapping_add(1);
         if self.tas.mode != TasMode::Inactive {
             self.follow_tas_cursor();
         }
@@ -429,6 +591,9 @@ impl App {
     }
 
     fn handle_hotkeys(&mut self, ctx: &egui::Context) {
+        if self.binding_capture.is_some() {
+            return;
+        }
         let (ctrl, shift) = ctx.input(|input| (input.modifiers.ctrl, input.modifiers.shift));
         if ctrl && ctx.input(|i| i.key_pressed(Key::O)) {
             self.open_rom_dialog();
@@ -439,66 +604,94 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        if ctx.input(|i| i.key_pressed(Key::Space)) {
+        let assists_allowed = self.play_mode() == PlayMode::Standard;
+        if assists_allowed && self.hotkey_pressed(ctx, Key::Space) {
             self.toggle_pause();
         }
-        if ctx.input(|i| i.key_pressed(Key::R)) {
+        if self.hotkey_pressed(ctx, Key::R) {
             self.reset();
         }
-        if ctx.input(|i| i.key_pressed(Key::P)) {
+        if self.hotkey_pressed(ctx, Key::P) {
             if ctrl {
                 self.power_cycle();
             } else {
                 self.toggle_power();
             }
         }
-        if ctx.input(|i| i.key_pressed(Key::F5)) {
+        if assists_allowed && self.hotkey_pressed(ctx, Key::F5) {
             self.quick_save();
         }
-        if ctx.input(|i| i.key_pressed(Key::F8)) {
+        if assists_allowed && self.hotkey_pressed(ctx, Key::F8) {
             self.quick_load();
         }
-        if ctx.input(|i| i.key_pressed(Key::N)) {
+        if assists_allowed && self.hotkey_pressed(ctx, Key::N) {
             self.advance_frame(ctx);
         }
-        if ctx.input(|i| i.key_pressed(Key::F11)) {
+        if self.hotkey_pressed(ctx, Key::F11) {
             self.toggle_fullscreen(ctx);
         }
-        if ctx.input(|i| i.key_pressed(Key::F12)) {
+        if self.hotkey_pressed(ctx, Key::F12) {
             self.take_screenshot();
         }
-        if ctx.input(|i| i.key_pressed(Key::Num0)) {
+        if assists_allowed && self.hotkey_pressed(ctx, Key::Num0) {
             self.speed_index = NORMAL_SPEED_INDEX;
         }
-        if ctx.input(|i| i.key_pressed(Key::F1)) {
+        if assists_allowed && self.hotkey_pressed(ctx, Key::F1) {
             self.show_debugger = true;
         }
-        if ctx.input(|i| i.key_pressed(Key::F2)) {
+        if assists_allowed && self.hotkey_pressed(ctx, Key::F2) {
             self.show_hex = true;
             self.paused = true;
         }
-        self.fast_forward = ctx.input(|i| i.key_down(Key::Tab));
-        if shift && ctx.input(|i| i.key_pressed(Key::F5)) {
+        self.fast_forward = assists_allowed
+            && !self.key_is_controller_binding(Key::Tab)
+            && ctx.input(|i| i.key_down(Key::Tab));
+        if assists_allowed && shift && self.hotkey_pressed(ctx, Key::F5) {
             self.show_states = true;
         }
     }
 
+    fn hotkey_pressed(&self, ctx: &egui::Context, key: Key) -> bool {
+        !self.key_is_controller_binding(key) && ctx.input(|input| input.key_pressed(key))
+    }
+
+    fn key_is_controller_binding(&self, key: Key) -> bool {
+        let name = key.name();
+        self.settings
+            .input
+            .bindings
+            .iter()
+            .chain(&self.settings.input.player2_bindings)
+            .any(|binding| binding.label() == name)
+    }
+
     fn host_input_frame(&self, ctx: &egui::Context) -> TasFrame {
-        if ctx.egui_wants_keyboard_input() {
+        if self.binding_capture.is_some() {
             return TasFrame::default();
+        }
+        if ctx.egui_wants_keyboard_input() {
+            return self.gamepad_input_frame();
         }
         self.bound_input_frame(ctx)
     }
 
     fn bound_input_frame(&self, ctx: &egui::Context) -> TasFrame {
+        let gamepad = self.gamepad_input_frame();
         self.filter_live_dpad(TasFrame {
-            player1: binding_mask(ctx, &self.settings.input.bindings),
-            player2: binding_mask(ctx, &self.settings.input.player2_bindings),
+            player1: binding_mask(ctx, &self.settings.input.bindings) | gamepad.player1,
+            player2: binding_mask(ctx, &self.settings.input.player2_bindings) | gamepad.player2,
+        })
+    }
+
+    fn gamepad_input_frame(&self) -> TasFrame {
+        self.filter_live_dpad(TasFrame {
+            player1: self.gamepad_mask(0, &self.settings.input.gamepad_bindings),
+            player2: self.gamepad_mask(1, &self.settings.input.player2_gamepad_bindings),
         })
     }
 
     fn filter_live_dpad(&self, input: TasFrame) -> TasFrame {
-        if self.settings.input.allow_opposite_directions {
+        if self.play_mode() == PlayMode::Standard && self.settings.input.allow_opposite_directions {
             input
         } else {
             TasFrame {
@@ -506,6 +699,139 @@ impl App {
                 player2: neutralize_opposite_directions(input.player2),
             }
         }
+    }
+
+    fn poll_input_devices(&mut self, ctx: &egui::Context) {
+        if self.binding_capture.is_some() && ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.binding_capture = None;
+            self.status = "Input binding cancelled".into();
+        }
+        if let Some(BindingCapture::Keyboard { player, button }) = self.binding_capture {
+            let key = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(physical_key.unwrap_or(*key)),
+                    _ => None,
+                })
+            });
+            if let Some(key) = key {
+                let binding = KeyBinding::new(key.name());
+                let label = binding.label().to_owned();
+                if player == 0 {
+                    self.settings.input.bindings[button] = binding;
+                } else {
+                    self.settings.input.player2_bindings[button] = binding;
+                }
+                self.binding_capture = None;
+                self.settings_dirty = true;
+                self.status = format!(
+                    "Player {} {} is now bound to {label}",
+                    player + 1,
+                    nes_button_label(button)
+                );
+            }
+        }
+
+        let mut captured = None;
+        if let Some(gamepads) = &mut self.gamepads {
+            while let Some(event) = gamepads.next_event() {
+                let slot = gamepads.gamepads().position(|(id, _)| id == event.id);
+                if let Some(description) = describe_gamepad_event(event.event) {
+                    let device = gamepads
+                        .connected_gamepad(event.id)
+                        .map(|gamepad| gamepad.name().to_owned())
+                        .unwrap_or_else(|| "disconnected controller".into());
+                    self.last_gamepad_activity = Some(match slot {
+                        Some(slot) => format!("#{} {device}: {description}", slot + 1),
+                        None => format!("{device}: {description}"),
+                    });
+                }
+                if let Some(BindingCapture::Gamepad { player, button }) = self.binding_capture {
+                    let threshold = self.settings.input.gamepad_axis_threshold.clamp(0.1, 0.9);
+                    let binding = match event.event {
+                        EventType::ButtonPressed(gamepad_button, code) => {
+                            Some(GamepadBinding::ExactButton {
+                                button: gamepad_button,
+                                code,
+                            })
+                        }
+                        EventType::ButtonChanged(gamepad_button, value, code)
+                            if value >= threshold =>
+                        {
+                            Some(GamepadBinding::ExactButton {
+                                button: gamepad_button,
+                                code,
+                            })
+                        }
+                        EventType::ButtonChanged(gamepad_button, value, code) if value <= 0.05 => {
+                            Some(GamepadBinding::ExactButtonLow {
+                                button: gamepad_button,
+                                code,
+                            })
+                        }
+                        EventType::AxisChanged(axis, value, code) if value.abs() >= threshold => {
+                            let direction = if value.is_sign_positive() { 1 } else { -1 };
+                            Some(GamepadBinding::ExactAxis {
+                                axis,
+                                code,
+                                direction,
+                            })
+                        }
+                        EventType::AxisChanged(axis, value, code) if value.abs() <= 0.05 => {
+                            Some(GamepadBinding::ExactAxisLow { axis, code })
+                        }
+                        _ => None,
+                    };
+                    if let Some(binding) = binding {
+                        captured = Some((player, button, binding, slot));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((player, button, binding, slot)) = captured {
+            if player == 0 {
+                self.settings.input.gamepad_bindings[button] = Some(binding);
+            } else {
+                self.settings.input.player2_gamepad_bindings[button] = Some(binding);
+            }
+            self.settings.input.gamepad_slots[player] = slot;
+            self.binding_capture = None;
+            self.settings_dirty = true;
+            self.status = format!(
+                "Player {} {} is now bound to {}",
+                player + 1,
+                nes_button_label(button),
+                gamepad_binding_label(binding)
+            );
+        }
+    }
+
+    fn gamepad_mask(&self, player: usize, bindings: &[Option<GamepadBinding>; 8]) -> u8 {
+        let Some(gamepads) = &self.gamepads else {
+            return 0;
+        };
+        let slot = self.settings.input.gamepad_slots[player].unwrap_or(player);
+        let Some((_, gamepad)) = gamepads.gamepads().nth(slot) else {
+            return 0;
+        };
+        bindings
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (index, binding)| {
+                mask | (u8::from(binding.is_some_and(|binding| {
+                    gamepad_binding_down(
+                        &gamepad,
+                        binding,
+                        self.settings.input.gamepad_axis_threshold.clamp(0.1, 0.9),
+                    )
+                })) << index)
+            })
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -525,6 +851,7 @@ impl App {
         }
 
         let mut action = None;
+        let assists_allowed = self.play_mode() == PlayMode::Standard;
         egui::Panel::top("top-bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -560,56 +887,58 @@ impl App {
                 });
 
                 ui.menu_button("Emulation", |ui| {
-                    let pause_label = if self.paused {
-                        "Resume    Space"
-                    } else {
-                        "Pause    Space"
-                    };
-                    if ui
-                        .add_enabled(self.nes.is_some(), egui::Button::new(pause_label))
-                        .clicked()
-                    {
-                        action = Some(MenuAction::TogglePause);
-                        ui.close();
+                    if assists_allowed {
+                        let pause_label = if self.paused {
+                            "Resume    Space"
+                        } else {
+                            "Pause    Space"
+                        };
+                        if ui
+                            .add_enabled(self.nes.is_some(), egui::Button::new(pause_label))
+                            .clicked()
+                        {
+                            action = Some(MenuAction::TogglePause);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.powered, egui::Button::new("Frame Advance    N"))
+                            .clicked()
+                        {
+                            action = Some(MenuAction::FrameAdvance);
+                            ui.close();
+                        }
+                        let can_rewind = if self.tas.movie.is_some() {
+                            self.tas.cursor > 0
+                        } else {
+                            !self.rewind.is_empty()
+                        };
+                        if ui
+                            .add_enabled(
+                                can_rewind,
+                                egui::Button::new("Rewind One Step    Backspace"),
+                            )
+                            .clicked()
+                        {
+                            action = Some(MenuAction::RewindFrame);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(self.nes.is_some(), egui::Button::new("Quick Save    F5"))
+                            .clicked()
+                        {
+                            action = Some(MenuAction::QuickSave);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.nes.is_some(), egui::Button::new("Quick Load    F8"))
+                            .clicked()
+                        {
+                            action = Some(MenuAction::QuickLoad);
+                            ui.close();
+                        }
+                        ui.separator();
                     }
-                    if ui
-                        .add_enabled(self.powered, egui::Button::new("Frame Advance    N"))
-                        .clicked()
-                    {
-                        action = Some(MenuAction::FrameAdvance);
-                        ui.close();
-                    }
-                    let can_rewind = if self.tas.movie.is_some() {
-                        self.tas.cursor > 0
-                    } else {
-                        !self.rewind.is_empty()
-                    };
-                    if ui
-                        .add_enabled(
-                            can_rewind,
-                            egui::Button::new("Rewind One Frame    Backspace"),
-                        )
-                        .clicked()
-                    {
-                        action = Some(MenuAction::RewindFrame);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(self.nes.is_some(), egui::Button::new("Quick Save    F5"))
-                        .clicked()
-                    {
-                        action = Some(MenuAction::QuickSave);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.nes.is_some(), egui::Button::new("Quick Load    F8"))
-                        .clicked()
-                    {
-                        action = Some(MenuAction::QuickLoad);
-                        ui.close();
-                    }
-                    ui.separator();
                     if ui
                         .add_enabled(self.nes.is_some(), egui::Button::new("Reset    R"))
                         .clicked()
@@ -687,35 +1016,41 @@ impl App {
                     }
                 });
 
-                ui.menu_button("Tools", |ui| {
-                    if ui.button("Save States…").clicked() {
-                        self.show_states = true;
-                        ui.close();
-                    }
-                    if ui.button("Rewind & Speed…").clicked() {
-                        self.show_time = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("TAS Editor…").clicked() {
-                        self.show_tas = true;
-                        ui.close();
-                    }
-                    if ui.button("TAS Control View…").clicked() {
-                        self.show_tas_control = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Debugger…    F1").clicked() {
-                        self.show_debugger = true;
-                        ui.close();
-                    }
-                    if ui.button("Hex Editor…    F2").clicked() {
-                        self.show_hex = true;
-                        self.paused = true;
-                        ui.close();
-                    }
-                });
+                if assists_allowed {
+                    ui.menu_button("Tools", |ui| {
+                        if ui.button("Save States…").clicked() {
+                            self.show_states = true;
+                            ui.close();
+                        }
+                        if ui.button("Rewind & Speed…").clicked() {
+                            self.show_time = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("TAS Editor…").clicked() {
+                            self.show_tas = true;
+                            ui.close();
+                        }
+                        if ui.button("TAS Control View…").clicked() {
+                            self.show_tas_control = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Debugger…    F1").clicked() {
+                            self.show_debugger = true;
+                            ui.close();
+                        }
+                        if ui.button("Hex Editor…    F2").clicked() {
+                            self.show_hex = true;
+                            self.paused = true;
+                            ui.close();
+                        }
+                    });
+                }
+                if self.play_mode() == PlayMode::Achievement && ui.button("Achievements").clicked()
+                {
+                    self.show_achievements = true;
+                }
 
                 ui.separator();
                 ui.selectable_value(&mut self.page, MainPage::Game, "Game");
@@ -728,6 +1063,8 @@ impl App {
                     }
                     let frame = self.nes.as_ref().map_or(0, |nes| nes.frame().number);
                     ui.label(format!("Frame {frame} · Lag {}", self.lag_frames));
+                    ui.separator();
+                    ui.label(self.play_mode().label());
                     ui.separator();
                     ui.label(if self.paused { "Paused" } else { "Running" });
                 });
@@ -813,6 +1150,7 @@ impl App {
                 ui.add(egui::Image::new(&self.texture).fit_to_exact_size(size));
             });
         });
+        self.achievement_toast_overlay(ui.ctx());
     }
 
     fn library_page(&mut self, ui: &mut egui::Ui) {
@@ -1088,14 +1426,351 @@ impl App {
 
     fn feature_windows(&mut self, ui: &mut egui::Ui) {
         self.settings_window(ui);
-        self.states_window(ui);
-        self.time_window(ui);
-        self.tas_window(ui);
-        self.tas_control_window(ui);
+        self.achievements_window(ui);
         self.input_window(ui);
         self.av_window(ui);
-        self.debugger_window(ui);
-        self.hex_window(ui);
+        if self.play_mode() == PlayMode::Standard {
+            self.states_window(ui);
+            self.time_window(ui);
+            self.tas_window(ui);
+            self.tas_control_window(ui);
+            self.debugger_window(ui);
+            self.hex_window(ui);
+        }
+    }
+
+    fn achievements_window(&mut self, ui: &mut egui::Ui) {
+        if !self.show_achievements || self.play_mode() != PlayMode::Achievement {
+            return;
+        }
+
+        let user = self.achievements.user();
+        let game = self.achievements.game();
+        let mut achievement_rows = if game.is_some() {
+            self.achievements.achievements()
+        } else {
+            Vec::new()
+        };
+        let client_warning = achievement_rows
+            .iter()
+            .find(|achievement| is_achievement_client_warning(achievement))
+            .cloned();
+        achievement_rows.retain(|achievement| !is_achievement_client_warning(achievement));
+        achievement_rows.sort_by_key(|achievement| !achievement.unlocked);
+        for achievement in &achievement_rows {
+            let url = if achievement.unlocked {
+                &achievement.badge_url
+            } else {
+                &achievement.badge_locked_url
+            };
+            self.ensure_achievement_badge(url);
+        }
+        let archive_entries: Vec<_> = self
+            .achievement_archive
+            .entries
+            .iter()
+            .filter(|entry| entry.achievement_id != 0 && !entry.title.starts_with("Warning:"))
+            .cloned()
+            .collect();
+        for entry in &archive_entries {
+            self.ensure_achievement_badge(&entry.badge_url);
+        }
+        let hardcore = self.achievements.is_hardcore();
+        let game_loaded = self.achievements.is_game_loaded();
+        let mut open = self.show_achievements;
+        let mut sign_in = false;
+        let mut logout = false;
+        egui::Window::new("RetroAchievements")
+            .open(&mut open)
+            .default_width(680.0)
+            .default_height(620.0)
+            .resizable(true)
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(27, 29, 36))
+                    .corner_radius(8)
+                    .inner_margin(12)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.heading("RetroAchievements");
+                                if let Some(user) = &user {
+                                    ui.label(format!(
+                                        "{}  ·  {} hardcore points",
+                                        user.display_name, user.score
+                                    ));
+                                } else {
+                                    ui.label("Sign in to unlock achievements and leaderboards");
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let color = if client_warning.is_some() {
+                                        egui::Color32::from_rgb(232, 174, 61)
+                                    } else if hardcore && game_loaded {
+                                        egui::Color32::from_rgb(82, 196, 112)
+                                    } else {
+                                        egui::Color32::from_rgb(230, 174, 64)
+                                    };
+                                    ui.colored_label(
+                                        color,
+                                        if client_warning.is_some() {
+                                            "HARDCORE UNAVAILABLE"
+                                        } else if hardcore && game_loaded {
+                                            "HARDCORE ACTIVE"
+                                        } else if hardcore {
+                                            "HARDCORE READY"
+                                        } else {
+                                            "OFFLINE"
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                    });
+
+                if let Some(warning) = &client_warning {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(55, 43, 22))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(184, 130, 39),
+                        ))
+                        .corner_radius(7)
+                        .inner_margin(10)
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("!")
+                                        .size(22.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(244, 191, 73)),
+                                );
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Emulator verification required")
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(246, 208, 125)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&warning.description)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(220, 205, 174)),
+                                    );
+                                });
+                            });
+                        });
+                }
+
+                if user.is_none() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Username");
+                        ui.text_edit_singleline(&mut self.settings.achievements.username);
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.achievement_password)
+                                .password(true)
+                                .desired_width(150.0),
+                        );
+                        if ui
+                            .add_enabled(
+                                !self.settings.achievements.username.trim().is_empty()
+                                    && !self.achievement_password.is_empty(),
+                                egui::Button::new("Sign in"),
+                            )
+                            .clicked()
+                        {
+                            sign_in = true;
+                        }
+                    });
+                    ui.small("Your password is used only for sign-in. Only the returned token is saved locally.");
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.achievement_panel,
+                        AchievementPanel::CurrentSet,
+                        "Current game",
+                    );
+                    ui.selectable_value(
+                        &mut self.achievement_panel,
+                        AchievementPanel::Archive,
+                        format!("Unlock archive ({})", archive_entries.len()),
+                    );
+                    if user.is_some() {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("Sign out").clicked() {
+                                    logout = true;
+                                }
+                            },
+                        );
+                    }
+                });
+                ui.separator();
+
+                match self.achievement_panel {
+                    AchievementPanel::CurrentSet => {
+                        if let Some(game) = &game {
+                            let unlocked = achievement_rows
+                                .iter()
+                                .filter(|achievement| achievement.unlocked)
+                                .count();
+                            let earned_points: u32 = achievement_rows
+                                .iter()
+                                .filter(|achievement| achievement.unlocked)
+                                .map(|achievement| achievement.points)
+                                .sum();
+                            let total_points: u32 = achievement_rows
+                                .iter()
+                                .map(|achievement| achievement.points)
+                                .sum();
+                            ui.heading(&game.title);
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{unlocked}/{} unlocked",
+                                    achievement_rows.len()
+                                ));
+                                ui.separator();
+                                ui.label(format!("{earned_points}/{total_points} points"));
+                                ui.separator();
+                                ui.small(format!("Game ID {}", game.id));
+                            });
+                            let progress = if achievement_rows.is_empty() {
+                                0.0
+                            } else {
+                                unlocked as f32 / achievement_rows.len() as f32
+                            };
+                            ui.add(egui::ProgressBar::new(progress).show_percentage());
+                            ui.horizontal(|ui| {
+                                ui.label("Show:");
+                                ui.selectable_value(
+                                    &mut self.achievement_filter,
+                                    AchievementFilter::All,
+                                    "All",
+                                );
+                                ui.selectable_value(
+                                    &mut self.achievement_filter,
+                                    AchievementFilter::Locked,
+                                    "Locked",
+                                );
+                                ui.selectable_value(
+                                    &mut self.achievement_filter,
+                                    AchievementFilter::Unlocked,
+                                    "Unlocked",
+                                );
+                            });
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for unlocked_group in [true, false] {
+                                    if matches!(
+                                        (self.achievement_filter, unlocked_group),
+                                        (AchievementFilter::Locked, true)
+                                            | (AchievementFilter::Unlocked, false)
+                                    ) {
+                                        continue;
+                                    }
+                                    let count = achievement_rows
+                                        .iter()
+                                        .filter(|achievement| {
+                                            achievement.unlocked == unlocked_group
+                                        })
+                                        .count();
+                                    if count == 0 {
+                                        continue;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(if unlocked_group {
+                                            format!("UNLOCKED  {count}")
+                                        } else {
+                                            format!("LOCKED  {count}")
+                                        })
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_gray(165)),
+                                    );
+                                    for achievement in achievement_rows.iter().filter(
+                                        |achievement| achievement.unlocked == unlocked_group,
+                                    ) {
+                                        let badge_url = if achievement.unlocked {
+                                            &achievement.badge_url
+                                        } else {
+                                            &achievement.badge_locked_url
+                                        };
+                                        achievement_card(
+                                            ui,
+                                            achievement,
+                                            self.achievement_badges.get(badge_url),
+                                        );
+                                        ui.add_space(5.0);
+                                    }
+                                }
+                            });
+                        } else if user.is_some() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(50.0);
+                                ui.heading("No achievement set loaded");
+                                ui.label("Load a supported NES game to see its achievements.");
+                            });
+                        }
+                    }
+                    AchievementPanel::Archive => {
+                        let archived_points: u32 =
+                            archive_entries.iter().map(|entry| entry.points).sum();
+                        ui.heading("Unlock archive");
+                        ui.label(format!(
+                            "{} unlocks · {} points earned in this emulator",
+                            archive_entries.len(), archived_points
+                        ));
+                        ui.small("This local history is kept even when you switch games.");
+                        ui.add_space(6.0);
+                        if archive_entries.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(50.0);
+                                ui.heading("No archived unlocks yet");
+                                ui.label("Achievements earned here will appear in this list.");
+                            });
+                        } else {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for entry in &archive_entries {
+                                    archive_card(
+                                        ui,
+                                        entry,
+                                        self.achievement_badges.get(&entry.badge_url),
+                                    );
+                                    ui.add_space(5.0);
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        self.show_achievements = open;
+
+        if sign_in {
+            let username = self.settings.achievements.username.trim().to_owned();
+            match self
+                .achievements
+                .login_password(&username, &self.achievement_password)
+            {
+                Ok(()) => self.status = "Signing in to RetroAchievements…".into(),
+                Err(error) => self.status = format!("RetroAchievements sign-in failed: {error}"),
+            }
+        }
+        if logout {
+            self.achievements.logout();
+            self.achievements.unload_game();
+            self.settings.achievements.token.clear();
+            self.achievement_password.clear();
+            self.settings_dirty = true;
+            self.status = "Signed out of RetroAchievements".into();
+        }
     }
 
     fn settings_window(&mut self, ui: &mut egui::Ui) {
@@ -1104,6 +1779,7 @@ impl App {
         }
         let mut open = self.show_settings;
         let mut close_requested = false;
+        let old_play_mode = self.settings.general.play_mode;
         let old_default_speed = self.settings.emulation.speed_index;
         let old_slot_count = self.settings.save_states.slots;
         let old_palette = (
@@ -1124,6 +1800,18 @@ impl App {
                     }
                 });
                 ui.separator();
+                let restricted = self.settings.general.play_mode.restricts_assists();
+                if restricted
+                    && matches!(
+                        self.settings_category,
+                        SettingsCategory::Emulation
+                            | SettingsCategory::SaveStates
+                            | SettingsCategory::Tas
+                            | SettingsCategory::Debugging
+                    )
+                {
+                    self.settings_category = SettingsCategory::General;
+                }
                 ui.horizontal_wrapped(|ui| {
                     for (cat, label) in [
                         (SettingsCategory::General, "General"),
@@ -1136,6 +1824,17 @@ impl App {
                         (SettingsCategory::Tas, "TAS"),
                         (SettingsCategory::Debugging, "Debugging"),
                     ] {
+                        if restricted
+                            && matches!(
+                                cat,
+                                SettingsCategory::Emulation
+                                    | SettingsCategory::SaveStates
+                                    | SettingsCategory::Tas
+                                    | SettingsCategory::Debugging
+                            )
+                        {
+                            continue;
+                        }
                         ui.selectable_value(&mut self.settings_category, cat, label);
                     }
                 });
@@ -1143,6 +1842,34 @@ impl App {
                 let mut changed = false;
                 match self.settings_category {
                     SettingsCategory::General => {
+                        ui.strong("Play profile");
+                        ui.horizontal_wrapped(|ui| {
+                            for mode in [
+                                PlayMode::Standard,
+                                PlayMode::Speedrun,
+                                PlayMode::Achievement,
+                            ] {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.general.play_mode,
+                                        mode,
+                                        mode.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                        ui.label(match self.settings.general.play_mode {
+                            PlayMode::Standard => {
+                                "All emulator tools are available, including rewind, save states, speed controls, TAS, pause, and debugging."
+                            }
+                            PlayMode::Speedrun => {
+                                "Clean 1x play: save states, rewind, speed controls, pause/frame advance, TAS, and debugging are disabled."
+                            }
+                            PlayMode::Achievement => {
+                                "RetroAchievements hardcore play at 1x with emulator assists and debugging disabled."
+                            }
+                        });
+                        ui.separator();
                         changed |= ui
                             .checkbox(
                                 &mut self.settings.general.reopen_last_game,
@@ -1210,9 +1937,10 @@ impl App {
                         }
                     }
                     SettingsCategory::Input => {
-                        changed |= input_mapping_ui(ui, &mut self.settings);
+                        changed |= self.input_mapping_ui(ui);
                         if ui.button("Restore Input defaults").clicked() {
                             self.settings.input = Default::default();
+                            self.binding_capture = None;
                             changed = true;
                         }
                     }
@@ -1222,9 +1950,10 @@ impl App {
                             .add(
                                 egui::Slider::new(
                                     &mut self.settings.emulation.rewind_seconds,
-                                    1..=30,
+                                    5..=600,
                                 )
-                                .text("Rewind seconds"),
+                                .logarithmic(true)
+                                .text("Rewind history (seconds)"),
                             )
                             .changed();
                         changed |= ui
@@ -1336,20 +2065,22 @@ impl App {
                             self.per_game.muted = Some(mute);
                             self.save_per_game();
                         }
-                        let mut use_s = self.per_game.speed_index.is_some();
-                        if ui.checkbox(&mut use_s, "Override speed").changed() {
-                            self.per_game.speed_index = use_s.then_some(self.speed_index);
-                            self.save_per_game();
-                        }
-                        if use_s {
-                            let mut speed = self
-                                .per_game
-                                .speed_index
-                                .unwrap_or(self.speed_index)
-                                .min(SPEEDS.len() - 1);
-                            if speed_ui(ui, &mut speed) {
-                                self.per_game.speed_index = Some(speed);
+                        if self.settings.general.play_mode == PlayMode::Standard {
+                            let mut use_s = self.per_game.speed_index.is_some();
+                            if ui.checkbox(&mut use_s, "Override speed").changed() {
+                                self.per_game.speed_index = use_s.then_some(self.speed_index);
                                 self.save_per_game();
+                            }
+                            if use_s {
+                                let mut speed = self
+                                    .per_game
+                                    .speed_index
+                                    .unwrap_or(self.speed_index)
+                                    .min(SPEEDS.len() - 1);
+                                if speed_ui(ui, &mut speed) {
+                                    self.per_game.speed_index = Some(speed);
+                                    self.save_per_game();
+                                }
                             }
                         }
                     });
@@ -1373,7 +2104,12 @@ impl App {
         if old_crt != crt_signature(&self.settings.video) {
             self.frame_dirty = true;
         }
-        if self.settings.emulation.speed_index != old_default_speed {
+        if self.settings.general.play_mode != old_play_mode {
+            self.apply_play_mode(self.settings.general.play_mode);
+        }
+        if self.play_mode() == PlayMode::Standard
+            && self.settings.emulation.speed_index != old_default_speed
+        {
             self.speed_index = self.settings.emulation.speed_index.min(SPEEDS.len() - 1);
         }
         if self.settings.save_states.slots != old_slot_count {
@@ -1483,14 +2219,35 @@ impl App {
                     )
                     .clicked()
                 {
-                    self.rewind_once();
+                    self.rewind_step();
                 }
                 ui.label(format!(
-                    "{} snapshots buffered (~{} seconds)",
+                    "{} compressed snapshots ({:.1} s, {})",
                     self.rewind.len(),
-                    self.settings.emulation.rewind_seconds
+                    self.rewind.len() as f64
+                        * self.settings.emulation.rewind_interval_frames.max(1) as f64
+                        / NTSC_FRAME_RATE,
+                    format_bytes(
+                        self.rewind
+                            .iter()
+                            .map(|point| point.compressed_machine.len())
+                            .sum()
+                    )
                 ));
-                ui.label("Hold Backspace to rewind.");
+                let uncompressed: usize =
+                    self.rewind.iter().map(|point| point.uncompressed_len).sum();
+                let compressed: usize = self
+                    .rewind
+                    .iter()
+                    .map(|point| point.compressed_machine.len())
+                    .sum();
+                if uncompressed > 0 {
+                    ui.label(format!(
+                        "Stored at {:.1}% of the original state size",
+                        compressed as f64 * 100.0 / uncompressed as f64
+                    ));
+                }
+                ui.label("Hold Backspace for continuous reverse playback; release to resume.");
             });
         self.show_time = open;
     }
@@ -2172,6 +2929,13 @@ impl App {
     }
 
     fn convert_tas_control_movie(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "TAS tools are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         let Some(source) = self.tas_control_movie.clone() else {
             return;
         };
@@ -2208,6 +2972,201 @@ impl App {
         self.tas_control_status = self.status.clone();
     }
 
+    fn input_mapping_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let connected = self
+            .gamepads
+            .as_ref()
+            .map(|gamepads| {
+                gamepads
+                    .gamepads()
+                    .enumerate()
+                    .map(|(slot, (_, gamepad))| (slot, gamepad.name().to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if let Some(error) = &self.gamepad_error {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!("Gamepad support could not start: {error}"),
+            );
+        } else if connected.is_empty() {
+            ui.label("No controller detected. Plug one in; it can be mapped without restarting.");
+        } else {
+            ui.label(format!(
+                "{} controller{} detected: {}",
+                connected.len(),
+                if connected.len() == 1 { "" } else { "s" },
+                connected
+                    .iter()
+                    .map(|(slot, name)| format!("#{} {name}", slot + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(activity) = &self.last_gamepad_activity {
+            ui.monospace(format!("Last raw input: {activity}"));
+        } else if !connected.is_empty() {
+            ui.small("Press something on the controller to inspect its raw input.");
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            for player in 0..2 {
+                ui.label(format!("Player {} controller:", player + 1));
+                let automatic = format!("Automatic (controller #{})", player + 1);
+                let selected = self.settings.input.gamepad_slots[player]
+                    .and_then(|slot| {
+                        connected
+                            .iter()
+                            .find(|(candidate, _)| *candidate == slot)
+                            .map(|(slot, name)| format!("#{} {name}", slot + 1))
+                    })
+                    .unwrap_or_else(|| automatic.clone());
+                egui::ComboBox::from_id_salt(("gamepad-slot", player, ui.id()))
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.input.gamepad_slots[player],
+                                None,
+                                &automatic,
+                            )
+                            .changed();
+                        for (slot, name) in &connected {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.input.gamepad_slots[player],
+                                    Some(*slot),
+                                    format!("#{} {name}", slot + 1),
+                                )
+                                .changed();
+                        }
+                    });
+            }
+        });
+
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.settings.input.gamepad_axis_threshold, 0.1..=0.9)
+                    .text("Stick / axis activation threshold"),
+            )
+            .changed();
+        ui.small(
+            "Lower this if a direction will not capture or activate. Raise it if an axis drifts.",
+        );
+        if self.play_mode() == PlayMode::Standard {
+            changed |= ui
+                .checkbox(
+                    &mut self.settings.input.allow_opposite_directions,
+                    "Allow opposite D-pad directions",
+                )
+                .on_hover_text(
+                    "Off matches a stock NES rocker D-pad: Left+Right and Up+Down cancel to neutral. Enable only for TAS/debug input that intentionally needs impossible combinations.",
+                )
+                .changed();
+        }
+        if self.play_mode().restricts_assists() || !self.settings.input.allow_opposite_directions {
+            ui.small("Hardware-accurate D-pad: opposite directions cancel to neutral.");
+        }
+
+        if let Some(capture) = self.binding_capture {
+            ui.horizontal(|ui| {
+                let (kind, player, button) = match capture {
+                    BindingCapture::Keyboard { player, button } => ("key", player, button),
+                    BindingCapture::Gamepad { player, button } => {
+                        ("controller button or direction", player, button)
+                    }
+                };
+                ui.strong(format!(
+                    "Press a {kind} for Player {} {}…",
+                    player + 1,
+                    nes_button_label(button)
+                ));
+                if ui.button("Cancel").clicked() {
+                    self.binding_capture = None;
+                }
+                ui.small("Esc also cancels capture.");
+            });
+        } else {
+            ui.small(
+                "Click any mapping, then press the key or controller input you want. Controller capture stores the exact hardware input for compatibility.",
+            );
+        }
+
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::Grid::new(ui.id().with("input-map"))
+                .striped(true)
+                .min_col_width(105.0)
+                .show(ui, |ui| {
+                    ui.strong("NES button");
+                    ui.strong("P1 keyboard");
+                    ui.strong("P1 controller");
+                    ui.strong("P2 keyboard");
+                    ui.strong("P2 controller");
+                    ui.end_row();
+                    for button in 0..8 {
+                        ui.label(nes_button_label(button));
+                        for player in 0..2 {
+                            let keyboard_capture = BindingCapture::Keyboard { player, button };
+                            let key_label = if self.binding_capture == Some(keyboard_capture) {
+                                "Press a key…".to_owned()
+                            } else if player == 0 {
+                                self.settings.input.bindings[button].label().to_owned()
+                            } else {
+                                self.settings.input.player2_bindings[button]
+                                    .label()
+                                    .to_owned()
+                            };
+                            if ui.button(key_label).clicked() {
+                                self.binding_capture = Some(keyboard_capture);
+                            }
+
+                            let gamepad_capture = BindingCapture::Gamepad { player, button };
+                            let binding = if player == 0 {
+                                self.settings.input.gamepad_bindings[button]
+                            } else {
+                                self.settings.input.player2_gamepad_bindings[button]
+                            };
+                            let gamepad_label = if self.binding_capture == Some(gamepad_capture) {
+                                "Press input…".to_owned()
+                            } else {
+                                binding
+                                    .map(gamepad_binding_label)
+                                    .unwrap_or_else(|| "Not bound".into())
+                            };
+                            let response = ui
+                                .button(gamepad_label)
+                                .on_hover_text("Click to capture. Right-click to clear.");
+                            if response.clicked() {
+                                self.binding_capture = Some(gamepad_capture);
+                            }
+                            if response.secondary_clicked() {
+                                if player == 0 {
+                                    self.settings.input.gamepad_bindings[button] = None;
+                                } else {
+                                    self.settings.input.player2_gamepad_bindings[button] = None;
+                                }
+                                if self.binding_capture == Some(gamepad_capture) {
+                                    self.binding_capture = None;
+                                }
+                                changed = true;
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+        let player1 = self.gamepad_mask(0, &self.settings.input.gamepad_bindings);
+        let player2 = self.gamepad_mask(1, &self.settings.input.player2_gamepad_bindings);
+        ui.monospace(format!(
+            "Mapped input test — P1: {}   P2: {}",
+            input_mask_label(player1),
+            input_mask_label(player2)
+        ));
+        changed
+    }
+
     fn input_window(&mut self, ui: &mut egui::Ui) {
         if !self.show_input {
             return;
@@ -2215,8 +3174,10 @@ impl App {
         let mut open = self.show_input;
         egui::Window::new("Input Configuration")
             .open(&mut open)
+            .default_width(760.0)
+            .resizable(true)
             .show(ui, |ui| {
-                if input_mapping_ui(ui, &mut self.settings) {
+                if self.input_mapping_ui(ui) {
                     self.settings_dirty = true;
                 }
                 ui.label("Mappings apply immediately and are saved globally.");
@@ -2568,6 +3529,10 @@ impl App {
     }
 
     fn toggle_pause(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!("Pause is disabled in {} mode", self.play_mode().label());
+            return;
+        }
         if self.nes.is_some() {
             self.paused = !self.paused;
             if self.paused {
@@ -2584,6 +3549,13 @@ impl App {
         }
     }
     fn advance_frame(&mut self, ctx: &egui::Context) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "Frame advance is disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if self.powered {
             if !self.tas.prepare_frame_advance() {
                 self.paused = true;
@@ -2611,16 +3583,20 @@ impl App {
         }
     }
     fn reset(&mut self) {
+        let achievement_mode = self.play_mode() == PlayMode::Achievement;
         if let Some(nes) = &mut self.nes {
             nes.reset();
             self.powered = true;
             self.paused = false;
-            self.rewind.clear();
+            self.clear_rewind_history();
             self.tas.stop();
             self.lag_frames = 0;
             self.frame_dirty = true;
             self.clear_audio_pipeline();
             self.status = "Reset".into();
+        }
+        if achievement_mode {
+            self.achievements.reset();
         }
     }
     fn power_cycle(&mut self) {
@@ -2646,7 +3622,75 @@ impl App {
             }
         }
     }
+
+    fn collect_compressed_rewind_points(&mut self) {
+        loop {
+            match self.rewind_compressor.points.try_recv() {
+                Ok(point) if point.generation == self.rewind_generation => {
+                    self.rewind.push_back(point);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        let interval = self.settings.emulation.rewind_interval_frames.max(1) as usize;
+        let max = self.settings.emulation.rewind_seconds.saturating_mul(60) / interval;
+        while self.rewind.len() > max.max(1) {
+            self.rewind.pop_front();
+        }
+    }
+
+    fn invalidate_pending_rewind_captures(&mut self) {
+        self.rewind_generation = self.rewind_generation.wrapping_add(1);
+    }
+
+    fn clear_rewind_history(&mut self) {
+        self.invalidate_pending_rewind_captures();
+        self.rewind.clear();
+    }
+
+    fn update_continuous_rewind(&mut self, held: bool) {
+        let interval = Duration::from_secs_f64(1.0 / REWIND_UPDATES_PER_SECOND);
+        let now = Instant::now();
+        if held {
+            if !self.rewind_active {
+                self.rewind_active = true;
+                self.resume_after_rewind = !self.paused;
+                self.paused = true;
+                self.frame_budget = 0.0;
+                self.next_rewind_step = now;
+                self.invalidate_pending_rewind_captures();
+                self.clear_audio_pipeline();
+            }
+            if now >= self.next_rewind_step {
+                self.rewind_step();
+                // Advance the deadline instead of resetting it to `now`, so
+                // timer jitter cannot accumulate into a lower rewind rate.
+                self.next_rewind_step =
+                    advance_rewind_deadline(self.next_rewind_step, now, interval);
+            }
+        } else if self.rewind_active {
+            self.rewind_active = false;
+            if self.resume_after_rewind && self.powered {
+                self.paused = false;
+                self.status = "Resumed after rewind".into();
+            } else {
+                self.status = "Rewind stopped".into();
+            }
+            self.resume_after_rewind = false;
+            self.frame_budget = 0.0;
+            self.clear_audio_pipeline();
+        }
+    }
+
     fn rewind_step(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!("Rewind is disabled in {} mode", self.play_mode().label());
+            return;
+        }
+        if !self.rewind_active {
+            self.invalidate_pending_rewind_captures();
+        }
         if self.tas.movie.is_some() {
             self.rewind_tas_one_frame();
         } else {
@@ -2677,42 +3721,67 @@ impl App {
         } else {
             format!("Rewound exactly 1 TAS frame to {target}")
         };
+        self.presented_frames_in_window = self.presented_frames_in_window.wrapping_add(1);
     }
 
     fn rewind_once(&mut self) {
-        if let (Some(point), Some(nes)) = (self.rewind.pop_back(), self.nes.as_mut())
-            && nes.load_state(&point.machine).is_ok()
-        {
-            let recording_rewind = self.tas.recording_context();
-            let removed = if recording_rewind {
-                self.tas.truncate_recording_at(point.tas_cursor)
-            } else {
-                0
-            };
-            if self.tas.movie.is_some() && self.tas.mode != TasMode::Inactive {
-                self.tas.set_cursor_paused(point.tas_cursor);
-            } else {
-                self.tas.cursor = point.tas_cursor;
+        let Some(point) = self.rewind.pop_back() else {
+            self.status = "Rewind buffer is empty".into();
+            return;
+        };
+        let machine = match point.decompress() {
+            Ok(machine) => machine,
+            Err(error) => {
+                self.status = format!("Rewind snapshot is corrupt: {error}");
+                return;
             }
-            self.lag_frames = point.lag_frames;
-            self.last_controller_reads = point.controller_reads;
-            self.paused = true;
-            self.frame_dirty = true;
-            if self.tas.movie.is_some() {
-                self.follow_tas_cursor();
-            }
-            self.clear_audio_pipeline();
-            self.status = if recording_rewind {
-                format!(
-                    "Rewound to TAS frame {}; removed {removed} future input frame(s)",
-                    point.tas_cursor
-                )
-            } else {
-                "Rewound".into()
-            };
+        };
+        let Some(nes) = self.nes.as_mut() else {
+            return;
+        };
+        if let Err(error) = nes.load_state(&machine) {
+            self.status = format!("Rewind restore failed: {error}");
+            return;
         }
+        let recording_rewind = self.tas.recording_context();
+        let removed = if recording_rewind {
+            self.tas.truncate_recording_at(point.tas_cursor)
+        } else {
+            0
+        };
+        if self.tas.movie.is_some() && self.tas.mode != TasMode::Inactive {
+            self.tas.set_cursor_paused(point.tas_cursor);
+        } else {
+            self.tas.cursor = point.tas_cursor;
+        }
+        self.lag_frames = point.lag_frames;
+        self.last_controller_reads = point.controller_reads;
+        self.paused = true;
+        self.frame_dirty = true;
+        self.presented_frames_in_window = self.presented_frames_in_window.wrapping_add(1);
+        if self.tas.movie.is_some() {
+            self.follow_tas_cursor();
+        }
+        self.clear_audio_pipeline();
+        self.status = if recording_rewind {
+            format!(
+                "Rewound to TAS frame {}; removed {removed} future input frame(s)",
+                point.tas_cursor
+            )
+        } else if self.rewind_active {
+            "Rewinding…".into()
+        } else {
+            "Rewound".into()
+        };
     }
     fn quick_save(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "Save states are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if let Some(nes) = &self.nes {
             match save_states::save_slot(nes, self.selected_slot) {
                 Ok(_) => {
@@ -2724,16 +3793,23 @@ impl App {
         }
     }
     fn quick_load(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "Save states are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if let Some(nes) = &mut self.nes {
             match save_states::load_slot(nes, self.selected_slot) {
                 Ok(_) => {
                     self.paused = true;
                     self.powered = nes.powered();
                     self.frame_dirty = true;
-                    self.rewind.clear();
+                    self.last_controller_reads = nes.controller_reads(0);
+                    self.clear_rewind_history();
                     self.tas.stop();
                     self.lag_frames = 0;
-                    self.last_controller_reads = nes.controller_reads(0);
                     self.clear_audio_pipeline();
                     self.status = format!("Loaded slot {}", self.selected_slot);
                 }
@@ -2806,11 +3882,14 @@ impl App {
         load_battery(&mut replacement, &path)?;
         let hash = replacement.rom_hash();
         self.per_game = settings::load_per_game(hash);
-        self.speed_index = self
-            .per_game
-            .speed_index
-            .unwrap_or(self.settings.emulation.speed_index)
-            .min(SPEEDS.len() - 1);
+        self.speed_index = if self.play_mode().restricts_assists() {
+            NORMAL_SPEED_INDEX
+        } else {
+            self.per_game
+                .speed_index
+                .unwrap_or(self.settings.emulation.speed_index)
+                .min(SPEEDS.len() - 1)
+        };
         self.nes = Some(replacement);
         let palette_note = self.apply_video_palette().err();
         self.rom_path = Some(path.clone());
@@ -2819,7 +3898,7 @@ impl App {
         self.paused = false;
         self.frame_budget = 0.0;
         self.frame_dirty = true;
-        self.rewind.clear();
+        self.clear_rewind_history();
         self.tas = Default::default();
         self.tas_held_input = TasFrame::default();
         self.tas.checkpoint_interval = self.settings.tas.checkpoint_interval.max(1);
@@ -2840,6 +3919,13 @@ impl App {
         self.status = palette_note
             .map(|note| format!("ROM loaded; {note}"))
             .unwrap_or_else(|| "ROM loaded".into());
+        if self.play_mode() == PlayMode::Achievement && self.achievements.user().is_some() {
+            if let Err(error) = self.achievements.load_game(&path, &self.rom_bytes) {
+                self.status = format!("ROM loaded; achievements could not start: {error}");
+            } else {
+                self.status = "ROM loaded; loading RetroAchievements set…".into();
+            }
+        }
         Ok(())
     }
 
@@ -2931,6 +4017,13 @@ impl App {
         }
     }
     fn new_tas_movie(&mut self, start_type: TasStartType) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "TAS tools are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if self.nes.is_none() || self.rom_bytes.is_empty() {
             self.status = "Load a ROM before creating a TAS movie".into();
             return;
@@ -2968,11 +4061,11 @@ impl App {
         self.powered = true;
         self.paused = false;
         self.fast_forward = false;
-        self.rewind.clear();
-        self.lag_frames = 0;
         self.last_controller_reads = nes
             .controller_reads(0)
             .wrapping_add(nes.controller_reads(1));
+        self.clear_rewind_history();
+        self.lag_frames = 0;
         self.frame_dirty = true;
         self.follow_tas_cursor();
         self.clear_audio_pipeline();
@@ -2980,6 +4073,12 @@ impl App {
     }
 
     fn restore_tas_start(&mut self) -> Result<Vec<u8>, String> {
+        if self.play_mode().restricts_assists() {
+            return Err(format!(
+                "TAS tools are disabled in {} mode",
+                self.play_mode().label()
+            ));
+        }
         let (start_type, starting_state) = self
             .tas
             .movie
@@ -3029,7 +4128,7 @@ impl App {
                     }
                     self.paused = false;
                     self.powered = true;
-                    self.rewind.clear();
+                    self.clear_rewind_history();
                     self.frame_dirty = true;
                     self.follow_tas_cursor();
                     self.clear_audio_pipeline();
@@ -3104,6 +4203,13 @@ impl App {
     }
 
     fn apply_tas_timeline_action(&mut self, action: TasTimelineAction) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "TAS tools are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if matches!(action, TasTimelineAction::Copy) {
             if self.tas.copy_selection() {
                 self.status = format!("Copied {} TAS frame(s)", self.tas.clipboard.len());
@@ -3185,12 +4291,19 @@ impl App {
     }
 
     fn export_tas(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "TAS tools are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if let (Some(nes), Some(movie)) = (&self.nes, &self.tas.movie) {
             let dir = settings::tas_root().join(format!("{:016x}", nes.rom_hash()));
             let _ = fs::create_dir_all(&dir);
             if let Some(path) = FileDialog::new()
                 .set_directory(dir)
-                .add_filter("My Own NES TAS", &["tas"])
+                .add_filter("CrabNes TAS", &["tas"])
                 .set_file_name("movie.tas")
                 .save_file()
             {
@@ -3208,10 +4321,17 @@ impl App {
         }
     }
     fn import_tas(&mut self) {
+        if self.play_mode().restricts_assists() {
+            self.status = format!(
+                "TAS tools are disabled in {} mode",
+                self.play_mode().label()
+            );
+            return;
+        }
         if let Some(nes) = &self.nes
             && let Some(path) = FileDialog::new()
                 .set_directory(settings::tas_root().join(format!("{:016x}", nes.rom_hash())))
-                .add_filter("My Own NES TAS", &["tas"])
+                .add_filter("CrabNes TAS", &["tas"])
                 .pick_file()
         {
             let expected = tas::rom_sha256_hex(nes.rom_sha256());
@@ -3238,7 +4358,350 @@ impl App {
             }
         }
     }
+
+    fn play_mode(&self) -> PlayMode {
+        self.active_play_mode
+    }
+
+    fn apply_play_mode(&mut self, mode: PlayMode) {
+        let previous = self.active_play_mode;
+        if previous == PlayMode::Achievement && mode != PlayMode::Achievement {
+            self.achievements.unload_game();
+            self.show_achievements = false;
+            self.achievement_toasts.clear();
+        }
+        self.active_play_mode = mode;
+        self.fast_forward = false;
+        self.frame_budget = 0.0;
+        if mode.restricts_assists() {
+            self.speed_index = NORMAL_SPEED_INDEX;
+            self.show_states = false;
+            self.show_time = false;
+            self.show_tas = false;
+            self.show_tas_control = false;
+            self.show_debugger = false;
+            self.show_hex = false;
+            self.frame_advance_held = false;
+            self.rewind_active = false;
+            self.resume_after_rewind = false;
+            self.clear_rewind_history();
+            self.tas.stop();
+            if self.powered {
+                self.paused = false;
+            }
+            self.clear_audio_pipeline();
+            self.status = format!("{} mode enabled — emulator assists disabled", mode.label());
+            if mode == PlayMode::Achievement && previous != PlayMode::Achievement {
+                self.start_achievement_session();
+            }
+        } else {
+            self.speed_index = self
+                .per_game
+                .speed_index
+                .unwrap_or(self.settings.emulation.speed_index)
+                .min(SPEEDS.len() - 1);
+            self.status = "Standard mode enabled".into();
+        }
+    }
+
+    fn start_achievement_session(&mut self) {
+        self.show_achievements = true;
+        if self.achievements.user().is_some() {
+            self.load_current_achievement_game();
+            return;
+        }
+
+        let username = self.settings.achievements.username.trim();
+        let token = self.settings.achievements.token.trim();
+        if username.is_empty() || token.is_empty() {
+            self.status = "Achievement mode enabled — sign in to RetroAchievements".into();
+            return;
+        }
+        match self.achievements.login_token(username, token) {
+            Ok(()) => self.status = "Signing in to RetroAchievements…".into(),
+            Err(error) => self.status = format!("RetroAchievements sign-in failed: {error}"),
+        }
+    }
+
+    fn load_current_achievement_game(&mut self) {
+        let Some(path) = self.rom_path.as_deref() else {
+            return;
+        };
+        if self.rom_bytes.is_empty() {
+            return;
+        }
+        match self.achievements.load_game(path, &self.rom_bytes) {
+            Ok(()) => self.status = "Loading RetroAchievements set…".into(),
+            Err(error) => self.status = format!("Could not load achievement set: {error}"),
+        }
+    }
+
+    fn handle_achievement_events(&mut self, events: Vec<AchievementEvent>) {
+        for event in events {
+            match event.kind {
+                AchievementEventKind::Login if event.result == 0 => {
+                    self.achievement_password.clear();
+                    if let Some(user) = self.achievements.user() {
+                        self.settings.achievements.username = user.username;
+                        self.settings.achievements.token = user.token;
+                        self.settings_dirty = true;
+                        self.status =
+                            format!("Signed in to RetroAchievements as {}", user.display_name);
+                    } else {
+                        self.status = "Signed in to RetroAchievements".into();
+                    }
+                    self.load_current_achievement_game();
+                }
+                AchievementEventKind::Login => {
+                    self.settings.achievements.token.clear();
+                    self.settings_dirty = true;
+                    self.status = if event.message.is_empty() {
+                        "RetroAchievements sign-in failed".into()
+                    } else {
+                        format!("RetroAchievements sign-in failed: {}", event.message)
+                    };
+                }
+                AchievementEventKind::GameLoad if event.result == 0 => {
+                    if let Some(game) = self.achievements.game() {
+                        self.status = format!("Achievements loaded: {} (hardcore)", game.title);
+                    } else {
+                        self.status = "Achievement set loaded (hardcore)".into();
+                    }
+                }
+                AchievementEventKind::GameLoad => {
+                    self.status = if event.message.is_empty() {
+                        "No RetroAchievements set was found for this ROM".into()
+                    } else {
+                        format!("Achievement set not loaded: {}", event.message)
+                    };
+                }
+                AchievementEventKind::Achievement
+                    if event.id == 0 || event.title.starts_with("Warning:") =>
+                {
+                    self.status = if event.message.is_empty() {
+                        event.title
+                    } else {
+                        event.message
+                    };
+                }
+                AchievementEventKind::Achievement => {
+                    let details = self
+                        .achievements
+                        .achievements()
+                        .into_iter()
+                        .find(|achievement| achievement.id == event.id);
+                    let game = self.achievements.game();
+                    let description = details
+                        .as_ref()
+                        .map(|achievement| achievement.description.clone())
+                        .filter(|description| !description.is_empty())
+                        .unwrap_or_else(|| event.message.clone());
+                    let badge_url = details
+                        .as_ref()
+                        .map(|achievement| achievement.badge_url.clone())
+                        .unwrap_or_default();
+                    self.ensure_achievement_badge(&badge_url);
+                    self.achievement_toasts.push_back(AchievementToast {
+                        title: event.title.clone(),
+                        description: description.clone(),
+                        points: event.points,
+                        badge_url: badge_url.clone(),
+                        started_at: None,
+                    });
+                    if let Some(game) = game {
+                        let archive_result = self.achievement_archive.record(UnlockEntry {
+                            game_id: game.id,
+                            achievement_id: event.id,
+                            game_title: game.title,
+                            title: event.title.clone(),
+                            description,
+                            points: event.points,
+                            badge_url,
+                            unlocked_at: 0,
+                        });
+                        if let Err(error) = archive_result {
+                            self.push_achievement_activity(format!(
+                                "Could not save unlock archive: {error}"
+                            ));
+                        }
+                    }
+                    let text = format!("Unlocked: {} (+{} points)", event.title, event.points);
+                    self.push_achievement_activity(text.clone());
+                    self.status = text;
+                }
+                AchievementEventKind::GameCompleted => {
+                    let text = "Game mastered — all core achievements unlocked".to_owned();
+                    self.push_achievement_activity(text.clone());
+                    self.status = text;
+                }
+                AchievementEventKind::Reset => {
+                    self.reset();
+                    self.status = "Reset for RetroAchievements hardcore mode".into();
+                }
+                AchievementEventKind::Disconnected
+                | AchievementEventKind::Reconnected
+                | AchievementEventKind::Leaderboard
+                | AchievementEventKind::ServerError => {
+                    let text = if event.message.is_empty() {
+                        event.title
+                    } else if event.title.is_empty() {
+                        event.message
+                    } else {
+                        format!("{}: {}", event.title, event.message)
+                    };
+                    if !text.is_empty() {
+                        self.push_achievement_activity(text.clone());
+                        self.status = text;
+                    }
+                }
+                AchievementEventKind::Unknown => {}
+            }
+        }
+    }
+
+    fn push_achievement_activity(&mut self, item: String) {
+        self.achievement_feed.push_front(item);
+        self.achievement_feed.truncate(8);
+    }
+
+    fn ensure_achievement_badge(&mut self, url: &str) {
+        if url.is_empty()
+            || self.achievement_badges.contains_key(url)
+            || !self.achievement_badges_requested.insert(url.to_owned())
+        {
+            return;
+        }
+        self.achievements.request_badge(url.to_owned());
+    }
+
+    fn collect_achievement_badges(&mut self, ctx: &egui::Context) {
+        for badge in self.achievements.take_badge_images() {
+            let image = ColorImage::from_rgba_unmultiplied(badge.size, &badge.rgba);
+            let texture = ctx.load_texture(
+                format!("achievement-badge:{}", badge.url),
+                image,
+                TextureOptions::LINEAR,
+            );
+            self.achievement_badges.insert(badge.url, texture);
+        }
+    }
+
+    fn achievement_toast_overlay(&mut self, ctx: &egui::Context) {
+        if self.play_mode() != PlayMode::Achievement {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(toast) = self.achievement_toasts.front_mut()
+            && toast.started_at.is_none()
+        {
+            toast.started_at = Some(now);
+        }
+        let Some(toast) = self.achievement_toasts.front().cloned() else {
+            return;
+        };
+        let elapsed = now
+            .duration_since(toast.started_at.unwrap_or(now))
+            .as_secs_f32();
+        const DISPLAY_SECONDS: f32 = 5.5;
+        if elapsed >= DISPLAY_SECONDS {
+            self.achievement_toasts.pop_front();
+            ctx.request_repaint();
+            return;
+        }
+
+        let enter = (elapsed / 0.28).clamp(0.0, 1.0);
+        let enter = 1.0 - (1.0 - enter).powi(3);
+        let exit = ((DISPLAY_SECONDS - elapsed) / 0.45).clamp(0.0, 1.0);
+        let alpha = enter.min(exit);
+        let y = 58.0 - (1.0 - enter) * 100.0;
+        let text_color =
+            egui::Color32::from_rgba_unmultiplied(242, 239, 190, (255.0 * alpha) as u8);
+        let muted_color =
+            egui::Color32::from_rgba_unmultiplied(190, 190, 190, (255.0 * alpha) as u8);
+        let texture = self.achievement_badges.get(&toast.badge_url).cloned();
+
+        egui::Area::new(egui::Id::new("achievement-unlock-toast"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(24.0, y))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(
+                        10,
+                        11,
+                        13,
+                        (242.0 * alpha) as u8,
+                    ))
+                    .stroke(egui::Stroke::new(
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(102, 106, 112, (255.0 * alpha) as u8),
+                    ))
+                    .corner_radius(12)
+                    .inner_margin(12)
+                    .show(ui, |ui| {
+                        ui.set_width(430.0);
+                        ui.horizontal(|ui| {
+                            if let Some(texture) = &texture {
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(Vec2::splat(76.0))
+                                        .corner_radius(5),
+                                );
+                            } else {
+                                egui::Frame::new()
+                                    .fill(egui::Color32::from_rgba_unmultiplied(
+                                        35,
+                                        36,
+                                        42,
+                                        (255.0 * alpha) as u8,
+                                    ))
+                                    .corner_radius(5)
+                                    .show(ui, |ui| {
+                                        ui.allocate_space(Vec2::splat(76.0));
+                                    });
+                            }
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("ACHIEVEMENT UNLOCKED")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgba_unmultiplied(
+                                            222,
+                                            189,
+                                            78,
+                                            (255.0 * alpha) as u8,
+                                        )),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&toast.title)
+                                        .size(20.0)
+                                        .strong()
+                                        .color(text_color),
+                                );
+                                if !toast.description.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(&toast.description)
+                                            .small()
+                                            .color(muted_color),
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("+{} points", toast.points))
+                                        .strong()
+                                        .color(text_color),
+                                );
+                            });
+                        });
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
     fn current_speed(&self) -> f64 {
+        if self.play_mode().restricts_assists() {
+            return 1.0;
+        }
         if self.tas.mode == TasMode::Recording {
             1.0
         } else if self.fast_forward {
@@ -3270,6 +4733,153 @@ impl App {
     }
 }
 
+fn is_achievement_client_warning(achievement: &nes_achievements_native::Achievement) -> bool {
+    achievement.id == 0 || achievement.title.starts_with("Warning:")
+}
+
+fn achievement_card(
+    ui: &mut egui::Ui,
+    achievement: &nes_achievements_native::Achievement,
+    texture: Option<&TextureHandle>,
+) {
+    let fill = if achievement.unlocked {
+        egui::Color32::from_rgb(31, 43, 38)
+    } else {
+        egui::Color32::from_rgb(29, 30, 35)
+    };
+    let stroke = if achievement.unlocked {
+        egui::Color32::from_rgb(67, 137, 91)
+    } else {
+        egui::Color32::from_rgb(57, 59, 68)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(8)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                achievement_badge(ui, texture, 64.0);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(&achievement.title)
+                                .strong()
+                                .size(16.0)
+                                .color(if achievement.unlocked {
+                                    egui::Color32::from_rgb(225, 239, 228)
+                                } else {
+                                    egui::Color32::from_rgb(220, 220, 224)
+                                }),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{} pts", achievement.points))
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(224, 188, 78)),
+                        );
+                        if achievement.unlocked {
+                            ui.label(
+                                egui::RichText::new("UNLOCKED")
+                                    .small()
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(91, 205, 125)),
+                            );
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(&achievement.description)
+                            .small()
+                            .color(egui::Color32::from_gray(180)),
+                    );
+                    if !achievement.measured_progress.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(
+                                    (achievement.measured_percent / 100.0).clamp(0.0, 1.0),
+                                )
+                                .desired_width(180.0),
+                            );
+                            ui.small(&achievement.measured_progress);
+                        });
+                    }
+                });
+            });
+        });
+}
+
+fn archive_card(ui: &mut egui::Ui, entry: &UnlockEntry, texture: Option<&TextureHandle>) {
+    let unlocked_at = chrono::DateTime::from_timestamp(entry.unlocked_at, 0)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%b %-d, %Y · %-I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_else(|| "Unknown time".into());
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(31, 38, 35))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(61, 105, 78)))
+        .corner_radius(8)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                achievement_badge(ui, texture, 64.0);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(&entry.title).strong().size(16.0));
+                        ui.label(
+                            egui::RichText::new(format!("{} pts", entry.points))
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(224, 188, 78)),
+                        );
+                    });
+                    if !entry.description.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&entry.description)
+                                .small()
+                                .color(egui::Color32::from_gray(185)),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} · {}", entry.game_title, unlocked_at))
+                            .small()
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                });
+            });
+        });
+}
+
+fn achievement_badge(ui: &mut egui::Ui, texture: Option<&TextureHandle>, size: f32) {
+    if let Some(texture) = texture {
+        ui.add(
+            egui::Image::new(texture)
+                .fit_to_exact_size(Vec2::splat(size))
+                .corner_radius(5),
+        );
+    } else {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(43, 44, 51))
+            .corner_radius(5)
+            .show(ui, |ui| {
+                ui.allocate_ui(Vec2::splat(size), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("RA")
+                                .size(18.0)
+                                .color(egui::Color32::from_gray(110)),
+                        );
+                    });
+                });
+            });
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.emulate(ctx);
@@ -3282,13 +4892,19 @@ impl eframe::App for App {
         self.status_bar(ui);
         self.central(ui);
         self.feature_windows(ui);
+        if self.binding_capture.is_some()
+            && !self.show_input
+            && !(self.show_settings && self.settings_category == SettingsCategory::Input)
+        {
+            self.binding_capture = None;
+        }
         if !ui.ctx().input(|input| input.pointer.any_down()) {
             self.frame_advance_repeated = false;
             self.frame_advance_hold_started = None;
         }
     }
     fn on_exit(&mut self) {
-        if self.settings.save_states.autosave_on_exit {
+        if self.play_mode() == PlayMode::Standard && self.settings.save_states.autosave_on_exit {
             self.quick_save();
         }
         let _ = self.save_battery();
@@ -3542,7 +5158,7 @@ fn binding_mask(ctx: &egui::Context, bindings: &[KeyBinding; 8]) -> u8 {
         .iter()
         .enumerate()
         .fold(0, |mask, (index, binding)| {
-            mask | (u8::from(binding_down(ctx, *binding)) << index)
+            mask | (u8::from(binding_down(ctx, binding)) << index)
         })
 }
 
@@ -3589,86 +5205,169 @@ fn input_mask_label(mask: u8) -> String {
     }
 }
 
-fn binding_down(ctx: &egui::Context, binding: KeyBinding) -> bool {
+fn binding_down(ctx: &egui::Context, binding: &KeyBinding) -> bool {
+    if binding.label() == "Shift" {
+        return ctx.input(|i| i.key_down(Key::ShiftLeft) || i.key_down(Key::ShiftRight));
+    }
+    Key::ALL
+        .iter()
+        .copied()
+        .find(|key| key.name() == binding.label())
+        .is_some_and(|key| ctx.input(|input| input.key_down(key)))
+}
+
+fn nes_button_label(index: usize) -> &'static str {
+    ["A", "B", "Select", "Start", "Up", "Down", "Left", "Right"][index]
+}
+
+fn gamepad_binding_down(gamepad: &Gamepad<'_>, binding: GamepadBinding, threshold: f32) -> bool {
     match binding {
-        KeyBinding::Shift => {
-            ctx.input(|i| i.key_down(Key::ShiftLeft) || i.key_down(Key::ShiftRight))
+        GamepadBinding::Button(button) => {
+            button != GamepadButton::Unknown && gamepad.is_pressed(button)
         }
-        _ => ctx.input(|i| {
-            i.key_down(match binding {
-                KeyBinding::Z => Key::Z,
-                KeyBinding::X => Key::X,
-                KeyBinding::Enter => Key::Enter,
-                KeyBinding::Up => Key::ArrowUp,
-                KeyBinding::Down => Key::ArrowDown,
-                KeyBinding::Left => Key::ArrowLeft,
-                KeyBinding::Right => Key::ArrowRight,
-                KeyBinding::A => Key::A,
-                KeyBinding::S => Key::S,
-                KeyBinding::Q => Key::Q,
-                KeyBinding::W => Key::W,
-                KeyBinding::C => Key::C,
-                KeyBinding::V => Key::V,
-                KeyBinding::E => Key::E,
-                KeyBinding::I => Key::I,
-                KeyBinding::J => Key::J,
-                KeyBinding::K => Key::K,
-                KeyBinding::L => Key::L,
-                KeyBinding::Shift => unreachable!(),
-            })
-        }),
+        GamepadBinding::Axis { axis, direction } => {
+            axis != Axis::Unknown && axis_active(gamepad.value(axis), direction, threshold)
+        }
+        GamepadBinding::ExactButton { code, .. } => {
+            gamepad.state().is_pressed(code) || gamepad.state().value(code) >= threshold
+        }
+        GamepadBinding::ExactButtonLow { code, .. } => {
+            raw_value_known(gamepad, code)
+                && low_input_active(gamepad.state().value(code), threshold)
+        }
+        GamepadBinding::ExactAxis {
+            code, direction, ..
+        } => axis_active(gamepad.state().value(code), direction, threshold),
+        GamepadBinding::ExactAxisLow { code, .. } => {
+            raw_value_known(gamepad, code)
+                && low_input_active(gamepad.state().value(code), threshold)
+        }
+        GamepadBinding::RawButton(code) => gamepad.state().is_pressed(code),
+        GamepadBinding::RawAxis { code, direction } => {
+            axis_active(gamepad.state().value(code), direction, threshold)
+        }
     }
 }
-fn input_mapping_ui(ui: &mut egui::Ui, settings: &mut Settings) -> bool {
-    let mut changed = false;
-    changed |= ui
-        .checkbox(
-            &mut settings.input.allow_opposite_directions,
-            "Allow opposite D-pad directions",
-        )
-        .on_hover_text(
-            "Off matches a stock NES rocker D-pad: Left+Right and Up+Down cancel to neutral. Enable only for TAS/debug input that intentionally needs impossible combinations.",
-        )
-        .changed();
-    if !settings.input.allow_opposite_directions {
-        ui.small("Hardware-accurate D-pad: opposite directions cancel to neutral.");
+
+fn axis_active(value: f32, direction: i8, threshold: f32) -> bool {
+    if direction < 0 {
+        value <= -threshold
+    } else {
+        value >= threshold
     }
-    egui::Grid::new("input-map").striped(true).show(ui, |ui| {
-        ui.strong("Button");
-        ui.strong("Player 1");
-        ui.strong("Player 2");
-        ui.end_row();
-        for (index, label) in ["A", "B", "Select", "Start", "Up", "Down", "Left", "Right"]
-            .into_iter()
-            .enumerate()
-        {
-            ui.label(label);
-            egui::ComboBox::from_id_salt(("binding", index))
-                .selected_text(settings.input.bindings[index].label())
-                .show_ui(ui, |ui| {
-                    for key in KeyBinding::ALL {
-                        changed |= ui
-                            .selectable_value(&mut settings.input.bindings[index], key, key.label())
-                            .changed();
-                    }
-                });
-            egui::ComboBox::from_id_salt(("binding-p2", index))
-                .selected_text(settings.input.player2_bindings[index].label())
-                .show_ui(ui, |ui| {
-                    for key in KeyBinding::ALL {
-                        changed |= ui
-                            .selectable_value(
-                                &mut settings.input.player2_bindings[index],
-                                key,
-                                key.label(),
-                            )
-                            .changed();
-                    }
-                });
-            ui.end_row();
+}
+
+fn low_input_cutoff(threshold: f32) -> f32 {
+    (1.0 - threshold.clamp(0.1, 0.9)) * 0.5
+}
+
+fn low_input_active(value: f32, threshold: f32) -> bool {
+    value < low_input_cutoff(threshold)
+}
+
+fn raw_value_known(gamepad: &Gamepad<'_>, code: gilrs::ev::Code) -> bool {
+    gamepad.state().button_data(code).is_some() || gamepad.state().axis_data(code).is_some()
+}
+
+fn gamepad_binding_label(binding: GamepadBinding) -> String {
+    match binding {
+        GamepadBinding::Button(button) => gamepad_button_label(button).into(),
+        GamepadBinding::Axis { axis, direction } => {
+            format!(
+                "{} {}",
+                gamepad_axis_label(axis),
+                direction_label(direction)
+            )
         }
-    });
-    changed
+        GamepadBinding::ExactButton { button, code } => {
+            format!("{} [{code}]", gamepad_button_label(button))
+        }
+        GamepadBinding::ExactButtonLow { button, code } => {
+            format!("{} low/inverted [{code}]", gamepad_button_label(button))
+        }
+        GamepadBinding::ExactAxis {
+            axis,
+            code,
+            direction,
+        } => format!(
+            "{} {} [{code}]",
+            gamepad_axis_label(axis),
+            direction_label(direction)
+        ),
+        GamepadBinding::ExactAxisLow { axis, code } => {
+            format!("{} low/inverted [{code}]", gamepad_axis_label(axis))
+        }
+        GamepadBinding::RawButton(code) => format!("Button {code}"),
+        GamepadBinding::RawAxis { code, direction } => {
+            format!("Axis {code} {}", direction_label(direction))
+        }
+    }
+}
+
+fn describe_gamepad_event(event: EventType) -> Option<String> {
+    match event {
+        EventType::ButtonPressed(button, code) => {
+            Some(format!("{} pressed [{code}]", gamepad_button_label(button)))
+        }
+        EventType::ButtonReleased(button, code) => Some(format!(
+            "{} released [{code}]",
+            gamepad_button_label(button)
+        )),
+        EventType::ButtonChanged(button, value, code) => Some(format!(
+            "{} value {value:.3} [{code}]",
+            gamepad_button_label(button)
+        )),
+        EventType::AxisChanged(axis, value, code) => Some(format!(
+            "{} value {value:.3} [{code}]",
+            gamepad_axis_label(axis)
+        )),
+        EventType::Connected => Some("connected".into()),
+        EventType::Disconnected => Some("disconnected".into()),
+        _ => None,
+    }
+}
+
+fn direction_label(direction: i8) -> &'static str {
+    if direction < 0 { "−" } else { "+" }
+}
+
+fn gamepad_button_label(button: GamepadButton) -> &'static str {
+    match button {
+        GamepadButton::South => "South / A / Cross",
+        GamepadButton::East => "East / B / Circle",
+        GamepadButton::North => "North / Y / Triangle",
+        GamepadButton::West => "West / X / Square",
+        GamepadButton::C => "C",
+        GamepadButton::Z => "Z",
+        GamepadButton::LeftTrigger => "Left bumper",
+        GamepadButton::LeftTrigger2 => "Left trigger",
+        GamepadButton::RightTrigger => "Right bumper",
+        GamepadButton::RightTrigger2 => "Right trigger",
+        GamepadButton::Select => "Select / Back / Create",
+        GamepadButton::Start => "Start / Options",
+        GamepadButton::Mode => "Home / Guide",
+        GamepadButton::LeftThumb => "Left stick click",
+        GamepadButton::RightThumb => "Right stick click",
+        GamepadButton::DPadUp => "D-pad Up",
+        GamepadButton::DPadDown => "D-pad Down",
+        GamepadButton::DPadLeft => "D-pad Left",
+        GamepadButton::DPadRight => "D-pad Right",
+        GamepadButton::Unknown => "Unknown button",
+    }
+}
+
+fn gamepad_axis_label(axis: Axis) -> &'static str {
+    match axis {
+        Axis::LeftStickX => "Left stick X",
+        Axis::LeftStickY => "Left stick Y",
+        Axis::LeftZ => "Left trigger axis",
+        Axis::RightStickX => "Right stick X",
+        Axis::RightStickY => "Right stick Y",
+        Axis::RightZ => "Right trigger axis",
+        Axis::DPadX => "D-pad X",
+        Axis::DPadY => "D-pad Y",
+        Axis::Unknown => "Unknown axis",
+    }
 }
 
 fn neutralize_opposite_directions(mut mask: u8) -> u8 {
@@ -3692,6 +5391,28 @@ fn speed_ui(ui: &mut egui::Ui, index: &mut usize) -> bool {
     *index = (*index).min(SPEEDS.len() - 1);
     old != *index
 }
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes as f64 >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes as f64 >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn advance_rewind_deadline(deadline: Instant, now: Instant, interval: Duration) -> Instant {
+    let next = deadline + interval;
+    if now.saturating_duration_since(next) >= interval {
+        now + interval
+    } else {
+        next
+    }
+}
+
 fn memory_label(space: MemorySpace) -> &'static str {
     match space {
         MemorySpace::CpuRam => "CPU RAM",
@@ -3714,7 +5435,12 @@ fn load_battery(nes: &mut Nes, rom_path: &Path) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod input_filter_tests {
-    use super::neutralize_opposite_directions;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        RewindCapture, RewindPoint, advance_rewind_deadline, low_input_active,
+        neutralize_opposite_directions,
+    };
 
     #[test]
     fn opposite_dpad_directions_cancel_without_touching_buttons() {
@@ -3730,6 +5456,47 @@ mod input_filter_tests {
         assert_eq!(
             neutralize_opposite_directions(a_and_start | (1 << 4) | (1 << 7)),
             a_and_start | (1 << 4) | (1 << 7)
+        );
+    }
+
+    #[test]
+    fn zero_based_inverted_axes_treat_zero_as_active_and_center_as_neutral() {
+        assert!(low_input_active(0.0, 0.5));
+        assert!(!low_input_active(0.5, 0.5));
+        assert!(!low_input_active(1.0, 0.5));
+    }
+
+    #[test]
+    fn rewind_points_round_trip_through_fast_compression() {
+        let machine = (0..256_u16)
+            .flat_map(|byte| [byte as u8; 256])
+            .collect::<Vec<_>>();
+        let point = RewindPoint::compress(RewindCapture {
+            machine: machine.clone(),
+            generation: 9,
+            tas_cursor: 12,
+            lag_frames: 3,
+            controller_reads: 4,
+        });
+        assert!(point.compressed_machine.len() < machine.len());
+        assert_eq!(point.generation, 9);
+        assert_eq!(point.decompress().unwrap(), machine);
+    }
+
+    #[test]
+    fn rewind_deadline_carries_small_scheduler_delays_without_drifting() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(10);
+        let slightly_late = start + Duration::from_millis(12);
+        assert_eq!(
+            advance_rewind_deadline(start, slightly_late, interval),
+            start + interval
+        );
+
+        let badly_late = start + Duration::from_millis(25);
+        assert_eq!(
+            advance_rewind_deadline(start, badly_late, interval),
+            badly_late + interval
         );
     }
 }
