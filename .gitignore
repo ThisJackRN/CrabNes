@@ -1,6 +1,7 @@
 /target
 /frame.png
 /frame.ppm
+/roms/
 *.nes
 *.sav
 *.state

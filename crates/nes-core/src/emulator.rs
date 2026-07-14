@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    Region,
     bus::Bus,
     bus::BusSnapshot,
     cartridge::{Cartridge, CartridgeError},
@@ -99,7 +100,14 @@ pub struct Nes {
 
 impl Nes {
     pub fn from_ines(bytes: &[u8]) -> Result<Self, EmulationError> {
-        let cartridge = Cartridge::from_ines(bytes)?;
+        Self::from_cartridge(bytes, Cartridge::from_ines(bytes)?)
+    }
+
+    pub fn from_ines_with_region(bytes: &[u8], region: Region) -> Result<Self, EmulationError> {
+        Self::from_cartridge(bytes, Cartridge::from_ines_with_region(bytes, region)?)
+    }
+
+    fn from_cartridge(bytes: &[u8], cartridge: Cartridge) -> Result<Self, EmulationError> {
         let mut nes = Self {
             cpu: Cpu::default(),
             bus: Bus::new(cartridge),
@@ -114,7 +122,7 @@ impl Nes {
     }
 
     /// Execute one CPU instruction with each CPU bus access interleaved with
-    /// one APU clock and three NTSC PPU dots.
+    /// the active region's APU and PPU timing.
     pub fn step_instruction(&mut self) -> Result<u16, EmulationError> {
         if !self.powered {
             return Ok(0);
@@ -195,7 +203,7 @@ impl Nes {
         self.bus.apu.sample_rate()
     }
     pub fn apu_state(&self) -> crate::apu::ApuState {
-        self.bus.apu.state()
+        self.bus.apu.state_for_region(self.bus.cartridge.region())
     }
     pub fn set_apu_channel_output_enabled(
         &mut self,
@@ -309,6 +317,15 @@ impl Nes {
             MemorySpace::PrgRom => false,
             MemorySpace::Chr => self.bus.cartridge.debug_write_chr(offset, value),
         }
+    }
+    pub fn region(&self) -> Region {
+        self.bus.cartridge.region()
+    }
+    pub fn frame_rate(&self) -> f64 {
+        self.region().frame_rate()
+    }
+    pub fn cpu_clock_hz(&self) -> u32 {
+        self.region().cpu_clock_hz()
     }
 
     /// Copies the side-effect-free 64 KiB CPU address space used by
@@ -501,6 +518,34 @@ mod tests {
         assert!(nes.debug_write_memory(MemorySpace::Palette, 0, 0xff));
         assert_eq!(nes.memory_image(MemorySpace::Palette).bytes[0], 0x3f);
         assert!(!nes.debug_write_memory(MemorySpace::CpuRam, 0x800, 0xff));
+    }
+
+    #[test]
+    fn pal_rom_uses_50hz_cpu_and_ppu_timing() {
+        let mut rom = test_rom(&[0x4c, 0x00, 0x80]);
+        rom[9] = 1;
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert_eq!(nes.region(), Region::Pal);
+        assert_eq!(nes.cpu_clock_hz(), crate::PAL_CPU_CLOCK_HZ);
+        assert_eq!(nes.frame_rate(), crate::PAL_FRAME_RATE);
+
+        nes.run_frame().unwrap();
+        let first_frame_cycles = nes.cpu_cycles();
+        nes.run_frame().unwrap();
+        let steady_frame_cycles = nes.cpu_cycles() - first_frame_cycles;
+        assert!((33_247..=33_255).contains(&steady_frame_cycles));
+    }
+
+    #[test]
+    fn explicit_region_overrides_an_incorrect_ines_timing_flag_without_changing_identity() {
+        let rom = test_rom(&[0x4c, 0x00, 0x80]);
+        let ordinary = Nes::from_ines(&rom).unwrap();
+        let overridden = Nes::from_ines_with_region(&rom, Region::Pal).unwrap();
+
+        assert_eq!(ordinary.region(), Region::Ntsc);
+        assert_eq!(overridden.region(), Region::Pal);
+        assert_eq!(ordinary.rom_hash(), overridden.rom_hash());
+        assert_eq!(ordinary.rom_sha256(), overridden.rom_sha256());
     }
 
     #[test]

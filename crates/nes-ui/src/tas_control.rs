@@ -308,7 +308,9 @@ fn parse_fm2(text: &str, source_path: PathBuf) -> Result<ControlMovie, String> {
         "FM2 ROM MD5 is not cross-checked; load the same game and revision used by FCEUX".into(),
     );
     if pal {
-        warnings.push("FM2 uses PAL timing; this emulator currently runs NTSC, so synchronization will differ".into());
+        warnings.push(
+            "FM2 uses PAL timing; load a PAL ROM/header or synchronization will differ".into(),
+        );
     }
     if fourscore {
         warnings.push(

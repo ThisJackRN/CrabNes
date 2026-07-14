@@ -35,10 +35,11 @@ pub(crate) struct BusSnapshot {
 
 impl Bus {
     pub fn new(cartridge: Cartridge) -> Self {
+        let region = cartridge.region();
         Self {
             ram: [0; 0x800],
             ppu: Ppu::default(),
-            apu: Apu::default(),
+            apu: Apu::new(region),
             cartridge,
             controllers: [Controller::default(), Controller::default()],
             dma_stall: 0,
@@ -50,8 +51,9 @@ impl Bus {
     }
 
     pub fn reset(&mut self) {
+        let region = self.cartridge.region();
         self.ppu.reset();
-        self.apu.reset();
+        self.apu.reset(region);
         self.cartridge.reset();
         self.dma_stall = 0;
         self.dmc_dma = None;
@@ -156,11 +158,17 @@ impl Bus {
     }
 
     fn clock_hardware_cycle(&mut self) {
+        let region = self.cartridge.region();
         self.cartridge.clock_cpu();
         self.apu
-            .clock_with_expansion(self.cartridge.expansion_audio());
-        for _ in 0..3 {
-            self.ppu.clock(&mut self.cartridge);
+            .clock_with_expansion(self.cartridge.expansion_audio(), region);
+        let ppu_dots = match region {
+            crate::Region::Ntsc => 3,
+            // The PAL PPU runs at 16/5 of the CPU rate: 3,3,3,3,4 dots.
+            crate::Region::Pal => 3 + u8::from(self.cpu_cycles % 5 == 4),
+        };
+        for _ in 0..ppu_dots {
+            self.ppu.clock_for_region(&mut self.cartridge, region);
         }
         self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
 

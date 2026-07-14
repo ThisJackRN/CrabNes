@@ -1,4 +1,3 @@
-use crate::CPU_CLOCK_HZ;
 use serde::{Deserialize, Serialize};
 
 use super::OUTPUT_SAMPLE_RATE;
@@ -23,6 +22,12 @@ pub(super) struct Sampler {
 
 impl Default for Sampler {
     fn default() -> Self {
+        Self::new(crate::NTSC_CPU_CLOCK_HZ)
+    }
+}
+
+impl Sampler {
+    pub(super) fn new(cpu_clock_hz: u32) -> Self {
         Self {
             phase: 0,
             integrated: 0.0,
@@ -30,8 +35,8 @@ impl Default for Sampler {
             // stages reduce ultrasonic timer energy before the exact rational
             // sample-rate conversion below.
             anti_alias: [
-                LowPass::new(CPU_CLOCK_HZ as f32, 20_000.0),
-                LowPass::new(CPU_CLOCK_HZ as f32, 20_000.0),
+                LowPass::new(cpu_clock_hz as f32, 20_000.0),
+                LowPass::new(cpu_clock_hz as f32, 20_000.0),
             ],
             // NES-style output chain. These cutoff choices follow the common
             // 90 Hz HP -> 440 Hz HP -> 14 kHz LP model also used by TetaNES.
@@ -42,10 +47,13 @@ impl Default for Sampler {
             output_low_pass: LowPass::new(OUTPUT_SAMPLE_RATE as f32, 14_000.0),
         }
     }
-}
 
-impl Sampler {
-    pub(super) fn clock(&mut self, levels: Levels, expansion: f32) -> Option<f32> {
+    pub(super) fn clock(
+        &mut self,
+        levels: Levels,
+        expansion: f32,
+        cpu_clock_hz: u32,
+    ) -> Option<f32> {
         // The mixer is nonlinear, so averaging each channel first (the old
         // behavior) is not equivalent and changes transients and timbre.
         let mut mixed = nonlinear_mix(
@@ -62,18 +70,18 @@ impl Sampler {
         // Exact rational, area-preserving CPU-clock -> output-rate conversion.
         // A CPU value is held for one CPU cycle and split at a sample boundary
         // when needed; this produces exactly OUTPUT_SAMPLE_RATE samples per
-        // CPU_CLOCK_HZ clocks without frame-rate coupling or repeated samples.
+        // `cpu_clock_hz` clocks without frame-rate coupling or repeated samples.
         let mut units_left = OUTPUT_SAMPLE_RATE;
         let mut output = None;
         while units_left > 0 {
-            let to_boundary = CPU_CLOCK_HZ - self.phase;
+            let to_boundary = cpu_clock_hz - self.phase;
             let units = units_left.min(to_boundary);
             self.integrated += f64::from(mixed) * f64::from(units);
             self.phase += units;
             units_left -= units;
 
-            if self.phase == CPU_CLOCK_HZ {
-                let mut sample = (self.integrated / f64::from(CPU_CLOCK_HZ)) as f32;
+            if self.phase == cpu_clock_hz {
+                let mut sample = (self.integrated / f64::from(cpu_clock_hz)) as f32;
                 self.phase = 0;
                 self.integrated = 0.0;
                 for filter in &mut self.high_pass {

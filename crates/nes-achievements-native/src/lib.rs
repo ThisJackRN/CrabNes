@@ -158,12 +158,42 @@ pub struct Achievement {
     pub id: u32,
     pub points: u32,
     pub unlocked: bool,
+    pub bucket: AchievementBucket,
     pub measured_percent: f32,
     pub title: String,
     pub description: String,
     pub measured_progress: String,
     pub badge_url: String,
     pub badge_locked_url: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AchievementBucket {
+    Unknown,
+    Locked,
+    Unlocked,
+    Unsupported,
+    Unofficial,
+    RecentlyUnlocked,
+    ActiveChallenge,
+    AlmostThere,
+    Unsynced,
+}
+
+impl From<u8> for AchievementBucket {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::Locked,
+            2 => Self::Unlocked,
+            3 => Self::Unsupported,
+            4 => Self::Unofficial,
+            5 => Self::RecentlyUnlocked,
+            6 => Self::ActiveChallenge,
+            7 => Self::AlmostThere,
+            8 => Self::Unsynced,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 pub struct Client {
@@ -358,6 +388,7 @@ impl Client {
                 id: item.id,
                 points: item.points,
                 unlocked: item.unlocked != 0,
+                bucket: item.bucket.into(),
                 measured_percent: item.measured_percent,
                 title: char_buffer(&item.title),
                 description: char_buffer(&item.description),

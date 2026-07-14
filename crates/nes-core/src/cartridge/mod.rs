@@ -18,6 +18,7 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
+use crate::Region;
 use axrom::Axrom;
 use cnrom::Cnrom;
 use fme7::Fme7;
@@ -112,6 +113,7 @@ pub struct Cartridge {
     mapper_id: u16,
     header_mirroring: Mirroring,
     battery_backed: bool,
+    region: Region,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -122,14 +124,33 @@ pub(crate) struct CartridgeSnapshot {
 
 impl Cartridge {
     pub fn from_ines(bytes: &[u8]) -> Result<Self, CartridgeError> {
+        Self::from_ines_inner(bytes, None)
+    }
+
+    pub fn from_ines_with_region(bytes: &[u8], region: Region) -> Result<Self, CartridgeError> {
+        Self::from_ines_inner(bytes, Some(region))
+    }
+
+    fn from_ines_inner(
+        bytes: &[u8],
+        region_override: Option<Region>,
+    ) -> Result<Self, CartridgeError> {
         let parsed = ines::parse(bytes)?;
         let header = parsed.header;
         if header.console_type != 0 {
             return Err(CartridgeError::UnsupportedConsoleType(header.console_type));
         }
-        if matches!(header.timing, TimingMode::Pal | TimingMode::Dendy) {
+        if header.timing == TimingMode::Dendy {
             return Err(CartridgeError::UnsupportedTiming(header.timing));
         }
+        let region = region_override.unwrap_or_else(|| {
+            if header.timing == TimingMode::Pal {
+                Region::Pal
+            } else {
+                // Multi-region ROMs default to the locally compatible NTSC mode.
+                Region::Ntsc
+            }
+        });
         let mapper: Box<dyn Mapper> = match header.mapper_id {
             0 if header.submapper == 0 => {
                 let mut nrom = Nrom::new(parsed.prg, parsed.chr)?;
@@ -231,11 +252,15 @@ impl Cartridge {
             mapper_id: header.mapper_id,
             header_mirroring: header.mirroring,
             battery_backed: header.battery_backed,
+            region,
         })
     }
 
     pub fn mapper_id(&self) -> u16 {
         self.mapper_id
+    }
+    pub fn region(&self) -> Region {
+        self.region
     }
     pub fn mirroring(&self) -> Mirroring {
         self.mapper.mirroring().unwrap_or(self.header_mirroring)
@@ -339,10 +364,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pal_nes2_until_pal_timing_is_implemented() {
+    fn selects_pal_timing_from_nes2_header() {
+        let cartridge = Cartridge::from_ines(&nes2_nrom(1)).unwrap();
+        assert_eq!(cartridge.region(), Region::Pal);
+    }
+
+    #[test]
+    fn rejects_dendy_timing_until_it_is_implemented() {
         assert!(matches!(
-            Cartridge::from_ines(&nes2_nrom(1)),
-            Err(CartridgeError::UnsupportedTiming(TimingMode::Pal))
+            Cartridge::from_ines(&nes2_nrom(3)),
+            Err(CartridgeError::UnsupportedTiming(TimingMode::Dendy))
         ));
     }
 

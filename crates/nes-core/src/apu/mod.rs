@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use channels::{Dmc, Noise, Pulse, Triangle};
 use mixer::{Levels, Sampler};
 
-use crate::CPU_CLOCK_HZ;
+use crate::Region;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const MAX_QUEUED_SAMPLES: usize = OUTPUT_SAMPLE_RATE as usize * 2;
@@ -22,12 +22,32 @@ const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
     192, 24, 72, 26, 16, 28, 32, 30,
 ];
-const NOISE_PERIODS: [u16; 16] = [
+const NTSC_NOISE_PERIODS: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
 ];
-const DMC_PERIODS: [u16; 16] = [
+const PAL_NOISE_PERIODS: [u16; 16] = [
+    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
+];
+const NTSC_DMC_PERIODS: [u16; 16] = [
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
 ];
+const PAL_DMC_PERIODS: [u16; 16] = [
+    398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
+];
+
+const fn noise_periods(region: Region) -> &'static [u16; 16] {
+    match region {
+        Region::Ntsc => &NTSC_NOISE_PERIODS,
+        Region::Pal => &PAL_NOISE_PERIODS,
+    }
+}
+
+const fn dmc_periods(region: Region) -> &'static [u16; 16] {
+    match region {
+        Region::Ntsc => &NTSC_DMC_PERIODS,
+        Region::Pal => &PAL_DMC_PERIODS,
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ApuState {
@@ -74,25 +94,30 @@ pub struct Apu {
 
 impl Default for Apu {
     fn default() -> Self {
+        Self::new(Region::Ntsc)
+    }
+}
+
+impl Apu {
+    pub(crate) fn new(region: Region) -> Self {
+        let dmc_periods = dmc_periods(region);
         Self {
             pulse: [Pulse::new(true), Pulse::new(false)],
             triangle: Triangle::default(),
             noise: Noise::default(),
-            dmc: Dmc::default(),
+            dmc: Dmc::new(dmc_periods[0]),
             frame_counter: FrameCounter::default(),
             cycles: 0,
-            sampler: Sampler::default(),
+            sampler: Sampler::new(region.cpu_clock_hz()),
             samples: VecDeque::with_capacity(MAX_QUEUED_SAMPLES),
             channel_output_enabled: [true; 5],
             dropped_samples: 0,
         }
     }
-}
 
-impl Apu {
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self, region: Region) {
         let channel_output_enabled = self.channel_output_enabled;
-        *self = Self::default();
+        *self = Self::new(region);
         self.channel_output_enabled = channel_output_enabled;
     }
 
@@ -139,21 +164,23 @@ impl Apu {
     }
 
     pub fn clock(&mut self) {
-        self.clock_with_expansion(0.0);
+        self.clock_with_expansion(0.0, Region::Ntsc);
     }
 
-    pub(crate) fn clock_with_expansion(&mut self, expansion: f32) {
+    pub(crate) fn clock_with_expansion(&mut self, expansion: f32, region: Region) {
         self.cycles = self.cycles.wrapping_add(1);
 
         self.triangle.clock_timer();
-        self.noise.clock_timer();
-        self.dmc.clock_timer();
+        self.noise
+            .clock_timer(noise_periods(region)[self.noise.period_index()]);
+        self.dmc
+            .clock_timer(dmc_periods(region)[self.dmc.rate_index()]);
         if self.cycles.is_multiple_of(2) {
             self.pulse[0].clock_timer();
             self.pulse[1].clock_timer();
         }
 
-        let events = self.frame_counter.clock();
+        let events = self.frame_counter.clock(region);
         if events.quarter {
             self.clock_quarter_frame();
         }
@@ -166,7 +193,7 @@ impl Apu {
         self.noise.apply_length_pending();
 
         let levels = self.levels();
-        if let Some(sample) = self.sampler.clock(levels, expansion) {
+        if let Some(sample) = self.sampler.clock(levels, expansion, region.cpu_clock_hz()) {
             if self.samples.len() == MAX_QUEUED_SAMPLES {
                 self.samples.pop_front();
                 self.dropped_samples = self.dropped_samples.saturating_add(1);
@@ -208,12 +235,17 @@ impl Apu {
     }
 
     pub fn state(&self) -> ApuState {
+        self.state_for_region(Region::Ntsc)
+    }
+
+    pub(crate) fn state_for_region(&self, region: Region) -> ApuState {
+        let cpu_clock_hz = region.cpu_clock_hz();
         let pulse_periods = [self.pulse[0].timer(), self.pulse[1].timer()];
         let pulse_frequencies_hz = pulse_periods.map(|period| {
             if period < 8 {
                 0.0
             } else {
-                CPU_CLOCK_HZ as f32 / (16.0 * (f32::from(period) + 1.0))
+                cpu_clock_hz as f32 / (16.0 * (f32::from(period) + 1.0))
             }
         });
         let triangle_period = self.triangle.timer();
@@ -222,12 +254,12 @@ impl Apu {
             pulse_frequencies_hz,
             pulse_levels: [self.pulse[0].output(), self.pulse[1].output()],
             triangle_period,
-            triangle_frequency_hz: CPU_CLOCK_HZ as f32
+            triangle_frequency_hz: cpu_clock_hz as f32
                 / (32.0 * (f32::from(triangle_period) + 1.0)),
             triangle_level: self.triangle.output(),
-            noise_period: self.noise.period(),
+            noise_period: noise_periods(region)[self.noise.period_index()],
             noise_level: self.noise.output(),
-            dmc_period: self.dmc.rate_period(),
+            dmc_period: dmc_periods(region)[self.dmc.rate_index()],
             dmc_level: self.dmc.output(),
             frame_five_step: self.frame_counter.five_step,
             queued_samples: self.samples.len(),
@@ -282,8 +314,10 @@ struct FrameEvents {
 impl FrameCounter {
     // Adapted from TetaNES's CPU-cycle frame sequencer (Copyright 2021
     // Luke Petherbridge; MIT/Apache-2.0). See THIRD_PARTY_NOTICES.md.
-    const FOUR_STEP_CYCLES: [u32; 6] = [7_457, 14_913, 22_371, 29_828, 29_829, 29_830];
-    const FIVE_STEP_CYCLES: [u32; 6] = [7_457, 14_913, 22_371, 29_829, 37_281, 37_282];
+    const NTSC_FOUR_STEP_CYCLES: [u32; 6] = [7_457, 14_913, 22_371, 29_828, 29_829, 29_830];
+    const NTSC_FIVE_STEP_CYCLES: [u32; 6] = [7_457, 14_913, 22_371, 29_829, 37_281, 37_282];
+    const PAL_FOUR_STEP_CYCLES: [u32; 6] = [8_313, 16_627, 24_939, 33_252, 33_253, 33_254];
+    const PAL_FIVE_STEP_CYCLES: [u32; 6] = [8_313, 16_627, 24_939, 33_253, 41_565, 41_566];
 
     fn write(&mut self, value: u8, cpu_cycles: u64) {
         self.pending_five_step = value & 0x80 != 0;
@@ -294,13 +328,14 @@ impl FrameCounter {
         self.reset_delay = 3 + (cpu_cycles as u8 & 1);
     }
 
-    fn clock(&mut self) -> FrameEvents {
+    fn clock(&mut self, region: Region) -> FrameEvents {
         self.cycle += 1;
         let mut events = FrameEvents::default();
-        let step_cycles = if self.five_step {
-            Self::FIVE_STEP_CYCLES
-        } else {
-            Self::FOUR_STEP_CYCLES
+        let step_cycles = match (region, self.five_step) {
+            (Region::Ntsc, false) => Self::NTSC_FOUR_STEP_CYCLES,
+            (Region::Ntsc, true) => Self::NTSC_FIVE_STEP_CYCLES,
+            (Region::Pal, false) => Self::PAL_FOUR_STEP_CYCLES,
+            (Region::Pal, true) => Self::PAL_FIVE_STEP_CYCLES,
         };
 
         if self.cycle == step_cycles[self.step] {
@@ -356,7 +391,7 @@ mod tests {
     #[test]
     fn produces_samples_at_48khz() {
         let mut apu = Apu::default();
-        for _ in 0..CPU_CLOCK_HZ {
+        for _ in 0..crate::NTSC_CPU_CLOCK_HZ {
             apu.clock();
         }
         let mut samples = Vec::new();
@@ -382,10 +417,10 @@ mod tests {
         noise.prepare_timer_test(0);
         let initial = noise.shift_register();
         for _ in 0..3 {
-            noise.clock_timer();
+            noise.clock_timer(NTSC_NOISE_PERIODS[0]);
             assert_eq!(noise.shift_register(), initial);
         }
-        noise.clock_timer();
+        noise.clock_timer(NTSC_NOISE_PERIODS[0]);
         assert_ne!(noise.shift_register(), initial);
     }
 
@@ -414,7 +449,7 @@ mod tests {
     #[test]
     fn output_filter_removes_steady_dac_bias() {
         let mut apu = Apu::default();
-        for _ in 0..CPU_CLOCK_HZ * 2 {
+        for _ in 0..crate::NTSC_CPU_CLOCK_HZ * 2 {
             apu.clock();
         }
         let mut samples = Vec::new();
@@ -468,7 +503,7 @@ mod tests {
         let mut quarter_cycles = Vec::new();
         let mut half_cycles = Vec::new();
         for cycle in 1..=29_830 {
-            let events = counter.clock();
+            let events = counter.clock(Region::Ntsc);
             if events.quarter {
                 quarter_cycles.push(cycle);
             }
@@ -489,14 +524,45 @@ mod tests {
     fn five_step_frame_counter_has_no_irq_and_clocks_on_write() {
         let mut counter = FrameCounter::default();
         counter.write(0x80, 0);
-        assert_eq!(counter.clock(), FrameEvents::default());
-        assert_eq!(counter.clock(), FrameEvents::default());
-        let immediate = counter.clock();
+        assert_eq!(counter.clock(Region::Ntsc), FrameEvents::default());
+        assert_eq!(counter.clock(Region::Ntsc), FrameEvents::default());
+        let immediate = counter.clock(Region::Ntsc);
         assert!(immediate.quarter && immediate.half);
         for _ in 0..37_282 {
-            counter.clock();
+            counter.clock(Region::Ntsc);
         }
         assert!(!counter.irq_flag);
+    }
+
+    #[test]
+    fn pal_sampler_still_produces_48khz() {
+        let mut apu = Apu::new(Region::Pal);
+        for _ in 0..crate::PAL_CPU_CLOCK_HZ {
+            apu.clock_with_expansion(0.0, Region::Pal);
+        }
+        let mut samples = Vec::new();
+        apu.drain_samples(&mut samples);
+        assert_eq!(samples.len(), OUTPUT_SAMPLE_RATE as usize);
+    }
+
+    #[test]
+    fn pal_frame_counter_uses_50hz_landmarks() {
+        let mut counter = FrameCounter::default();
+        let mut quarter_cycles = Vec::new();
+        let mut half_cycles = Vec::new();
+        for cycle in 1..=33_254 {
+            let events = counter.clock(Region::Pal);
+            if events.quarter {
+                quarter_cycles.push(cycle);
+            }
+            if events.half {
+                half_cycles.push(cycle);
+            }
+        }
+        assert_eq!(quarter_cycles, [8_313, 16_627, 24_939, 33_253]);
+        assert_eq!(half_cycles, [16_627, 33_253]);
+        assert!(counter.irq_flag);
+        assert_eq!(counter.cycle, 0);
     }
 
     #[test]
