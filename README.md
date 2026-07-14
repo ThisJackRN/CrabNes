@@ -149,9 +149,6 @@ CrabNes stores user data under:
   tas\<rom-hash>\                Default TAS folder
 ```
 
-On first launch, CrabNes automatically moves an existing
-`%LOCALAPPDATA%\MyOwnNesEmulator` directory to the new location. If Windows blocks
-the move, CrabNes safely continues using the legacy directory for that session.
 Battery saves and screenshots remain beside the ROM.
 
 ## Build from source
