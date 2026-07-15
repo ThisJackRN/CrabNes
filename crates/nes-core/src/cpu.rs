@@ -53,6 +53,18 @@ pub struct Cpu {
     instructions: u64,
     #[serde(default)]
     jammed: bool,
+    #[serde(default)]
+    interrupt_poll_i: bool,
+    #[serde(default)]
+    nmi_latched: bool,
+    #[serde(default)]
+    interrupt_poll_cycle: u16,
+    #[serde(default)]
+    branch_irq_first_poll: bool,
+    #[serde(default)]
+    branch_irq_delay: bool,
+    #[serde(default)]
+    irq_poll_latched: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +88,12 @@ impl Default for Cpu {
             status: U | I,
             instructions: 0,
             jammed: false,
+            interrupt_poll_i: true,
+            nmi_latched: false,
+            interrupt_poll_cycle: 0,
+            branch_irq_first_poll: false,
+            branch_irq_delay: false,
+            irq_poll_latched: false,
         }
     }
 }
@@ -90,6 +108,12 @@ impl Cpu {
         self.pc = self.read_word(bus, 0xfffc);
         self.instructions = 0;
         self.jammed = false;
+        self.interrupt_poll_i = true;
+        self.nmi_latched = false;
+        self.interrupt_poll_cycle = 0;
+        self.branch_irq_first_poll = false;
+        self.branch_irq_delay = false;
+        self.irq_poll_latched = false;
     }
 
     pub fn state(&self) -> CpuState {
@@ -113,22 +137,68 @@ impl Cpu {
     }
 
     pub fn irq(&mut self, bus: &mut Bus) -> u16 {
-        if self.flag(I) {
-            0
-        } else {
-            bus.read(self.pc);
-            bus.read(self.pc);
-            self.interrupt(bus, 0xfffe, false);
-            7
+        bus.read(self.pc);
+        bus.read(self.pc);
+        self.interrupt(bus, 0xfffe, false);
+        7
+    }
+
+    pub(crate) fn irq_masked_at_poll(&self) -> bool {
+        self.interrupt_poll_i
+    }
+
+    pub(crate) fn take_latched_nmi(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.nmi_latched);
+        if pending {
+            self.suppress_branch_irq();
+            self.irq_poll_latched = false;
         }
+        pending
+    }
+
+    pub(crate) fn take_branch_irq_delay(&mut self) -> bool {
+        std::mem::take(&mut self.branch_irq_delay)
+    }
+
+    pub(crate) fn take_polled_irq(&mut self) -> bool {
+        std::mem::take(&mut self.irq_poll_latched)
+    }
+
+    pub(crate) fn suppress_branch_irq(&mut self) {
+        self.branch_irq_first_poll = false;
+        self.branch_irq_delay = false;
+    }
+
+    pub(crate) fn complete_interrupt_poll(&mut self, bus: &mut Bus) {
+        if self.interrupt_poll_cycle == 0 {
+            return;
+        }
+        if bus.nmi_pending_at_slot(self.interrupt_poll_cycle) {
+            self.nmi_latched = bus.ppu.take_nmi();
+        }
+        let irq_at_poll = bus.irq_pending_at_slot(self.interrupt_poll_cycle);
+        self.irq_poll_latched = irq_at_poll && !self.interrupt_poll_i;
+        if !self.interrupt_poll_i && !irq_at_poll && bus.irq_pending() {
+            self.branch_irq_delay = true;
+        }
+        self.interrupt_poll_cycle = 0;
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<u16, CpuError> {
+        self.interrupt_poll_cycle = 0;
         if self.jammed {
             bus.read(self.pc);
             return Ok(1);
         }
+        let i_before_instruction = self.flag(I);
         let opcode = self.fetch(bus);
+        self.branch_irq_first_poll = false;
+        if matches!(
+            opcode,
+            0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xb0 | 0xd0 | 0xf0
+        ) {
+            self.branch_irq_first_poll = bus.irq_pending() && !i_before_instruction;
+        }
         self.instructions = self.instructions.wrapping_add(1);
         let cycles = match opcode {
             // ADC
@@ -1249,6 +1319,21 @@ impl Cpu {
                 4 + p as u16
             }
         };
+        if opcode != 0x00 && !self.jammed {
+            self.interrupt_poll_cycle = if matches!(
+                opcode,
+                0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xb0 | 0xd0 | 0xf0
+            ) {
+                if cycles == 4 { 3 } else { 1 }
+            } else {
+                cycles.saturating_sub(1)
+            };
+            self.interrupt_poll_i = if matches!(opcode, 0x28 | 0x58 | 0x78) {
+                i_before_instruction
+            } else {
+                self.flag(I)
+            };
+        }
         Ok(cycles)
     }
 
@@ -1508,6 +1593,7 @@ impl Cpu {
     fn branch(&mut self, bus: &mut Bus, condition: bool) -> u16 {
         let offset = self.fetch(bus) as i8;
         if !condition {
+            self.finish_branch_irq_poll(bus, false);
             return 2;
         }
         let old = self.pc;
@@ -1516,11 +1602,19 @@ impl Cpu {
         let page_crossed = old & 0xff00 != self.pc & 0xff00;
         if page_crossed {
             bus.read((old & 0xff00) | (self.pc & 0x00ff));
+        } else {
+            self.finish_branch_irq_poll(bus, false);
         }
         3 + page_crossed as u16
     }
-    fn interrupt(&mut self, bus: &mut Bus, vector: u16, software: bool) {
+    fn finish_branch_irq_poll(&mut self, bus: &Bus, page_crossed: bool) {
+        if !page_crossed && !self.flag(I) && !self.branch_irq_first_poll && bus.irq_pending() {
+            self.branch_irq_delay = true;
+        }
+    }
+    fn interrupt(&mut self, bus: &mut Bus, mut vector: u16, software: bool) {
         self.push_word(bus, self.pc);
+        let nmi_hijacked = vector == 0xfffe && bus.ppu.take_nmi();
         let mut flags = self.status | U;
         if software {
             flags |= B;
@@ -1529,6 +1623,78 @@ impl Cpu {
         }
         self.push(bus, flags);
         self.set_flag(I, true);
+        self.interrupt_poll_i = true;
+        self.suppress_branch_irq();
+        self.irq_poll_latched = false;
+        self.interrupt_poll_cycle = 0;
+        if nmi_hijacked {
+            // NMI can hijack an IRQ/BRK after its return state was pushed but
+            // before the vector fetch. The original B-bit value is retained.
+            vector = 0xfffa;
+        }
         self.pc = self.read_word(bus, vector);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cartridge::Cartridge;
+
+    fn nrom_bus(program: &[u8]) -> Bus {
+        let mut rom = vec![0; 16 + 0x4000 + 0x2000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        rom[5] = 1;
+        rom[16..16 + program.len()].copy_from_slice(program);
+        rom[16 + 0x3ffa..16 + 0x4000].copy_from_slice(&[0x00, 0x90, 0x00, 0x80, 0x00, 0xa0]);
+        Bus::new(Cartridge::from_ines(&rom).unwrap())
+    }
+
+    fn run_instruction(cpu: &mut Cpu, bus: &mut Bus) {
+        bus.begin_cpu_sequence();
+        let cycles = cpu.step(bus).unwrap();
+        bus.finish_cpu_sequence(cycles);
+        cpu.complete_interrupt_poll(bus);
+    }
+
+    #[test]
+    fn cli_and_sei_use_the_i_flag_from_their_interrupt_poll_cycle() {
+        // CLI; NOP; SEI. CLI remains masked for its own poll, the NOP sees the
+        // cleared flag, and SEI's poll still sees the pre-instruction clear.
+        let mut bus = nrom_bus(&[0x58, 0xea, 0x78]);
+        let mut cpu = Cpu {
+            pc: 0x8000,
+            ..Cpu::default()
+        };
+
+        run_instruction(&mut cpu, &mut bus);
+        assert!(cpu.irq_masked_at_poll());
+        run_instruction(&mut cpu, &mut bus);
+        assert!(!cpu.irq_masked_at_poll());
+        run_instruction(&mut cpu, &mut bus);
+        assert!(!cpu.irq_masked_at_poll());
+        assert!(cpu.flag(I));
+    }
+
+    #[test]
+    fn nmi_hijacks_irq_and_brk_vectors_without_changing_the_pushed_b_bit() {
+        for software in [false, true] {
+            let mut bus = nrom_bus(&[]);
+            let mut cpu = Cpu {
+                pc: 0x8123,
+                status: U,
+                ..Cpu::default()
+            };
+            bus.ppu.force_nmi_for_test();
+
+            bus.begin_cpu_sequence();
+            cpu.interrupt(&mut bus, 0xfffe, software);
+            bus.finish_cpu_sequence(5);
+
+            assert_eq!(cpu.pc, 0x9000);
+            let pushed_status = bus.peek_cpu(0x01fb);
+            assert_eq!(pushed_status & B != 0, software);
+        }
     }
 }

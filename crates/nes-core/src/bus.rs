@@ -23,6 +23,8 @@ pub struct Bus {
     open_bus: u8,
     dmc_completed_last_cpu_slot: bool,
     cpu_sequence_cycles: u16,
+    nmi_samples: Vec<bool>,
+    irq_samples: Vec<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -56,6 +58,8 @@ impl Bus {
             open_bus: 0,
             dmc_completed_last_cpu_slot: false,
             cpu_sequence_cycles: 0,
+            nmi_samples: Vec::with_capacity(8),
+            irq_samples: Vec::with_capacity(8),
         }
     }
 
@@ -71,11 +75,16 @@ impl Bus {
         self.open_bus = 0;
         self.dmc_completed_last_cpu_slot = false;
         self.cpu_sequence_cycles = 0;
+        self.nmi_samples.clear();
+        self.irq_samples.clear();
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
-        self.advance_cpu_slot();
-        self.read_untimed(address)
+        self.advance_cpu_slot(true);
+        self.record_irq_line();
+        let value = self.read_untimed(address);
+        self.record_nmi_line();
+        value
     }
 
     fn read_untimed(&mut self, address: u16) -> u8 {
@@ -93,6 +102,11 @@ impl Bus {
                 ),
                 // The controller drives only the low serial bit. The upper
                 // three bits retain CPU open bus on an NTSC NES.
+                0x4016 if self.cartridge.mapper_id() == 99 => (
+                    self.controllers[0].read() | u8::from(self.controllers[0].coin()) * 0x20,
+                    true,
+                ),
+                0x4017 if self.cartridge.mapper_id() == 99 => (self.controllers[1].read(), true),
                 0x4016 => (self.controllers[0].read() | (self.open_bus & 0xe0), true),
                 0x4017 => (self.controllers[1].read() | (self.open_bus & 0xe0), true),
                 _ => (self.open_bus, false),
@@ -106,8 +120,10 @@ impl Bus {
     }
 
     pub fn write(&mut self, address: u16, value: u8) {
-        self.advance_cpu_slot();
+        self.advance_cpu_slot(false);
+        self.record_irq_line();
         self.write_untimed(address, value);
+        self.record_nmi_line();
     }
 
     fn write_untimed(&mut self, address: u16, value: u8) {
@@ -132,13 +148,17 @@ impl Bus {
     pub(crate) fn begin_cpu_sequence(&mut self) {
         debug_assert_eq!(self.cpu_sequence_cycles, 0);
         self.cpu_sequence_cycles = 0;
+        self.nmi_samples.clear();
+        self.irq_samples.clear();
     }
 
     /// Completes the idle slots in a CPU instruction, reset, or interrupt
     /// sequence. Memory accesses have already advanced their individual slots.
     pub(crate) fn finish_cpu_sequence(&mut self, target_cycles: u16) -> u16 {
         while self.cpu_sequence_cycles < target_cycles {
-            self.advance_cpu_slot();
+            self.advance_cpu_slot(true);
+            self.record_irq_line();
+            self.record_nmi_line();
         }
         let actual = self.cpu_sequence_cycles;
         debug_assert_eq!(actual, target_cycles);
@@ -148,18 +168,54 @@ impl Bus {
 
     pub(crate) fn cancel_cpu_sequence(&mut self) {
         self.cpu_sequence_cycles = 0;
+        self.nmi_samples.clear();
+        self.irq_samples.clear();
     }
 
-    fn advance_cpu_slot(&mut self) -> bool {
-        let dmc_completed = self.service_dma_stalls();
+    pub(crate) fn nmi_pending_at_slot(&self, slot: u16) -> bool {
+        slot.checked_sub(1)
+            .and_then(|slot| self.nmi_samples.get(slot as usize))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn irq_pending_at_slot(&self, slot: u16) -> bool {
+        slot.checked_sub(1)
+            .and_then(|slot| self.irq_samples.get(slot as usize))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn record_irq_line(&mut self) {
+        self.irq_samples.push(self.irq_pending());
+    }
+
+    fn record_nmi_line(&mut self) {
+        self.nmi_samples.push(self.ppu.nmi_pending());
+    }
+
+    fn advance_cpu_slot(&mut self, can_service_dmc: bool) -> bool {
+        let dmc_completed = self.service_dma_stalls(can_service_dmc);
         self.clock_hardware_cycle();
         self.cpu_sequence_cycles = self.cpu_sequence_cycles.saturating_add(1);
         self.dmc_completed_last_cpu_slot = dmc_completed;
         dmc_completed
     }
 
-    fn service_dma_stalls(&mut self) -> bool {
+    fn service_dma_stalls(&mut self, can_service_dmc: bool) -> bool {
         let mut dmc_completed = false;
+        if self.dma_stall == 0 && !can_service_dmc {
+            return false;
+        }
+        if self.dma_stall == 0
+            && self
+                .dmc_dma
+                .as_ref()
+                .is_some_and(|dma| dma.wait_for_alignment)
+        {
+            self.dmc_dma.as_mut().unwrap().wait_for_alignment = false;
+            return false;
+        }
         while self.dma_stall != 0 || self.dmc_dma.is_some() {
             let servicing_dmc = self.dmc_dma.is_some();
             self.clock_hardware_cycle();
@@ -196,12 +252,14 @@ impl Bus {
         unmasked_value: u8,
     ) {
         let dmc_interrupted_previous_slot = self.dmc_completed_last_cpu_slot;
-        let dmc_completed = self.advance_cpu_slot();
+        let dmc_completed = self.advance_cpu_slot(false);
+        self.record_irq_line();
         if dmc_interrupted_previous_slot || dmc_completed {
             self.write_untimed(unmasked_address, unmasked_value);
         } else {
             self.write_untimed(masked_address, masked_value);
         }
+        self.record_nmi_line();
     }
 
     fn clock_hardware_cycle(&mut self) {
@@ -228,6 +286,7 @@ impl Bus {
             self.dmc_dma = Some(DmcDma {
                 address,
                 cycles_remaining: 4,
+                wait_for_alignment: self.cpu_cycles & 1 == 0,
             });
         }
     }
@@ -342,6 +401,16 @@ mod tests {
         Cartridge::from_ines(&rom).unwrap()
     }
 
+    fn mapper99_cartridge() -> Cartridge {
+        let mut rom = vec![0; 16 + 0x8000 + 0x4000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 2;
+        rom[5] = 2;
+        rom[6] = 0x30;
+        rom[7] = 0x60;
+        Cartridge::from_ines(&rom).unwrap()
+    }
+
     #[test]
     fn controller_reads_preserve_upper_cpu_open_bus_bits() {
         let mut bus = Bus::new(nrom_cartridge());
@@ -353,6 +422,21 @@ mod tests {
         bus.open_bus = 0xe0;
         bus.internal_data_bus = 0xe0;
         assert_eq!(bus.read_untimed(0x4016), 0xe1);
+    }
+
+    #[test]
+    fn mapper99_coin_input_is_separate_from_the_select_button() {
+        let mut bus = Bus::new(mapper99_cartridge());
+        bus.open_bus = 0xe0;
+        assert_eq!(bus.read_untimed(0x4016), 0x00);
+
+        bus.controllers[0].set_coin(true);
+        assert_eq!(bus.read_untimed(0x4016) & 0x60, 0x20);
+        assert_eq!(bus.read_untimed(0x4017) & 0xfc, 0x00);
+
+        bus.controllers[0].set_coin(false);
+        bus.controllers[0].set_button(crate::controller::Button::Select, true);
+        assert_eq!(bus.read_untimed(0x4016) & 0x60, 0x00);
     }
 
     #[test]
@@ -373,21 +457,49 @@ mod tests {
         bus.dmc_dma = Some(DmcDma {
             address: 0x8000,
             cycles_remaining: 1,
+            wait_for_alignment: false,
         });
 
         bus.write_unstable_store(0x0001, 0x11, 0x0002, 0x22);
-        assert_eq!(bus.ram[1], 0);
-        assert_eq!(bus.ram[2], 0x22);
+        assert_eq!(bus.ram[1], 0x11);
+        assert_eq!(bus.ram[2], 0);
+        assert!(
+            bus.dmc_dma.is_some(),
+            "DMC cannot halt the final write slot"
+        );
 
         let mut bus = Bus::new(nrom_cartridge());
         bus.dmc_dma = Some(DmcDma {
             address: 0x8000,
             cycles_remaining: 1,
+            wait_for_alignment: false,
         });
         bus.read(0x0000);
         bus.write_unstable_store(0x0001, 0x11, 0x0002, 0x22);
         assert_eq!(bus.ram[1], 0);
         assert_eq!(bus.ram[2], 0x22);
+    }
+
+    #[test]
+    fn dmc_dma_waits_through_cpu_writes_and_alignment_slot() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.dmc_dma = Some(DmcDma {
+            address: 0x8000,
+            cycles_remaining: 1,
+            wait_for_alignment: true,
+        });
+
+        bus.write(0x0000, 0x5a);
+        assert_eq!(bus.ram[0], 0x5a);
+        assert!(bus.dmc_dma.is_some());
+
+        bus.read(0x0000);
+        assert!(
+            bus.dmc_dma.is_some(),
+            "first eligible read is the alignment slot"
+        );
+        bus.read(0x0000);
+        assert!(bus.dmc_dma.is_none());
     }
 }
 
@@ -395,4 +507,5 @@ mod tests {
 struct DmcDma {
     address: u16,
     cycles_remaining: u8,
+    wait_for_alignment: bool,
 }

@@ -6,7 +6,7 @@ use gilrs::{Axis, Button as GamepadButton, ev::Code};
 
 use crate::persistence;
 
-pub const SETTINGS_VERSION: u32 = 3;
+pub const SETTINGS_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -210,6 +210,8 @@ pub struct InputSettings {
     pub player2_bindings: [KeyBinding; 8],
     pub gamepad_bindings: [Option<GamepadBinding>; 8],
     pub player2_gamepad_bindings: [Option<GamepadBinding>; 8],
+    pub vs_coin_binding: KeyBinding,
+    pub vs_coin_gamepad_binding: Option<GamepadBinding>,
     /// Connected-controller index for each player. `None` assigns controllers in player order.
     pub gamepad_slots: [Option<usize>; 2],
     pub gamepad_axis_threshold: f32,
@@ -333,6 +335,8 @@ impl Default for InputSettings {
             ],
             gamepad_bindings: default_gamepad_bindings(),
             player2_gamepad_bindings: default_gamepad_bindings(),
+            vs_coin_binding: KeyBinding::new("5"),
+            vs_coin_gamepad_binding: None,
             gamepad_slots: [None, None],
             gamepad_axis_threshold: 0.5,
             allow_opposite_directions: false,
@@ -417,6 +421,9 @@ fn migrate(mut settings: Settings) -> Settings {
     if settings.version < 3 {
         settings.version = 3;
     }
+    if settings.version < 4 {
+        settings.version = 4;
+    }
     settings
 }
 
@@ -483,6 +490,8 @@ mod tests {
             InputSettings::default().gamepad_bindings
         );
         assert_eq!(settings.input.gamepad_slots, [None, None]);
+        assert_eq!(settings.input.vs_coin_binding.label(), "5");
+        assert_eq!(settings.input.vs_coin_gamepad_binding, None);
         assert_eq!(settings.input.gamepad_axis_threshold, 0.5);
         assert!(!settings.input.allow_opposite_directions);
         assert_eq!(settings.tas.checkpoint_interval, 300);

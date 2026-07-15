@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -23,8 +23,18 @@ pub enum CoverSource {
 pub struct AccuracyEstimate {
     pub score: u8,
     pub rating: String,
+    pub mapper_coverage: String,
+    pub passed: u16,
+    pub total: u16,
     pub details: Vec<String>,
 }
+
+const ACCURACYCOIN_PASSED: u16 = 101;
+const ACCURACYCOIN_TOTAL: u16 = 141;
+const ACCURACYCOIN_OFFICIAL_CPU: (u16, u16, u8) = (22, 23, 10);
+const ACCURACYCOIN_UNOFFICIAL_CPU: (u16, u16, u8) = (66, 66, 5);
+const ACCURACYCOIN_PPU: (u16, u16, u8) = (8, 33, 15);
+const ACCURACYCOIN_APU_DMA: (u16, u16, u8) = (5, 19, 5);
 
 #[derive(Clone)]
 pub struct LibraryEntry {
@@ -450,57 +460,105 @@ impl RomLibrary {
 
 fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
     let mapper = nes.mapper_id();
-    let (mut score, mapper_note): (u8, &str) = match mapper {
+    let (coverage, mapper_penalty, mapper_note): (&str, u8, &str) = match mapper {
         0 => (
-            94,
+            "Focused",
+            0,
             "NROM has no bank-switching hardware and receives the strongest coverage.",
         ),
         1 => (
-            91,
+            "Focused",
+            2,
             "MMC1 banking, mirroring, RAM, and serial writes are covered.",
         ),
         2 | 3 | 7 => (
-            92,
+            "Focused",
+            2,
             "This discrete mapper family has focused banking and mirroring tests.",
         ),
         9 | 10 => (
-            87,
-            "MMC2/MMC4 latch behavior is supported; uncommon board details need more coverage.",
+            "Partial",
+            5,
+            "MMC2/MMC4 banking and latch behavior have focused regressions, but the PPU fetch pipeline is not yet dot-perfect.",
         ),
         4 => (
-            84,
+            "Broad",
+            5,
             "MMC3 is broadly supported, but exact IRQ and MMC6 board variants remain accuracy work.",
         ),
         21 | 22 | 23 | 25 => (
-            82,
+            "Partial",
+            7,
             "VRC2/VRC4 banking and cycle IRQs work; wiring variants reduce confidence.",
         ),
         24 | 26 => (
-            80,
+            "Partial",
+            7,
             "VRC6 banking, IRQs, and expansion audio work; analog audio matching is approximate.",
         ),
         69 => (
-            80,
+            "Partial",
+            7,
             "FME-7 banking, IRQs, and Sunsoft 5B audio work; uncommon board variants need testing.",
         ),
         19 => (
-            76,
+            "Partial",
+            8,
             "Namco 163 banking, IRQs, and audio work; channel mixing remains approximate.",
         ),
         5 => (
-            68,
+            "Experimental",
+            12,
             "MMC5 works, but extended attributes and vertical split rendering remain incomplete.",
         ),
         85 => (
-            65,
+            "Experimental",
+            14,
             "VRC7 works, but FM operator and envelope behavior is still experimental.",
         ),
+        99 => (
+            "Partial",
+            10,
+            "Nintendo Vs. System PRG/CHR banking, four-screen nametables, single-coin input, and the known Vs. Super Mario Bros. RGB palette are covered; configurable DIP switches and other RGB PPU revisions remain incomplete.",
+        ),
         _ => (
-            50,
+            "Experimental",
+            20,
             "This mapper does not have a dedicated CrabNes confidence profile yet.",
         ),
     };
-    let mut details = vec![format!("Mapper {mapper}: {mapper_note}")];
+    let requirements = analyze_rom_requirements(bytes, mapper);
+    let official_cpu_penalty = accuracycoin_penalty(ACCURACYCOIN_OFFICIAL_CPU);
+    let unofficial_cpu_penalty = accuracycoin_penalty(ACCURACYCOIN_UNOFFICIAL_CPU);
+    let ppu_penalty = scale_penalty(
+        accuracycoin_penalty(ACCURACYCOIN_PPU),
+        requirements.ppu_exposure(),
+    );
+    let apu_dma_penalty = scale_penalty(
+        accuracycoin_penalty(ACCURACYCOIN_APU_DMA),
+        requirements.apu_dma_exposure(),
+    );
+    let common_score = 100_u8
+        .saturating_sub(official_cpu_penalty)
+        .saturating_sub(unofficial_cpu_penalty)
+        .saturating_sub(ppu_penalty)
+        .saturating_sub(apu_dma_penalty);
+    let mut score = common_score.saturating_sub(mapper_penalty);
+    let mut details = vec![
+        format!(
+            "AccuracyCoin result: {ACCURACYCOIN_PASSED}/{ACCURACYCOIN_TOTAL} tests pass overall."
+        ),
+        format!(
+            "Likely-code hardware score: {common_score}/100 (CPU -{}, PPU -{} at {}% exposure, APU/DMA -{} at {}% exposure).",
+            official_cpu_penalty + unofficial_cpu_penalty,
+            ppu_penalty,
+            requirements.ppu_exposure(),
+            apu_dma_penalty,
+            requirements.apu_dma_exposure(),
+        ),
+        requirements.analysis_note(mapper),
+        format!("Mapper {mapper} coverage: {coverage}; -{mapper_penalty} points. {mapper_note}"),
+    ];
 
     let nes2 = bytes.get(7).is_some_and(|value| value & 0x0c == 0x08);
     let submapper = if nes2 {
@@ -512,9 +570,7 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
         details.push(format!("NES 2.0 header; submapper {submapper}."));
         if submapper != 0 && !matches!(mapper, 19 | 21 | 22 | 23 | 25 | 85) {
             score = score.saturating_sub(6);
-            details.push(
-                "This mapper does not yet specialize every NES 2.0 submapper variant.".into(),
-            );
+            details.push("Unknown specialized NES 2.0 submapper: -6 points.".into());
         }
     } else {
         details.push("iNES header; hardware variants may not be fully identified.".into());
@@ -523,33 +579,368 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
     match nes.region() {
         Region::Ntsc => details.push("NTSC cycle timing is enabled.".into()),
         Region::Pal => {
-            score = score.saturating_sub(2);
+            score = score.saturating_sub(8);
             details.push(
-                "PAL timing is enabled; its automated game coverage is smaller than NTSC.".into(),
+                "PAL timing: -8 points because AccuracyCoin measures NTSC RP2A03G/RP2C02G behavior."
+                    .into(),
             );
         }
     }
+    if bytes.get(6).is_some_and(|value| value & 0x08 != 0) {
+        score = score.saturating_sub(4);
+        details.push("Four-screen nametable hardware: -4 points due to limited coverage.".into());
+    }
     details.push(
-        "The shared CPU and PPU accuracy suite is applied, but the PPU fetch pipeline is not yet dot-perfect."
-            .into(),
-    );
-    details.push(
-        "This estimate is recomputed from the current core and ROM metadata whenever CrabNes starts or the library is refreshed."
+        "This is a static estimate derived from likely reachable code, AccuracyCoin categories, and cartridge requirements—not an exhaustive playthrough."
             .into(),
     );
 
     AccuracyEstimate {
         score,
         rating: match score {
-            90..=u8::MAX => "High",
-            80..=89 => "Good",
-            70..=79 => "Fair",
+            80..=u8::MAX => "High",
+            70..=79 => "Good",
+            60..=69 => "Fair",
             _ => "Experimental",
         }
         .into(),
+        mapper_coverage: coverage.into(),
+        passed: ACCURACYCOIN_PASSED,
+        total: ACCURACYCOIN_TOTAL,
         details,
     }
 }
+
+fn accuracycoin_penalty((passed, total, risk_budget): (u16, u16, u8)) -> u8 {
+    let failed = total.saturating_sub(passed);
+    ((u32::from(failed) * u32::from(risk_budget) + u32::from(total) / 2) / u32::from(total)) as u8
+}
+
+fn scale_penalty(penalty: u8, exposure_percent: u8) -> u8 {
+    ((u16::from(penalty) * u16::from(exposure_percent) + 50) / 100) as u8
+}
+
+#[derive(Default)]
+struct RomRequirements {
+    instructions: usize,
+    ppu_control: bool,
+    ppu_status: bool,
+    ppu_oam: bool,
+    ppu_scroll_vram: bool,
+    apu_channels: bool,
+    apu_enable: bool,
+    apu_frame_counter: bool,
+    dmc: bool,
+}
+
+impl RomRequirements {
+    fn ppu_exposure(&self) -> u8 {
+        if self.instructions == 0 {
+            return 100;
+        }
+        u8::from(self.ppu_control) * 15
+            + u8::from(self.ppu_status) * 15
+            + u8::from(self.ppu_oam) * 15
+            + u8::from(self.ppu_scroll_vram) * 20
+    }
+
+    fn apu_dma_exposure(&self) -> u8 {
+        if self.instructions == 0 || self.dmc {
+            return 100;
+        }
+        u8::from(self.apu_channels) * 30
+            + u8::from(self.apu_enable) * 10
+            + u8::from(self.apu_frame_counter) * 10
+    }
+
+    fn analysis_note(&self, mapper: u16) -> String {
+        if self.instructions == 0 {
+            return "Static code scan could not resolve the interrupt vectors; full shared hardware risk was retained.".into();
+        }
+        let scope = match mapper {
+            0 => "the complete fixed NROM program",
+            9 => "fixed code and MMC2 8 KiB banks reached from fixed-bank calls",
+            _ => {
+                "the startup and fixed banks; dynamically selected banks remain covered by mapper risk"
+            }
+        };
+        format!(
+            "Static reachability scan decoded {} likely instructions from the reset/NMI/IRQ vectors across {scope}.",
+            self.instructions
+        )
+    }
+
+    fn record_access(&mut self, address: u16, write: bool, indexed: bool) {
+        if (0x2000..=0x3fff).contains(&address) {
+            if indexed {
+                self.ppu_control = true;
+                self.ppu_status = true;
+                self.ppu_oam = true;
+                self.ppu_scroll_vram = true;
+                return;
+            }
+            match address & 7 {
+                0 | 1 => self.ppu_control = true,
+                2 => self.ppu_status = true,
+                3 | 4 => self.ppu_oam = true,
+                5..=7 => self.ppu_scroll_vram = true,
+                _ => {}
+            }
+        }
+        match address {
+            0x4000..=0x400f => self.apu_channels = true,
+            0x4010..=0x4013 => self.dmc = true,
+            0x4014 if write => self.ppu_oam = true,
+            0x4015 => self.apu_enable = true,
+            0x4017 if write => self.apu_frame_counter = true,
+            _ => {}
+        }
+    }
+}
+
+fn analyze_rom_requirements(bytes: &[u8], mapper: u16) -> RomRequirements {
+    let Some(prg) = ines_prg(bytes) else {
+        return RomRequirements::default();
+    };
+    if prg.len() < 6 {
+        return RomRequirements::default();
+    }
+
+    let mut requirements = RomRequirements::default();
+    let mut queue = VecDeque::new();
+    for vector_offset in [prg.len() - 6, prg.len() - 4, prg.len() - 2] {
+        let vector = u16::from_le_bytes([prg[vector_offset], prg[vector_offset + 1]]);
+        if vector >= 0x8000 {
+            queue.push_back((vector, None));
+        }
+    }
+    let mut visited = HashSet::new();
+
+    while let Some((pc, selected_bank)) = queue.pop_front() {
+        if !visited.insert((pc, selected_bank)) || visited.len() > 262_144 {
+            continue;
+        }
+        let Some(opcode) = read_prg_byte(prg, mapper, pc, selected_bank) else {
+            continue;
+        };
+        let length = usize::from(OPCODE_LENGTHS[opcode as usize]);
+        let operand_low = (length >= 2)
+            .then(|| read_prg_byte(prg, mapper, pc.wrapping_add(1), selected_bank))
+            .flatten();
+        let operand_high = (length >= 3)
+            .then(|| read_prg_byte(prg, mapper, pc.wrapping_add(2), selected_bank))
+            .flatten();
+        if length >= 2 && operand_low.is_none() || length >= 3 && operand_high.is_none() {
+            continue;
+        }
+        requirements.instructions += 1;
+        let next = pc.wrapping_add(length as u16);
+
+        if length == 3 && !matches!(opcode, 0x20 | 0x4c | 0x6c) {
+            let address = u16::from_le_bytes([operand_low.unwrap(), operand_high.unwrap()]);
+            requirements.record_access(
+                address,
+                opcode_writes_memory(opcode),
+                opcode_is_indexed(opcode),
+            );
+        }
+
+        match opcode {
+            0x00 | 0x40 | 0x60 | 0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92
+            | 0xb2 | 0xd2 | 0xf2 => {}
+            0x4c => enqueue_code_target(
+                &mut queue,
+                prg,
+                mapper,
+                pc,
+                u16::from_le_bytes([operand_low.unwrap(), operand_high.unwrap()]),
+                selected_bank,
+            ),
+            0x6c => {}
+            0x20 => {
+                enqueue_code_target(
+                    &mut queue,
+                    prg,
+                    mapper,
+                    pc,
+                    u16::from_le_bytes([operand_low.unwrap(), operand_high.unwrap()]),
+                    selected_bank,
+                );
+                queue.push_back((next, selected_bank));
+            }
+            0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xb0 | 0xd0 | 0xf0 => {
+                queue.push_back((
+                    next.wrapping_add_signed(i16::from(operand_low.unwrap() as i8)),
+                    selected_bank,
+                ));
+                queue.push_back((next, selected_bank));
+            }
+            _ => queue.push_back((next, selected_bank)),
+        }
+    }
+    requirements
+}
+
+fn ines_prg(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.get(0..4)? != b"NES\x1a" {
+        return None;
+    }
+    let start = 16 + usize::from(bytes.get(6)? & 0x04 != 0) * 512;
+    let declared = usize::from(*bytes.get(4)?) * 0x4000;
+    bytes.get(start..start.checked_add(declared)?)
+}
+
+fn enqueue_code_target(
+    queue: &mut VecDeque<(u16, Option<usize>)>,
+    prg: &[u8],
+    mapper: u16,
+    source: u16,
+    target: u16,
+    selected_bank: Option<usize>,
+) {
+    if mapper == 9 && source >= 0xa000 && (0x8000..0xa000).contains(&target) {
+        for bank in 0..prg.len() / 0x2000 {
+            queue.push_back((target, Some(bank)));
+        }
+    } else {
+        queue.push_back((target, selected_bank));
+    }
+}
+
+fn read_prg_byte(
+    prg: &[u8],
+    mapper: u16,
+    address: u16,
+    selected_bank: Option<usize>,
+) -> Option<u8> {
+    if address < 0x8000 || prg.is_empty() {
+        return None;
+    }
+    let cpu_offset = usize::from(address - 0x8000);
+    let offset = if mapper == 9 {
+        let bank_count = prg.len() / 0x2000;
+        let slot = usize::from((address - 0x8000) / 0x2000);
+        let bank = if slot == 0 {
+            selected_bank.unwrap_or(0) % bank_count
+        } else {
+            bank_count.checked_sub(4)? + slot
+        };
+        bank * 0x2000 + usize::from(address & 0x1fff)
+    } else if prg.len() <= 0x4000 {
+        cpu_offset % prg.len()
+    } else if mapper == 0 && prg.len() <= 0x8000 {
+        cpu_offset % prg.len()
+    } else if address >= 0xc000 {
+        prg.len().checked_sub(0x4000)? + usize::from(address - 0xc000)
+    } else {
+        cpu_offset % 0x4000
+    };
+    prg.get(offset).copied()
+}
+
+fn opcode_writes_memory(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x0e | 0x0f
+            | 0x1b
+            | 0x1e
+            | 0x1f
+            | 0x2e
+            | 0x2f
+            | 0x3b
+            | 0x3e
+            | 0x3f
+            | 0x4e
+            | 0x4f
+            | 0x5b
+            | 0x5e
+            | 0x5f
+            | 0x6e
+            | 0x6f
+            | 0x7b
+            | 0x7e
+            | 0x7f
+            | 0x8c
+            | 0x8d
+            | 0x8e
+            | 0x8f
+            | 0x99
+            | 0x9b
+            | 0x9c
+            | 0x9d
+            | 0x9e
+            | 0x9f
+            | 0xce
+            | 0xcf
+            | 0xdb
+            | 0xde
+            | 0xdf
+            | 0xee
+            | 0xef
+            | 0xfb
+            | 0xfe
+            | 0xff
+    )
+}
+
+fn opcode_is_indexed(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x19 | 0x1b
+            | 0x1d
+            | 0x1e
+            | 0x1f
+            | 0x39
+            | 0x3b
+            | 0x3d
+            | 0x3e
+            | 0x3f
+            | 0x59
+            | 0x5b
+            | 0x5d
+            | 0x5e
+            | 0x5f
+            | 0x79
+            | 0x7b
+            | 0x7d
+            | 0x7e
+            | 0x7f
+            | 0x99
+            | 0x9b
+            | 0x9c
+            | 0x9d
+            | 0x9e
+            | 0x9f
+            | 0xb9
+            | 0xbb
+            | 0xbc
+            | 0xbd
+            | 0xbe
+            | 0xbf
+            | 0xd9
+            | 0xdb
+            | 0xdd
+            | 0xde
+            | 0xdf
+            | 0xf9
+            | 0xfb
+            | 0xfd
+            | 0xfe
+            | 0xff
+    )
+}
+
+#[rustfmt::skip]
+const OPCODE_LENGTHS: [u8; 256] = [
+    1,2,1,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    3,2,1,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    1,2,1,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    1,2,1,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    2,2,2,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    2,2,2,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    2,2,2,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+    2,2,2,2,2,2,2,2,1,2,1,2,3,3,3,3, 2,2,1,2,2,2,2,2,1,3,1,3,3,3,3,3,
+];
 
 fn default_title(path: &Path) -> String {
     path.file_stem()
@@ -649,8 +1040,11 @@ mod tests {
             .iter()
             .find(|entry| matches!(&entry.status, EntryStatus::Ready))
             .unwrap();
-        assert_eq!(ready.accuracy.as_ref().unwrap().score, 94);
+        assert_eq!(ready.accuracy.as_ref().unwrap().score, 100);
         assert_eq!(ready.accuracy.as_ref().unwrap().rating, "High");
+        assert_eq!(ready.accuracy.as_ref().unwrap().mapper_coverage, "Focused");
+        assert_eq!(ready.accuracy.as_ref().unwrap().passed, 101);
+        assert_eq!(ready.accuracy.as_ref().unwrap().total, 141);
         assert!(
             library
                 .entries
@@ -681,7 +1075,7 @@ mod tests {
             entries: Vec::new(),
         };
         library.refresh(Some(&dir));
-        assert_eq!(library.entries[0].accuracy.as_ref().unwrap().score, 94);
+        assert_eq!(library.entries[0].accuracy.as_ref().unwrap().score, 100);
 
         rom[9] = 1;
         fs::write(&path, rom).unwrap();
@@ -694,7 +1088,7 @@ mod tests {
                 .unwrap()
                 .details
                 .iter()
-                .any(|detail| detail.contains("recomputed"))
+                .any(|detail| detail.contains("PAL timing"))
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -712,13 +1106,134 @@ mod tests {
         rom[16 + 0x7ffa..16 + 0x8000].copy_from_slice(&[0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
         let nes = Nes::from_ines(&rom).unwrap();
         let estimate = estimate_accuracy(&nes, &rom);
-        assert_eq!(estimate.score, 86);
-        assert_eq!(estimate.rating, "Good");
+        assert_eq!(estimate.score, 92);
+        assert_eq!(estimate.rating, "High");
+        assert_eq!(estimate.mapper_coverage, "Focused");
         assert!(
             estimate
                 .details
                 .iter()
-                .any(|detail| detail.contains("submapper variant"))
+                .any(|detail| detail.contains("Unknown specialized NES 2.0 submapper"))
+        );
+    }
+
+    #[test]
+    fn mapper_coverage_adjusts_the_accuracycoin_weighted_rom_score() {
+        let mut rom = vec![0; 16 + 0x20_000 + 0x20_000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 8;
+        rom[5] = 16;
+        rom[6] = 0x90;
+        rom[16 + 0x1fffa..16 + 0x20_000].copy_from_slice(&[0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        let nes = Nes::from_ines(&rom).unwrap();
+
+        let estimate = estimate_accuracy(&nes, &rom);
+
+        assert_eq!(estimate.score, 95);
+        assert_eq!(estimate.passed, 101);
+        assert_eq!(estimate.total, 141);
+        assert_eq!(estimate.rating, "High");
+        assert_eq!(estimate.mapper_coverage, "Partial");
+        assert!(
+            estimate
+                .details
+                .iter()
+                .any(|detail| detail.contains("Mapper 9 coverage: Partial"))
+        );
+    }
+
+    #[test]
+    fn accuracycoin_category_weights_match_the_supplied_test_array() {
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_OFFICIAL_CPU), 0);
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_UNOFFICIAL_CPU), 0);
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_PPU), 11);
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_APU_DMA), 4);
+        assert_eq!(
+            ACCURACYCOIN_OFFICIAL_CPU.0
+                + ACCURACYCOIN_UNOFFICIAL_CPU.0
+                + ACCURACYCOIN_PPU.0
+                + ACCURACYCOIN_APU_DMA.0,
+            ACCURACYCOIN_PASSED
+        );
+        assert_eq!(
+            ACCURACYCOIN_OFFICIAL_CPU.1
+                + ACCURACYCOIN_UNOFFICIAL_CPU.1
+                + ACCURACYCOIN_PPU.1
+                + ACCURACYCOIN_APU_DMA.1,
+            ACCURACYCOIN_TOTAL
+        );
+    }
+
+    #[test]
+    fn reachable_code_scales_only_the_hardware_categories_it_uses() {
+        let mut rom = test_rom();
+        let program = [
+            0xa9, 0x00, // LDA #0
+            0x8d, 0x00, 0x20, // STA $2000: control
+            0xad, 0x02, 0x20, // LDA $2002: status
+            0x8d, 0x05, 0x20, // STA $2005: scrolling
+            0x8d, 0x14, 0x40, // STA $4014: sprite DMA/OAM
+            0x8d, 0x00, 0x40, // STA $4000: regular APU
+            0x8d, 0x15, 0x40, // STA $4015: APU enable
+            0x8d, 0x17, 0x40, // STA $4017: frame counter
+            0x4c, 0x17, 0x80, // JMP $8017
+        ];
+        rom[16..16 + program.len()].copy_from_slice(&program);
+        let nes = Nes::from_ines(&rom).unwrap();
+
+        let estimate = estimate_accuracy(&nes, &rom);
+
+        assert_eq!(estimate.score, 91);
+        assert!(
+            estimate
+                .details
+                .iter()
+                .any(|detail| detail.contains("PPU -7 at 65% exposure"))
+        );
+        assert!(
+            estimate
+                .details
+                .iter()
+                .any(|detail| detail.contains("APU/DMA -2 at 50% exposure"))
+        );
+    }
+
+    #[test]
+    fn dmc_code_receives_the_full_apu_dma_risk() {
+        let mut rom = test_rom();
+        let program = [
+            0xa9, 0x00, // LDA #0
+            0x8d, 0x10, 0x40, // STA $4010: DMC control
+            0x4c, 0x05, 0x80, // JMP $8005
+        ];
+        rom[16..16 + program.len()].copy_from_slice(&program);
+        let nes = Nes::from_ines(&rom).unwrap();
+
+        let estimate = estimate_accuracy(&nes, &rom);
+
+        assert_eq!(estimate.score, 96);
+        assert!(
+            estimate
+                .details
+                .iter()
+                .any(|detail| detail.contains("APU/DMA -4 at 100% exposure"))
+        );
+    }
+
+    #[test]
+    fn unreachable_data_does_not_inflate_hardware_risk() {
+        let mut rom = test_rom();
+        rom[16 + 3..16 + 9].copy_from_slice(&[0x8d, 0x00, 0x20, 0x8d, 0x10, 0x40]);
+        let nes = Nes::from_ines(&rom).unwrap();
+
+        let estimate = estimate_accuracy(&nes, &rom);
+
+        assert_eq!(estimate.score, 100);
+        assert!(
+            estimate
+                .details
+                .iter()
+                .any(|detail| detail.contains("PPU -0 at 0% exposure"))
         );
     }
 
