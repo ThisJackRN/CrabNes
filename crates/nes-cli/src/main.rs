@@ -22,13 +22,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(rom_path) = args.next() else {
         return Err(
-            "usage: nes-cli <game.nes> [--frames N] [--press-start] [--press-start-at N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
+            "usage: nes-cli <game.nes> [--frames N] [--insert-coin-at N] [--press-select-at N] [--press-start] [--press-start-at N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
                 .into(),
         );
     };
     let mut frames = 1_u64;
     let mut screenshot = None;
     let mut press_start_at = None;
+    let mut insert_coin_at = None;
+    let mut press_select_at = None;
     let mut accuracycoin_report = false;
     let mut peek_addresses = Vec::new();
     while let Some(argument) = args.next() {
@@ -39,6 +41,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 press_start_at = Some(
                     args.next()
                         .ok_or("--press-start-at needs a frame")?
+                        .parse()?,
+                )
+            }
+            "--insert-coin-at" => {
+                insert_coin_at = Some(
+                    args.next()
+                        .ok_or("--insert-coin-at needs a frame")?
+                        .parse()?,
+                )
+            }
+            "--press-select-at" => {
+                press_select_at = Some(
+                    args.next()
+                        .ok_or("--press-select-at needs a frame")?
                         .parse()?,
                 )
             }
@@ -65,6 +81,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         nes.has_battery()
     );
     for frame in 0..frames {
+        if insert_coin_at == Some(frame) {
+            nes.controller_mut(0)
+                .expect("player one controller exists")
+                .set_coin(true);
+        } else if insert_coin_at.is_some_and(|coin| frame == coin.saturating_add(3)) {
+            nes.controller_mut(0)
+                .expect("player one controller exists")
+                .set_coin(false);
+        }
+        if press_select_at == Some(frame) {
+            nes.controller_mut(0)
+                .expect("player one controller exists")
+                .set_button(Button::Select, true);
+        } else if press_select_at.is_some_and(|select| frame == select.saturating_add(1)) {
+            nes.controller_mut(0)
+                .expect("player one controller exists")
+                .set_button(Button::Select, false);
+        }
         if press_start_at == Some(frame) {
             nes.controller_mut(0)
                 .expect("player one controller exists")

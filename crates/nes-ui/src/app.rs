@@ -82,6 +82,8 @@ enum TasTimelineAction {
 enum BindingCapture {
     Keyboard { player: usize, button: usize },
     Gamepad { player: usize, button: usize },
+    VsCoinKeyboard,
+    VsCoinGamepad,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -462,6 +464,10 @@ impl App {
             }
             ctx.request_repaint_after(Duration::from_millis(1));
         } else if !self.paused && self.powered && self.nes.is_some() {
+            let coin = self.vs_coin_down(ctx);
+            if let Some(controller) = self.nes.as_mut().and_then(|nes| nes.controller_mut(0)) {
+                controller.set_coin(coin);
+            }
             self.frame_budget += elapsed * frame_rate * speed;
             let mut frames = 0;
             let pacing_tolerance = if speed == 1.0 {
@@ -668,12 +674,14 @@ impl App {
 
     fn key_is_controller_binding(&self, key: Key) -> bool {
         let name = key.name();
-        self.settings
-            .input
-            .bindings
-            .iter()
-            .chain(&self.settings.input.player2_bindings)
-            .any(|binding| binding.label() == name)
+        self.settings.input.vs_coin_binding.label() == name
+            || self
+                .settings
+                .input
+                .bindings
+                .iter()
+                .chain(&self.settings.input.player2_bindings)
+                .any(|binding| binding.label() == name)
     }
 
     fn host_input_frame(&self, ctx: &egui::Context) -> TasFrame {
@@ -699,6 +707,34 @@ impl App {
             player1: self.gamepad_mask(0, &self.settings.input.gamepad_bindings),
             player2: self.gamepad_mask(1, &self.settings.input.player2_gamepad_bindings),
         })
+    }
+
+    fn vs_coin_down(&self, ctx: &egui::Context) -> bool {
+        if self.binding_capture.is_some() || ctx.egui_wants_keyboard_input() {
+            return false;
+        }
+        let keyboard = binding_down(ctx, &self.settings.input.vs_coin_binding);
+        keyboard || self.vs_coin_gamepad_down()
+    }
+
+    fn vs_coin_gamepad_down(&self) -> bool {
+        let Some(gamepads) = &self.gamepads else {
+            return false;
+        };
+        let slot = self.settings.input.gamepad_slots[0].unwrap_or(0);
+        let Some((_, gamepad)) = gamepads.gamepads().nth(slot) else {
+            return false;
+        };
+        if let Some(binding) = self.settings.input.vs_coin_gamepad_binding {
+            gamepad_binding_down(
+                &gamepad,
+                binding,
+                self.settings.input.gamepad_axis_threshold.clamp(0.1, 0.9),
+            )
+        } else {
+            let mask = self.gamepad_mask(0, &self.settings.input.gamepad_bindings);
+            mask & 0x0c == 0x0c
+        }
     }
 
     fn filter_live_dpad(&self, input: TasFrame) -> TasFrame {
@@ -747,6 +783,26 @@ impl App {
                 );
             }
         }
+        if self.binding_capture == Some(BindingCapture::VsCoinKeyboard) {
+            let key = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(physical_key.unwrap_or(*key)),
+                    _ => None,
+                })
+            });
+            if let Some(key) = key {
+                self.settings.input.vs_coin_binding = KeyBinding::new(key.name());
+                self.binding_capture = None;
+                self.settings_dirty = true;
+                self.status = format!("VS insert coin is now bound to {}", key.name());
+            }
+        }
 
         let mut captured = None;
         if let Some(gamepads) = &mut self.gamepads {
@@ -762,7 +818,10 @@ impl App {
                         None => format!("{device}: {description}"),
                     });
                 }
-                if let Some(BindingCapture::Gamepad { player, button }) = self.binding_capture {
+                if let Some(
+                    capture @ (BindingCapture::Gamepad { .. } | BindingCapture::VsCoinGamepad),
+                ) = self.binding_capture
+                {
                     let threshold = self.settings.input.gamepad_axis_threshold.clamp(0.1, 0.9);
                     let binding = match event.event {
                         EventType::ButtonPressed(gamepad_button, code) => {
@@ -799,27 +858,41 @@ impl App {
                         _ => None,
                     };
                     if let Some(binding) = binding {
-                        captured = Some((player, button, binding, slot));
+                        captured = Some((capture, binding, slot));
                         break;
                     }
                 }
             }
         }
-        if let Some((player, button, binding, slot)) = captured {
-            if player == 0 {
-                self.settings.input.gamepad_bindings[button] = Some(binding);
-            } else {
-                self.settings.input.player2_gamepad_bindings[button] = Some(binding);
-            }
-            self.settings.input.gamepad_slots[player] = slot;
+        if let Some((capture, binding, slot)) = captured {
+            let status = match capture {
+                BindingCapture::Gamepad { player, button } => {
+                    if player == 0 {
+                        self.settings.input.gamepad_bindings[button] = Some(binding);
+                    } else {
+                        self.settings.input.player2_gamepad_bindings[button] = Some(binding);
+                    }
+                    self.settings.input.gamepad_slots[player] = slot;
+                    format!(
+                        "Player {} {} is now bound to {}",
+                        player + 1,
+                        nes_button_label(button),
+                        gamepad_binding_label(binding)
+                    )
+                }
+                BindingCapture::VsCoinGamepad => {
+                    self.settings.input.vs_coin_gamepad_binding = Some(binding);
+                    self.settings.input.gamepad_slots[0] = slot;
+                    format!(
+                        "VS insert coin is now bound to {}",
+                        gamepad_binding_label(binding)
+                    )
+                }
+                _ => unreachable!("only gamepad captures are queued here"),
+            };
             self.binding_capture = None;
             self.settings_dirty = true;
-            self.status = format!(
-                "Player {} {} is now bound to {}",
-                player + 1,
-                nes_button_label(button),
-                gamepad_binding_label(binding)
-            );
+            self.status = status;
         }
     }
 
@@ -1292,7 +1365,7 @@ impl App {
                                 }
                                 if let Some(accuracy) = &entry.accuracy {
                                     ui.add_space(6.0);
-                                    ui.small("Estimated accuracy");
+                                    ui.small("Estimated ROM compatibility (AccuracyCoin-weighted)");
                                     let color = match accuracy.score {
                                         90..=u8::MAX => egui::Color32::from_rgb(72, 184, 104),
                                         80..=89 => egui::Color32::from_rgb(64, 155, 210),
@@ -1304,21 +1377,32 @@ impl App {
                                             .desired_width(ui.available_width().clamp(130.0, 220.0))
                                             .fill(color)
                                             .text(format!(
-                                                "{}% - {}",
+                                                "{}% — {}",
                                                 accuracy.score, accuracy.rating
                                             )),
                                     )
                                     .on_hover_ui(|ui| {
                                         ui.set_max_width(380.0);
-                                        ui.strong("Compatibility confidence estimate");
+                                        ui.strong("AccuracyCoin-weighted ROM estimate");
                                         ui.label(
-                                            "This is based on CrabNes mapper and timing coverage. It is not a measurement against original hardware and does not guarantee a game is bug-free.",
+                                            "This follows likely code from the ROM's reset, NMI, and IRQ vectors, detects the hardware features that code touches, weights the measured AccuracyCoin results to those features, and then applies mapper and header risk. It is a static estimate, not an automated playthrough.",
                                         );
+                                        ui.add_space(4.0);
+                                        ui.strong(format!(
+                                            "Selected mapper coverage: {}",
+                                            accuracy.mapper_coverage
+                                        ));
                                         ui.add_space(4.0);
                                         for detail in &accuracy.details {
                                             ui.label(format!("- {detail}"));
                                         }
                                     });
+                                    ui.small(format!(
+                                        "AccuracyCoin: {}/{} passed · Mapper coverage: {}",
+                                        accuracy.passed,
+                                        accuracy.total,
+                                        accuracy.mapper_coverage
+                                    ));
                                 }
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
@@ -3130,17 +3214,21 @@ impl App {
 
         if let Some(capture) = self.binding_capture {
             ui.horizontal(|ui| {
-                let (kind, player, button) = match capture {
-                    BindingCapture::Keyboard { player, button } => ("key", player, button),
-                    BindingCapture::Gamepad { player, button } => {
-                        ("controller button or direction", player, button)
+                let (kind, target) = match capture {
+                    BindingCapture::Keyboard { player, button } => (
+                        "key",
+                        format!("Player {} {}", player + 1, nes_button_label(button)),
+                    ),
+                    BindingCapture::Gamepad { player, button } => (
+                        "controller button or direction",
+                        format!("Player {} {}", player + 1, nes_button_label(button)),
+                    ),
+                    BindingCapture::VsCoinKeyboard => ("key", "VS insert coin".into()),
+                    BindingCapture::VsCoinGamepad => {
+                        ("controller button or direction", "VS insert coin".into())
                     }
                 };
-                ui.strong(format!(
-                    "Press a {kind} for Player {} {}…",
-                    player + 1,
-                    nes_button_label(button)
-                ));
+                ui.strong(format!("Press a {kind} for {target}…"));
                 if ui.button("Cancel").clicked() {
                     self.binding_capture = None;
                 }
@@ -3215,6 +3303,112 @@ impl App {
                     }
                 });
         });
+
+        ui.separator();
+        ui.strong("VS System arcade controls");
+        ui.small("These apply automatically to supported Nintendo VS arcade games.");
+        egui::Grid::new(ui.id().with("vs-arcade-inputs"))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Arcade input");
+                ui.strong("Keyboard");
+                ui.strong("Controller");
+                ui.end_row();
+
+                ui.label("Insert coin");
+                let coin_key_capture = BindingCapture::VsCoinKeyboard;
+                let coin_key_label = if self.binding_capture == Some(coin_key_capture) {
+                    "Press a key…"
+                } else {
+                    self.settings.input.vs_coin_binding.label()
+                };
+                if ui.button(coin_key_label).clicked() {
+                    self.binding_capture = Some(coin_key_capture);
+                }
+                let coin_gamepad_capture = BindingCapture::VsCoinGamepad;
+                let coin_gamepad_label = if self.binding_capture == Some(coin_gamepad_capture) {
+                    "Press input…".into()
+                } else {
+                    self.settings
+                        .input
+                        .vs_coin_gamepad_binding
+                        .map(gamepad_binding_label)
+                        .unwrap_or_else(|| "Select + Start chord".into())
+                };
+                let response = ui.button(coin_gamepad_label).on_hover_text(
+                    "Click to capture. Right-click to restore the Select+Start chord.",
+                );
+                if response.clicked() {
+                    self.binding_capture = Some(coin_gamepad_capture);
+                }
+                if response.secondary_clicked() {
+                    self.settings.input.vs_coin_gamepad_binding = None;
+                    if self.binding_capture == Some(coin_gamepad_capture) {
+                        self.binding_capture = None;
+                    }
+                    changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Start 1 player");
+                let select_key_capture = BindingCapture::Keyboard {
+                    player: 0,
+                    button: 2,
+                };
+                let select_key_label = if self.binding_capture == Some(select_key_capture) {
+                    "Press a key…"
+                } else {
+                    self.settings.input.bindings[2].label()
+                };
+                if ui.button(select_key_label).clicked() {
+                    self.binding_capture = Some(select_key_capture);
+                }
+                let select_gamepad_capture = BindingCapture::Gamepad {
+                    player: 0,
+                    button: 2,
+                };
+                let select_gamepad_label = if self.binding_capture == Some(select_gamepad_capture) {
+                    "Press input…".into()
+                } else {
+                    self.settings.input.gamepad_bindings[2]
+                        .map(gamepad_binding_label)
+                        .unwrap_or_else(|| "Not bound".into())
+                };
+                if ui.button(select_gamepad_label).clicked() {
+                    self.binding_capture = Some(select_gamepad_capture);
+                }
+                ui.end_row();
+
+                ui.label("Start 2 players");
+                let start_key_capture = BindingCapture::Keyboard {
+                    player: 0,
+                    button: 3,
+                };
+                let start_key_label = if self.binding_capture == Some(start_key_capture) {
+                    "Press a key…"
+                } else {
+                    self.settings.input.bindings[3].label()
+                };
+                if ui.button(start_key_label).clicked() {
+                    self.binding_capture = Some(start_key_capture);
+                }
+                let start_gamepad_capture = BindingCapture::Gamepad {
+                    player: 0,
+                    button: 3,
+                };
+                let start_gamepad_label = if self.binding_capture == Some(start_gamepad_capture) {
+                    "Press input…".into()
+                } else {
+                    self.settings.input.gamepad_bindings[3]
+                        .map(gamepad_binding_label)
+                        .unwrap_or_else(|| "Not bound".into())
+                };
+                if ui.button(start_gamepad_label).clicked() {
+                    self.binding_capture = Some(start_gamepad_capture);
+                }
+                ui.end_row();
+            });
+
         let player1 = self.gamepad_mask(0, &self.settings.input.gamepad_bindings);
         let player2 = self.gamepad_mask(1, &self.settings.input.player2_gamepad_bindings);
         ui.monospace(format!(
@@ -4000,6 +4194,16 @@ impl App {
     }
 
     fn apply_video_palette(&mut self) -> Result<Option<String>, String> {
+        if let Some(palette) = self.nes.as_ref().and_then(Nes::native_output_palette) {
+            if let Some(nes) = &mut self.nes {
+                nes.set_output_palette(palette);
+            }
+            self.frame_dirty = true;
+            return Ok(Some(format!(
+                "VS RP2C04-0004 palette selected; {} inserts a coin, Select starts 1 player, and Start starts 2 players",
+                self.settings.input.vs_coin_binding.label()
+            )));
+        }
         let (palette, warning) = match self.settings.video.palette_mode {
             PaletteMode::Ntsc2c02 => (NTSC_2C02_PALETTE, None),
             PaletteMode::Rgb2c03 => (RGB_2C03_PALETTE, None),

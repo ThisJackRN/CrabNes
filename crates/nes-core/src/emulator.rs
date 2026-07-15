@@ -20,7 +20,7 @@ pub enum EmulationError {
 }
 
 const STATE_MAGIC: &[u8; 8] = b"MONESST\0";
-pub const SAVE_STATE_VERSION: u32 = 3;
+pub const SAVE_STATE_VERSION: u32 = 5;
 
 #[derive(Debug)]
 pub enum StateError {
@@ -96,6 +96,7 @@ pub struct Nes {
     powered: bool,
     rom_hash: u64,
     rom_sha256: [u8; 32],
+    native_output_palette: Option<crate::ppu::OutputPalette>,
 }
 
 impl Nes {
@@ -108,12 +109,18 @@ impl Nes {
     }
 
     fn from_cartridge(bytes: &[u8], cartridge: Cartridge) -> Result<Self, EmulationError> {
+        let native_output_palette = native_output_palette(bytes, cartridge.mapper_id());
+        let mut bus = Bus::new(cartridge);
+        if let Some(palette) = native_output_palette {
+            bus.ppu.set_output_palette(palette);
+        }
         let mut nes = Self {
             cpu: Cpu::default(),
-            bus: Bus::new(cartridge),
+            bus,
             powered: true,
             rom_hash: hash_rom(bytes),
             rom_sha256: Sha256::digest(bytes).into(),
+            native_output_palette,
         };
         nes.bus.begin_cpu_sequence();
         nes.cpu.reset(&mut nes.bus);
@@ -128,15 +135,14 @@ impl Nes {
             return Ok(0);
         }
         self.bus.begin_cpu_sequence();
-        let cycle_result = if self.bus.ppu.take_nmi() {
+        let cycle_result = if self.cpu.take_latched_nmi() {
             Ok(self.cpu.nmi(&mut self.bus))
-        } else if self.bus.irq_pending() {
-            let irq_cycles = self.cpu.irq(&mut self.bus);
-            if irq_cycles == 0 {
-                self.cpu.step(&mut self.bus)
-            } else {
-                Ok(irq_cycles)
-            }
+        } else if self.cpu.take_polled_irq() {
+            Ok(self.cpu.irq(&mut self.bus))
+        } else if self.cpu.take_branch_irq_delay() {
+            self.cpu.step(&mut self.bus)
+        } else if self.bus.irq_pending() && !self.cpu.irq_masked_at_poll() {
+            Ok(self.cpu.irq(&mut self.bus))
         } else {
             self.cpu.step(&mut self.bus)
         };
@@ -147,7 +153,9 @@ impl Nes {
                 return Err(error.into());
             }
         };
-        Ok(self.bus.finish_cpu_sequence(cycles))
+        let actual_cycles = self.bus.finish_cpu_sequence(cycles);
+        self.cpu.complete_interrupt_poll(&mut self.bus);
+        Ok(actual_cycles)
     }
 
     /// Run until the PPU completes a video frame.
@@ -192,6 +200,9 @@ impl Nes {
     }
     pub fn set_output_palette(&mut self, palette: crate::ppu::OutputPalette) {
         self.bus.ppu.set_output_palette(palette);
+    }
+    pub fn native_output_palette(&self) -> Option<crate::ppu::OutputPalette> {
+        self.native_output_palette
     }
     pub fn cpu_cycles(&self) -> u64 {
         self.bus.cpu_cycles()
@@ -347,6 +358,22 @@ impl Nes {
             .get(port)
             .map_or(0, Controller::total_reads)
     }
+}
+
+fn native_output_palette(bytes: &[u8], mapper_id: u16) -> Option<crate::ppu::OutputPalette> {
+    // Legacy iNES headers do not identify the RGB PPU revision. Match the
+    // PRG+CHR payload so header repairs do not lose the correct hardware.
+    const VS_SMB_PRG_CHR_SHA256: [u8; 32] = [
+        0x5e, 0xb7, 0xf1, 0x85, 0x41, 0xc6, 0x1e, 0xb3, 0x94, 0x1b, 0x00, 0x43, 0x66, 0x03, 0xb5,
+        0xaa, 0xad, 0x4c, 0x93, 0xa2, 0xb2, 0x99, 0x91, 0x8f, 0x88, 0x94, 0x96, 0x3d, 0x50, 0x62,
+        0x71, 0xdc,
+    ];
+    if mapper_id != 99 || bytes.len() <= 16 {
+        return None;
+    }
+    let content_start = 16 + usize::from(bytes.get(6).is_some_and(|flags| flags & 0x04 != 0)) * 512;
+    let content_hash: [u8; 32] = Sha256::digest(bytes.get(content_start..)?).into();
+    (content_hash == VS_SMB_PRG_CHR_SHA256).then_some(crate::ppu::RGB_2C04_0004_PALETTE)
 }
 
 fn hash_rom(bytes: &[u8]) -> u64 {

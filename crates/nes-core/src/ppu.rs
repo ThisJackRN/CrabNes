@@ -38,6 +38,13 @@ pub struct PpuState {
     pub dot: u16,
 }
 
+#[derive(Clone, Copy, Default)]
+struct CachedBackgroundTile {
+    pattern_lo: u8,
+    pattern_hi: u8,
+    attribute: u8,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Frame {
     /// RGB888 pixels, row major.
@@ -89,6 +96,13 @@ pub struct Ppu {
     output_palette: OutputPalette,
     #[serde(skip, default)]
     frame_color_indices: Vec<u8>,
+    // Pattern bytes live in PPU shift registers on hardware. Keeping a
+    // scanline cache also ensures mapper latches see one fetch per tile rather
+    // than one fetch per output pixel.
+    #[serde(skip, default)]
+    background_tiles: Vec<CachedBackgroundTile>,
+    #[serde(skip, default)]
+    sprite_patterns: Vec<Option<(u8, u8)>>,
 }
 
 impl Default for Ppu {
@@ -121,6 +135,8 @@ impl Default for Ppu {
             frame: Frame::default(),
             output_palette: default_output_palette(),
             frame_color_indices: vec![0; FRAME_WIDTH * FRAME_HEIGHT],
+            background_tiles: Vec::new(),
+            sprite_patterns: Vec::new(),
         }
     }
 }
@@ -308,6 +324,11 @@ impl Ppu {
         let rendering = self.mask & 0x18 != 0;
         if rendering && self.scanline >= 0 && self.scanline < 240 && self.dot == 1 {
             self.capture_line_origin();
+            if matches!(cartridge.mapper_id(), 9 | 10) {
+                self.cache_scanline_patterns(cartridge);
+            } else {
+                self.background_tiles.clear();
+            }
         }
         if self.scanline >= 0 && self.scanline < 240 && self.dot >= 1 && self.dot <= 256 {
             self.render_pixel(self.dot as usize - 1, self.scanline as usize, cartridge);
@@ -340,6 +361,16 @@ impl Ppu {
                 self.increment_render_y();
             } else if self.dot == 257 {
                 self.copy_horizontal_scroll();
+                if matches!(cartridge.mapper_id(), 9 | 10) {
+                    let next_scanline = if self.scanline < 0 {
+                        0
+                    } else {
+                        self.scanline as usize + 1
+                    };
+                    self.cache_next_scanline_sprites(next_scanline, cartridge);
+                } else {
+                    self.sprite_patterns.clear();
+                }
             }
             if self.scanline == -1 && (280..=304).contains(&self.dot) {
                 self.copy_vertical_scroll();
@@ -370,6 +401,13 @@ impl Ppu {
 
     pub fn take_nmi(&mut self) -> bool {
         std::mem::take(&mut self.nmi_pending)
+    }
+    pub(crate) fn nmi_pending(&self) -> bool {
+        self.nmi_pending
+    }
+    #[cfg(test)]
+    pub(crate) fn force_nmi_for_test(&mut self) {
+        self.nmi_pending = true;
     }
     pub fn take_frame_complete(&mut self) -> bool {
         std::mem::take(&mut self.frame_complete)
@@ -544,18 +582,33 @@ impl Ppu {
             let table = table_y * 2 + table_x;
             let tile_x = local_x / 8;
             let tile_y = local_y / 8;
-            let name_addr = 0x2000 + table as u16 * 0x400 + (tile_y * 32 + tile_x) as u16;
-            let tile = self.read_memory(name_addr, cartridge);
-            let pattern_base = if self.control & 0x10 != 0 { 0x1000 } else { 0 };
-            let row = (local_y & 7) as u16;
-            let lo = self.read_memory(pattern_base + tile as u16 * 16 + row, cartridge);
-            let hi = self.read_memory(pattern_base + tile as u16 * 16 + row + 8, cartridge);
-            let bit = 7 - (local_x & 7);
-            background_pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
-            if background_pixel != 0 {
+            let (pattern_lo, pattern_hi, attribute, bit) = if let Some(cached) = self
+                .background_tiles
+                .get(((self.line_origin_x & 7) + x) / 8)
+            {
+                (
+                    cached.pattern_lo,
+                    cached.pattern_hi,
+                    cached.attribute,
+                    7 - (local_x & 7),
+                )
+            } else {
+                let name_addr = 0x2000 + table as u16 * 0x400 + (tile_y * 32 + tile_x) as u16;
                 let attribute_addr =
                     0x23c0 + table as u16 * 0x400 + ((tile_y / 4) * 8 + tile_x / 4) as u16;
+                let tile = self.read_memory(name_addr, cartridge);
                 let attribute = self.read_memory(attribute_addr, cartridge);
+                let pattern_base = if self.control & 0x10 != 0 { 0x1000 } else { 0 };
+                let row = (local_y & 7) as u16;
+                (
+                    self.read_memory(pattern_base + tile as u16 * 16 + row, cartridge),
+                    self.read_memory(pattern_base + tile as u16 * 16 + row + 8, cartridge),
+                    attribute,
+                    7 - (local_x & 7),
+                )
+            };
+            background_pixel = ((pattern_lo >> bit) & 1) | (((pattern_hi >> bit) & 1) << 1);
+            if background_pixel != 0 {
                 let shift = ((tile_y & 2) * 2 + (tile_x & 2)) as u8;
                 let palette = (attribute >> shift) & 3;
                 color =
@@ -602,8 +655,18 @@ impl Ppu {
                     (table, tile as u16, row)
                 };
                 let address = pattern_base + tile_number * 16 + tile_row as u16;
-                let lo = self.read_memory(address, cartridge);
-                let hi = self.read_memory(address + 8, cartridge);
+                let (lo, hi) = if self.sprite_patterns.is_empty() {
+                    (
+                        self.read_memory(address, cartridge),
+                        self.read_memory(address + 8, cartridge),
+                    )
+                } else if let Some(pattern) =
+                    self.sprite_patterns.get(sprite_index).copied().flatten()
+                {
+                    pattern
+                } else {
+                    continue;
+                };
                 let bit = 7 - column;
                 let sprite_pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
                 if sprite_pixel == 0 {
@@ -640,6 +703,88 @@ impl Ppu {
         let fine_y = ((self.vram_address >> 12) & 7) as usize;
         self.line_origin_x = nametable_x * 256 + coarse_x * 8 + self.fine_x as usize;
         self.line_origin_y = nametable_y * 240 + coarse_y * 8 + fine_y;
+    }
+
+    fn cache_scanline_patterns(&mut self, cartridge: &mut Cartridge) {
+        self.background_tiles.clear();
+        self.background_tiles.reserve(34);
+        let world_y = self.line_origin_y % 480;
+        let first_tile_x = self.line_origin_x & !7;
+        let pattern_base = if self.control & 0x10 != 0 { 0x1000 } else { 0 };
+        for slot in 0..34 {
+            let world_x = (first_tile_x + slot * 8) % 512;
+            let table_x = world_x / 256;
+            let table_y = world_y / 240;
+            let local_x = world_x % 256;
+            let local_y = world_y % 240;
+            let table = table_y * 2 + table_x;
+            let tile_x = local_x / 8;
+            let tile_y = local_y / 8;
+            let name_addr = 0x2000 + table as u16 * 0x400 + (tile_y * 32 + tile_x) as u16;
+            let attribute_addr =
+                0x23c0 + table as u16 * 0x400 + ((tile_y / 4) * 8 + tile_x / 4) as u16;
+            let tile = self.read_memory(name_addr, cartridge);
+            let attribute = self.read_memory(attribute_addr, cartridge);
+            let row = (local_y & 7) as u16;
+            let pattern_lo = self.read_memory(pattern_base + tile as u16 * 16 + row, cartridge);
+            let pattern_hi = self.read_memory(pattern_base + tile as u16 * 16 + row + 8, cartridge);
+            self.background_tiles.push(CachedBackgroundTile {
+                pattern_lo,
+                pattern_hi,
+                attribute,
+            });
+        }
+    }
+
+    fn cache_next_scanline_sprites(&mut self, y: usize, cartridge: &mut Cartridge) {
+        self.sprite_patterns.clear();
+        self.sprite_patterns.resize(64, None);
+        let sprite_height = if self.control & 0x20 != 0 { 16 } else { 8 };
+        let mut sprites_on_line = 0;
+
+        for sprite_index in 0..64 {
+            let base = sprite_index * 4;
+            let sprite_y = self.oam[base] as usize + 1;
+            if y < sprite_y || y >= sprite_y + sprite_height {
+                continue;
+            }
+            if sprites_on_line == 8 {
+                break;
+            }
+            sprites_on_line += 1;
+
+            let tile = self.oam[base + 1];
+            let attributes = self.oam[base + 2];
+            let mut row = y - sprite_y;
+            if attributes & 0x80 != 0 {
+                row = sprite_height - 1 - row;
+            }
+            let (pattern_base, tile_number, tile_row) = if sprite_height == 16 {
+                let table = (tile as u16 & 1) * 0x1000;
+                let tile_number = (tile as u16 & 0xfe) + (row / 8) as u16;
+                (table, tile_number, row & 7)
+            } else {
+                let table = if self.control & 0x08 != 0 { 0x1000 } else { 0 };
+                (table, tile as u16, row)
+            };
+            let address = pattern_base + tile_number * 16 + tile_row as u16;
+            let lo = self.read_memory(address, cartridge);
+            let hi = self.read_memory(address + 8, cartridge);
+            self.sprite_patterns[sprite_index] = Some((lo, hi));
+        }
+
+        // The PPU still fetches tile $FF for every unused one of its eight
+        // sprite slots. In 8x16 mode this reads $1FE0/$1FE8, which sets the
+        // MMC2's right-hand latch to FE before the next background fetches.
+        let dummy_address = if sprite_height == 16 {
+            0x1fe0
+        } else {
+            (if self.control & 0x08 != 0 { 0x1000 } else { 0 }) + 0x0ff0
+        };
+        for _ in sprites_on_line..8 {
+            self.read_memory(dummy_address, cartridge);
+            self.read_memory(dummy_address + 8, cartridge);
+        }
     }
 
     fn increment_coarse_x(&mut self) {
@@ -848,6 +993,77 @@ pub const RGB_2C03_PALETTE: OutputPalette = [
     rgb_3bit(0, 0, 0),
 ];
 
+/// RP2C04-0004 RGB palette used by Vs. Super Mario Bros. hardware.
+///
+/// Unlike a 2C02 palette approximation, these are the RGB PPU's physical
+/// three-bit DAC values in the hardware's scrambled palette-index order.
+pub const RGB_2C04_0004_PALETTE: OutputPalette = [
+    rgb_3bit(4, 3, 0),
+    rgb_3bit(3, 2, 6),
+    rgb_3bit(0, 4, 4),
+    rgb_3bit(6, 6, 0),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(7, 5, 5),
+    rgb_3bit(0, 1, 4),
+    rgb_3bit(6, 3, 0),
+    rgb_3bit(5, 5, 5),
+    rgb_3bit(3, 1, 0),
+    rgb_3bit(0, 7, 0),
+    rgb_3bit(0, 0, 3),
+    rgb_3bit(7, 6, 4),
+    rgb_3bit(7, 7, 0),
+    rgb_3bit(0, 4, 0),
+    rgb_3bit(5, 7, 2),
+    rgb_3bit(7, 3, 7),
+    rgb_3bit(2, 0, 0),
+    rgb_3bit(0, 2, 7),
+    rgb_3bit(7, 4, 7),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(2, 2, 2),
+    rgb_3bit(5, 1, 0),
+    rgb_3bit(7, 4, 0),
+    rgb_3bit(6, 5, 3),
+    rgb_3bit(0, 5, 3),
+    rgb_3bit(4, 4, 7),
+    rgb_3bit(1, 4, 0),
+    rgb_3bit(4, 0, 3),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(4, 7, 3),
+    rgb_3bit(3, 5, 7),
+    rgb_3bit(5, 0, 3),
+    rgb_3bit(0, 3, 1),
+    rgb_3bit(4, 2, 0),
+    rgb_3bit(0, 0, 6),
+    rgb_3bit(4, 0, 7),
+    rgb_3bit(5, 0, 7),
+    rgb_3bit(3, 3, 3),
+    rgb_3bit(7, 0, 4),
+    rgb_3bit(0, 2, 2),
+    rgb_3bit(6, 6, 6),
+    rgb_3bit(0, 3, 6),
+    rgb_3bit(0, 2, 0),
+    rgb_3bit(1, 1, 1),
+    rgb_3bit(7, 7, 3),
+    rgb_3bit(4, 4, 4),
+    rgb_3bit(7, 0, 7),
+    rgb_3bit(7, 5, 7),
+    rgb_3bit(7, 7, 7),
+    rgb_3bit(3, 2, 0),
+    rgb_3bit(7, 0, 0),
+    rgb_3bit(7, 6, 0),
+    rgb_3bit(2, 7, 6),
+    rgb_3bit(7, 7, 7),
+    rgb_3bit(4, 6, 7),
+    rgb_3bit(0, 0, 0),
+    rgb_3bit(7, 5, 0),
+    rgb_3bit(6, 3, 7),
+    rgb_3bit(5, 6, 7),
+    rgb_3bit(3, 6, 0),
+    rgb_3bit(6, 5, 7),
+    rgb_3bit(0, 7, 7),
+    rgb_3bit(1, 2, 0),
+];
+
 fn default_output_palette() -> OutputPalette {
     NTSC_2C02_PALETTE
 }
@@ -871,6 +1087,16 @@ mod tests {
         Cartridge::from_ines(&rom).unwrap()
     }
 
+    fn mapper9_cartridge(chr: &[u8]) -> Cartridge {
+        let mut rom = vec![0; 16 + 0x20_000 + 0x20_000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 8;
+        rom[5] = 16;
+        rom[6] = 0x90;
+        rom[16 + 0x20_000..].copy_from_slice(chr);
+        Cartridge::from_ines(&rom).unwrap()
+    }
+
     #[test]
     fn mirrors_nametables() {
         assert_eq!(mirror_nametable(0x2800, Mirroring::Vertical), 0);
@@ -890,6 +1116,13 @@ mod tests {
         assert_eq!(RGB_2C03_PALETTE[0x01], [0, 36, 146]);
         assert_eq!(RGB_2C03_PALETTE[0x2d], [0, 0, 0]);
         assert_eq!(RGB_2C03_PALETTE[0x3d], [0, 0, 0]);
+    }
+
+    #[test]
+    fn rgb_2c04_0004_palette_uses_the_scrambled_hardware_order() {
+        assert_eq!(RGB_2C04_0004_PALETTE[0x00], rgb_3bit(4, 3, 0));
+        assert_eq!(RGB_2C04_0004_PALETTE[0x04], [0, 0, 0]);
+        assert_eq!(RGB_2C04_0004_PALETTE[0x31], [255, 255, 255]);
     }
 
     #[test]
@@ -1036,5 +1269,91 @@ mod tests {
         assert_eq!(ppu.status & 0x40, 0);
         ppu.clock(&mut cartridge);
         assert_ne!(ppu.status & 0x40, 0);
+    }
+
+    #[test]
+    fn mapper_latch_tile_uses_one_cached_pattern_fetch_for_all_eight_pixels() {
+        let mut chr = vec![0; 0x20_000];
+        // Latch 1 starts in FE. Tile FD must be drawn from the old (FE) bank,
+        // even though its high-plane fetch switches subsequent tiles to FD.
+        chr[2 * 0x1000 + 0x0fd0] = 0xff;
+        let mut cartridge = mapper9_cartridge(&chr);
+        cartridge.cpu_write(0xd000, 1);
+        cartridge.cpu_write(0xe000, 2);
+
+        let mut ppu = Ppu::default();
+        ppu.control = 0x10;
+        ppu.mask = 0x0a;
+        ppu.palette[1] = 1;
+        ppu.nametable[0] = 0xfd;
+        ppu.scanline = 0;
+        ppu.dot = 1;
+        for _ in 0..8 {
+            ppu.clock(&mut cartridge);
+        }
+
+        assert_eq!(&ppu.frame_color_indices[..8], &[1; 8]);
+    }
+
+    #[test]
+    fn mapper_latches_see_the_two_background_fetches_past_the_right_edge() {
+        let mut chr = vec![0; 0x20_000];
+        chr[1 * 0x1000] = 0x11;
+        chr[2 * 0x1000] = 0x22;
+        let mut cartridge = mapper9_cartridge(&chr);
+        cartridge.cpu_write(0xd000, 1);
+        cartridge.cpu_write(0xe000, 2);
+
+        let mut ppu = Ppu::default();
+        ppu.control = 0x10;
+        ppu.mask = 0x08;
+        // With vertical mirroring, slot 33 is the second tile in nametable 1.
+        // It is outside the picture but is still fetched by the real PPU.
+        ppu.nametable[0x401] = 0xfd;
+        ppu.capture_line_origin();
+        ppu.cache_scanline_patterns(&mut cartridge);
+
+        assert_eq!(cartridge.ppu_read(0x1000), Some(0x11));
+    }
+
+    #[test]
+    fn mapper_latch_sprite_keeps_the_old_bank_for_its_entire_row() {
+        let mut chr = vec![0; 0x20_000];
+        chr[2 * 0x1000 + 0x0fd0] = 0xff;
+        let mut cartridge = mapper9_cartridge(&chr);
+        cartridge.cpu_write(0xb000, 1);
+        cartridge.cpu_write(0xc000, 2);
+
+        let mut ppu = Ppu::default();
+        ppu.mask = 0x14;
+        ppu.palette[0x11] = 1;
+        ppu.oam[0..4].copy_from_slice(&[0, 0xfd, 0, 0]);
+        ppu.cache_next_scanline_sprites(1, &mut cartridge);
+        for x in 0..8 {
+            ppu.render_pixel(x, 1, &mut cartridge);
+        }
+
+        assert_eq!(
+            &ppu.frame_color_indices[FRAME_WIDTH..FRAME_WIDTH + 8],
+            &[1; 8]
+        );
+    }
+
+    #[test]
+    fn mapper_latches_see_unused_eight_by_sixteen_sprite_fetches() {
+        let mut chr = vec![0; 0x20_000];
+        chr[1 * 0x1000] = 0x11;
+        chr[2 * 0x1000] = 0x22;
+        let mut cartridge = mapper9_cartridge(&chr);
+        cartridge.cpu_write(0xd000, 1);
+        cartridge.cpu_write(0xe000, 2);
+        cartridge.ppu_read(0x1fd8);
+
+        let mut ppu = Ppu::default();
+        ppu.control = 0x20;
+        ppu.oam.fill(0xff);
+        ppu.cache_next_scanline_sprites(1, &mut cartridge);
+
+        assert_eq!(cartridge.ppu_read(0x1000), Some(0x22));
     }
 }

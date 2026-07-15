@@ -3,6 +3,7 @@ mod cnrom;
 mod fme7;
 mod ines;
 mod mapper;
+mod mapper99;
 mod mmc1;
 mod mmc2;
 mod mmc3;
@@ -24,6 +25,7 @@ use cnrom::Cnrom;
 use fme7::Fme7;
 pub use ines::{InesHeader, RomFormat, TimingMode};
 use mapper::{Mapper, MapperSnapshot};
+use mapper99::Mapper99;
 use mmc1::Mmc1;
 use mmc2::Mmc2;
 use mmc3::Mmc3;
@@ -238,6 +240,12 @@ impl Cartridge {
                 header.prg_ram_bytes + header.prg_nvram_bytes,
                 parsed.trainer.as_deref(),
             )?),
+            99 => Box::new(Mapper99::new(
+                parsed.prg,
+                parsed.chr,
+                header.prg_ram_bytes + header.prg_nvram_bytes,
+                parsed.trainer.as_deref(),
+            )?),
             mapper @ 0 => {
                 return Err(CartridgeError::UnsupportedSubmapper {
                     mapper,
@@ -420,6 +428,7 @@ mod tests {
             (26, 4, 1),
             (69, 4, 1),
             (85, 4, 1),
+            (99, 2, 2),
         ];
         for (mapper, prg, chr) in cases {
             let cartridge = Cartridge::from_ines(&mapper_rom(mapper, prg, chr))

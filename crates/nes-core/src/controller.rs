@@ -19,6 +19,8 @@ pub struct Controller {
     shift: u8,
     strobe: bool,
     total_reads: u64,
+    #[serde(default)]
+    coin: bool,
 }
 
 impl Controller {
@@ -36,6 +38,14 @@ impl Controller {
 
     pub fn button(&self, button: Button) -> bool {
         self.buttons & (1 << button as u8) != 0
+    }
+
+    pub fn set_coin(&mut self, inserted: bool) {
+        self.coin = inserted;
+    }
+
+    pub fn coin(&self) -> bool {
+        self.coin
     }
 
     pub(crate) fn write_strobe(&mut self, value: u8) {

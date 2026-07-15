@@ -14,10 +14,10 @@ RetroAchievements support.
 
 ## Measured emulation accuracy
 
-**68.8% — 97 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
+**71.6% — 101 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
 
 This is CrabNes's current automated hardware-conformance test pass rate, not a
-claim that every NES game is exactly 68.8% accurate. Compatibility varies by
+claim that every NES game is exactly 71.6% accurate. Compatibility varies by
 game, mapper, and the hardware behavior it relies on. The score is updated only
 when it has been reproduced with the headless runner:
 
@@ -27,6 +27,12 @@ cargo run --release -p nes-cli -- AccuracyCoin.nes --frames 5000 --press-start-a
 
 AccuracyCoin targets the RP2A03G CPU/APU and RP2C02G PPU used by NTSC NES
 hardware. PAL support is tested separately because it uses different timing.
+
+The library's per-ROM compatibility estimate statically follows likely 6502 code
+from the ROM's reset, NMI, and IRQ vectors. It detects which PPU, APU, DMC, DMA,
+and interrupt features that reachable code uses, applies only the relevant
+AccuracyCoin risk, then adjusts for mapper and header uncertainty. Bank-selected
+code that cannot be resolved statically remains covered by the mapper penalty.
 
 ## Download for Windows
 
@@ -48,8 +54,9 @@ run the workflow manually or [build from source](#build-from-source).
 - Native low-latency Windows audio with per-channel controls.
 - Keyboard and hot-pluggable gamepad support for two players.
 - Searchable ROM library with custom titles, automatic RetroAchievements
-  artwork, user-selected artwork overrides, and a per-ROM accuracy estimate
-  that explains mapper and timing confidence.
+  artwork, user-selected artwork overrides, and a per-ROM compatibility estimate
+  weighted from likely reachable ROM code, measured AccuracyCoin categories,
+  and cartridge mapper coverage.
 - Versioned save states with screenshots and ROM validation.
 - LZ4-compressed rewind: two minutes by default, configurable up to ten minutes.
 - TAS recording, playback, rerecording, frame editing, seeking, and checkpoints.
@@ -98,7 +105,7 @@ restores the cached one.
 |---|---|
 | Region | NTSC and PAL; standard Europe/Australia/PAL filename tags correct legacy ROMs with missing timing flags; multi-region NES 2.0 images default to NTSC |
 | ROM format | iNES 1.0 and NES 2.0 for supported boards |
-| Mapper | 0 NROM; 1 MMC1; 2 UxROM; 3 CNROM; 4 MMC3; 5 MMC5; 7 AxROM; 9 MMC2; 10 MMC4; 19 Namco 163; 21/22/23/25 VRC2/VRC4; 24/26 VRC6; 69 FME-7/5B; 85 VRC7 |
+| Mapper | 0 NROM; 1 MMC1; 2 UxROM; 3 CNROM; 4 MMC3; 5 MMC5; 7 AxROM; 9 MMC2; 10 MMC4; 19 Namco 163; 21/22/23/25 VRC2/VRC4; 24/26 VRC6; 69 FME-7/5B; 85 VRC7; 99 Nintendo Vs. System |
 | Expansion audio | Sunsoft 5B, VRC6, Namco 163, MMC5, and VRC7 FM |
 | Desktop | Windows x64 |
 | Controllers | Two NES controllers through keyboard and gamepads |

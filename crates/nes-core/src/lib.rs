@@ -18,6 +18,7 @@ pub use controller::{Button, Controller};
 pub use emulator::{EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VERSION, StateError};
 pub use ppu::{
     FRAME_HEIGHT, FRAME_WIDTH, Frame, NTSC_2C02_PALETTE, OutputPalette, PpuState, RGB_2C03_PALETTE,
+    RGB_2C04_0004_PALETTE,
 };
 pub use timing::{NTSC_CPU_CLOCK_HZ, NTSC_FRAME_RATE, PAL_CPU_CLOCK_HZ, PAL_FRAME_RATE, Region};
 
