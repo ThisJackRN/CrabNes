@@ -18,7 +18,9 @@ RetroAchievements support.
 [AccuracyCoin's](https://github.com/100thCoin/AccuracyCoin) NTSC NES accuracy
 suite.**
 
-![AccuracyCoin results showing all 141 tests passing](docs/accuracycoin-141-of-141.png)
+<p align="center">
+  <img src="docs/accuracycoin-141-of-141.png" alt="AccuracyCoin results showing all 141 tests passing">
+</p>
 
 That makes CrabNes highly accurate by this measured standard, but no test suite
 can cover every game, mapper, or hardware edge case. Emulation accuracy is an
