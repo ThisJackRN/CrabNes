@@ -200,7 +200,7 @@ impl Bus {
                 // The controller drives only the low serial bit. The upper
                 // three bits retain CPU open bus on an NTSC NES.
                 0x4016 if self.cartridge.mapper_id() == 99 => (
-                    self.controllers[0].read() | u8::from(self.controllers[0].coin()) * 0x20,
+                    self.controllers[0].read() | (u8::from(self.controllers[0].coin()) * 0x20),
                     true,
                 ),
                 0x4017 if self.cartridge.mapper_id() == 99 => (self.controllers[1].read(), true),

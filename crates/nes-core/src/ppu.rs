@@ -1984,9 +1984,11 @@ mod tests {
         cartridge.cpu_write(0xd000, 1);
         cartridge.cpu_write(0xe000, 2);
 
-        let mut ppu = Ppu::default();
-        ppu.control = 0x10;
-        ppu.mask = 0x0a;
+        let mut ppu = Ppu {
+            control: 0x10,
+            mask: 0x0a,
+            ..Ppu::default()
+        };
         ppu.palette[1] = 1;
         ppu.nametable[0] = 0xfd;
         ppu.scanline = 0;
@@ -2006,15 +2008,17 @@ mod tests {
     #[test]
     fn mapper_latches_see_the_two_background_fetches_past_the_right_edge() {
         let mut chr = vec![0; 0x20_000];
-        chr[1 * 0x1000] = 0x11;
+        chr[0x1000] = 0x11;
         chr[2 * 0x1000] = 0x22;
         let mut cartridge = mapper9_cartridge(&chr);
         cartridge.cpu_write(0xd000, 1);
         cartridge.cpu_write(0xe000, 2);
 
-        let mut ppu = Ppu::default();
-        ppu.control = 0x10;
-        ppu.mask = 0x08;
+        let mut ppu = Ppu {
+            control: 0x10,
+            mask: 0x08,
+            ..Ppu::default()
+        };
         // The second prefetch tile is outside the picture but still reaches
         // the mapper's CHR latch through the normal dot-level fetch pipeline.
         ppu.nametable[1] = 0xfd;
@@ -2036,8 +2040,10 @@ mod tests {
         cartridge.cpu_write(0xb000, 1);
         cartridge.cpu_write(0xc000, 2);
 
-        let mut ppu = Ppu::default();
-        ppu.mask = 0x14;
+        let mut ppu = Ppu {
+            mask: 0x14,
+            ..Ppu::default()
+        };
         ppu.palette[0x11] = 1;
         ppu.oam[0..4].copy_from_slice(&[0, 0xfd, 0, 0]);
         ppu.scanline = 0;
@@ -2057,15 +2063,17 @@ mod tests {
     #[test]
     fn mapper_latches_see_unused_eight_by_sixteen_sprite_fetches() {
         let mut chr = vec![0; 0x20_000];
-        chr[1 * 0x1000] = 0x11;
+        chr[0x1000] = 0x11;
         chr[2 * 0x1000] = 0x22;
         let mut cartridge = mapper9_cartridge(&chr);
         cartridge.cpu_write(0xd000, 1);
         cartridge.cpu_write(0xe000, 2);
         cartridge.ppu_read(0x1fd8);
 
-        let mut ppu = Ppu::default();
-        ppu.control = 0x20;
+        let mut ppu = Ppu {
+            control: 0x20,
+            ..Ppu::default()
+        };
         ppu.oam.fill(0xff);
         ppu.scanline = 0;
         ppu.evaluate_sprites_for_next_scanline();

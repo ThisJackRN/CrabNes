@@ -429,13 +429,12 @@ impl Dmc {
                 // the bus-visible three-clock point on both phases so DMA
                 // cannot finish before a read-sensitive access such as $2002.
                 // Other rates retain their phase-sensitive timing.
-                self.start_delay = if !self.loop_flag && self.rate_index == 0x0f {
-                    3
-                } else if cpu_cycle & 1 == 0 {
-                    3
-                } else {
-                    2
-                };
+                self.start_delay =
+                    if (!self.loop_flag && self.rate_index == 0x0f) || cpu_cycle & 1 == 0 {
+                        3
+                    } else {
+                        2
+                    };
             }
         } else {
             self.start_delay = 0;

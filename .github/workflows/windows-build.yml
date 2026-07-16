@@ -23,6 +23,12 @@ jobs:
       - name: Cache Rust build files
         uses: Swatinem/rust-cache@v2
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
@@ -36,6 +42,7 @@ jobs:
           Copy-Item target/release/CrabNes.exe dist/
           Copy-Item README.md dist/
           Copy-Item LICENSE dist/
+          Copy-Item THIRD_PARTY_NOTICES.md dist/
 
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
