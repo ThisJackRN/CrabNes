@@ -178,14 +178,13 @@ impl Apu {
     }
 
     pub fn read_status(&mut self) -> u8 {
-        let status = u8::from(self.pulse[0].length() > 0)
+        u8::from(self.pulse[0].length() > 0)
             | (u8::from(self.pulse[1].length() > 0) << 1)
             | (u8::from(self.triangle.length() > 0) << 2)
             | (u8::from(self.noise.length() > 0) << 3)
             | (u8::from(self.dmc.active()) << 4)
             | (u8::from(self.frame_counter.read_irq_status(self.cycles)) << 6)
-            | (u8::from(self.dmc.irq_flag()) << 7);
-        status
+            | (u8::from(self.dmc.irq_flag()) << 7)
     }
 
     pub fn irq_pending(&self) -> bool {

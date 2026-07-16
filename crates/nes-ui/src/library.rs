@@ -826,9 +826,7 @@ fn read_prg_byte(
             bank_count.checked_sub(4)? + slot
         };
         bank * 0x2000 + usize::from(address & 0x1fff)
-    } else if prg.len() <= 0x4000 {
-        cpu_offset % prg.len()
-    } else if mapper == 0 && prg.len() <= 0x8000 {
+    } else if prg.len() <= 0x4000 || (mapper == 0 && prg.len() <= 0x8000) {
         cpu_offset % prg.len()
     } else if address >= 0xc000 {
         prg.len().checked_sub(0x4000)? + usize::from(address - 0xc000)
