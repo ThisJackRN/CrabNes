@@ -19,7 +19,7 @@ RetroAchievements support.
 suite.**
 
 <p align="center">
-  <img src="docs/accuracycoin-141-of-141.png" alt="AccuracyCoin results showing all 141 tests passing">
+  <img src="docs/accuracycoin-141-of-141-v2.png" alt="AccuracyCoin results showing all 141 tests passing">
 </p>
 
 That makes CrabNes highly accurate by this measured standard, but no test suite
