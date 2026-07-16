@@ -29,11 +29,11 @@ pub struct AccuracyEstimate {
     pub details: Vec<String>,
 }
 
-const ACCURACYCOIN_PASSED: u16 = 133;
+const ACCURACYCOIN_PASSED: u16 = 141;
 const ACCURACYCOIN_TOTAL: u16 = 141;
-const ACCURACYCOIN_OFFICIAL_CPU: (u16, u16, u8) = (22, 23, 10);
+const ACCURACYCOIN_OFFICIAL_CPU: (u16, u16, u8) = (23, 23, 10);
 const ACCURACYCOIN_UNOFFICIAL_CPU: (u16, u16, u8) = (66, 66, 5);
-const ACCURACYCOIN_PPU: (u16, u16, u8) = (26, 33, 15);
+const ACCURACYCOIN_PPU: (u16, u16, u8) = (33, 33, 15);
 const ACCURACYCOIN_APU_DMA: (u16, u16, u8) = (19, 19, 5);
 
 #[derive(Clone)]
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(ready.accuracy.as_ref().unwrap().score, 100);
         assert_eq!(ready.accuracy.as_ref().unwrap().rating, "High");
         assert_eq!(ready.accuracy.as_ref().unwrap().mapper_coverage, "Focused");
-        assert_eq!(ready.accuracy.as_ref().unwrap().passed, 133);
+        assert_eq!(ready.accuracy.as_ref().unwrap().passed, 141);
         assert_eq!(ready.accuracy.as_ref().unwrap().total, 141);
         assert!(
             library
@@ -1130,7 +1130,7 @@ mod tests {
         let estimate = estimate_accuracy(&nes, &rom);
 
         assert_eq!(estimate.score, 95);
-        assert_eq!(estimate.passed, 133);
+        assert_eq!(estimate.passed, 141);
         assert_eq!(estimate.total, 141);
         assert_eq!(estimate.rating, "High");
         assert_eq!(estimate.mapper_coverage, "Partial");
@@ -1146,7 +1146,7 @@ mod tests {
     fn accuracycoin_category_weights_match_the_supplied_test_array() {
         assert_eq!(accuracycoin_penalty(ACCURACYCOIN_OFFICIAL_CPU), 0);
         assert_eq!(accuracycoin_penalty(ACCURACYCOIN_UNOFFICIAL_CPU), 0);
-        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_PPU), 3);
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_PPU), 0);
         assert_eq!(accuracycoin_penalty(ACCURACYCOIN_APU_DMA), 0);
         assert_eq!(
             ACCURACYCOIN_OFFICIAL_CPU.0
@@ -1183,12 +1183,12 @@ mod tests {
 
         let estimate = estimate_accuracy(&nes, &rom);
 
-        assert_eq!(estimate.score, 98);
+        assert_eq!(estimate.score, 100);
         assert!(
             estimate
                 .details
                 .iter()
-                .any(|detail| detail.contains("PPU -2 at 65% exposure"))
+                .any(|detail| detail.contains("PPU -0 at 65% exposure"))
         );
         assert!(
             estimate

@@ -14,15 +14,23 @@ RetroAchievements support.
 
 ## Measured emulation accuracy
 
-**94.3% — 133 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
+**CrabNes achieves a perfect 141/141 score on
+[AccuracyCoin's](https://github.com/100thCoin/AccuracyCoin) NTSC NES accuracy
+suite.**
 
-This is CrabNes's current automated hardware-conformance test pass rate, not a
-claim that every NES game is exactly 94.3% accurate. Compatibility varies by
-game, mapper, and the hardware behavior it relies on. The score is updated only
-when it has been reproduced with the headless runner:
+![AccuracyCoin results showing all 141 tests passing](docs/accuracycoin-141-of-141.png)
+
+That makes CrabNes highly accurate by this measured standard, but no test suite
+can cover every game, mapper, or hardware edge case. Emulation accuracy is an
+ongoing effort: if something behaves differently from a real NES, please
+[report it](https://github.com/ThisJackRN/CrabNes/issues) with the game or test
+ROM, the behavior you expected, and what CrabNes did instead. Reproducible
+reports help make the emulator better for everyone.
+
+The score is updated only when it has been reproduced with the headless runner:
 
 ```powershell
-cargo run --release -p nes-cli -- AccuracyCoin.nes --frames 5000 --press-start-at 120 --accuracycoin-report
+cargo run --release -p nes-cli -- AccuracyCoin.nes --frames 12000 --press-start-at 120 --accuracycoin-report
 ```
 
 During development, run only the affected one-based test page. The runner
