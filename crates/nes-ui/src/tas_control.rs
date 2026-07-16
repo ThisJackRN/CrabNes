@@ -4,6 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use md5::{Digest as _, Md5};
+
 // External movie support is an independent interoperability implementation.
 // The FM2 parser follows FCEUX's public format documentation; no FCEUX or
 // BizHawk source code is incorporated. See THIRD_PARTY_NOTICES.md.
@@ -50,9 +53,26 @@ pub struct ControlMovie {
     pub suggested_start: TasStartType,
     pub warnings: Vec<String>,
     pub events: Vec<ControlEvent>,
+    pub fceux_rom_md5: Option<[u8; 16]>,
+    pub embedded_fceux_state: Option<Vec<u8>>,
 }
 
 impl ControlMovie {
+    pub fn verify_fceux_rom(&self, rom: &[u8]) -> Result<(), String> {
+        let Some(expected) = self.fceux_rom_md5 else {
+            return Ok(());
+        };
+        let actual: [u8; 16] = Md5::digest(ines_rom_payload(rom)?).into();
+        if actual != expected {
+            return Err(format!(
+                "FM2 ROM checksum mismatch: movie expects {}, loaded ROM is {}",
+                hex_bytes(&expected),
+                hex_bytes(&actual)
+            ));
+        }
+        Ok(())
+    }
+
     pub fn to_native_movie(
         &self,
         rom_sha256: String,
@@ -111,6 +131,8 @@ pub fn load(path: &Path, expected_rom_sha256: Option<&str>) -> Result<ControlMov
                 suggested_start: loaded.movie.start_type,
                 warnings: loaded.warnings,
                 events: Vec::new(),
+                fceux_rom_md5: None,
+                embedded_fceux_state: None,
             })
         }
         "txt" | "log" => {
@@ -231,6 +253,8 @@ fn parse_fm2(text: &str, source_path: PathBuf) -> Result<ControlMovie, String> {
     let mut unsupported_device = false;
     let mut declared_length = None;
     let mut version = None;
+    let mut fceux_rom_md5 = None;
+    let mut embedded_fceux_state = None;
 
     for (line_number, raw_line) in text.lines().enumerate() {
         let line = raw_line.trim_end_matches('\r');
@@ -275,12 +299,22 @@ fn parse_fm2(text: &str, source_path: PathBuf) -> Result<ControlMovie, String> {
             "FDS" if value.trim() == "1" => warnings.push("FDS movies are not supported".into()),
             "rerecordCount" => rerecord_count = value.trim().parse().unwrap_or(0),
             "length" => declared_length = value.trim().parse::<usize>().ok(),
+            "romChecksum" => {
+                fceux_rom_md5 = Some(decode_fm2_md5(value.trim()).map_err(|error| {
+                    format!(
+                        "invalid FM2 romChecksum on line {}: {error}",
+                        line_number + 1
+                    )
+                })?);
+            }
             "savestate" => {
                 suggested_start = TasStartType::SaveState;
-                warnings.push(
-                    "FM2 embeds an FCEUX savestate, which is not compatible with this emulator"
-                        .into(),
-                );
+                embedded_fceux_state = Some(decode_fm2_blob(value.trim()).map_err(|error| {
+                    format!(
+                        "invalid embedded FCEUX savestate on line {}: {error}",
+                        line_number + 1
+                    )
+                })?);
             }
             "comment" => {
                 let value = value.trim();
@@ -304,9 +338,16 @@ fn parse_fm2(text: &str, source_path: PathBuf) -> Result<ControlMovie, String> {
         Some(version) => return Err(format!("unsupported FM2 version {version}; expected 3")),
         None => return Err("FM2 header is missing version".into()),
     }
-    warnings.push(
-        "FM2 ROM MD5 is not cross-checked; load the same game and revision used by FCEUX".into(),
-    );
+    if fceux_rom_md5.is_none() {
+        warnings
+            .push("FM2 has no usable ROM MD5; load the exact game revision used by FCEUX".into());
+    }
+    if embedded_fceux_state.is_some() {
+        warnings.push(
+            "Embedded FCEUX start state will be imported when selected; this bridge currently supports MMC3 (mapper 4) chunked FCS states"
+                .into(),
+        );
+    }
     if pal {
         warnings.push(
             "FM2 uses PAL timing; load a PAL ROM/header or synchronization will differ".into(),
@@ -334,6 +375,8 @@ fn parse_fm2(text: &str, source_path: PathBuf) -> Result<ControlMovie, String> {
         suggested_start,
         warnings,
         events,
+        fceux_rom_md5,
+        embedded_fceux_state,
     })
 }
 
@@ -412,7 +455,61 @@ fn parse_bizhawk_input_log(
         suggested_start: TasStartType::PowerOn,
         warnings,
         events,
+        fceux_rom_md5: None,
+        embedded_fceux_state: None,
     })
+}
+
+fn decode_fm2_md5(value: &str) -> Result<[u8; 16], String> {
+    let bytes = decode_fm2_blob(value)?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("checksum decoded to {} bytes, expected 16", bytes.len()))
+}
+
+fn decode_fm2_blob(value: &str) -> Result<Vec<u8>, String> {
+    let bytes = if let Some(value) = value.strip_prefix("base64:") {
+        BASE64.decode(value).map_err(|error| error.to_string())?
+    } else if let Some(value) = value.strip_prefix("0x") {
+        if !value.len().is_multiple_of(2) {
+            return Err("hex data has an odd number of digits".into());
+        }
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).map_err(|_| "hex data contains a non-hex digit")
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(str::to_owned)?
+    } else {
+        return Err("expected base64: or 0x encoding".into());
+    };
+    if bytes.len() as u64 > MAX_IMPORT_BYTES {
+        return Err("decoded data is too large".into());
+    }
+    Ok(bytes)
+}
+
+fn ines_rom_payload(rom: &[u8]) -> Result<&[u8], String> {
+    if rom.len() < 16 || &rom[..4] != b"NES\x1a" {
+        return Err("loaded file is not an iNES ROM".into());
+    }
+    let trainer: usize = if rom[6] & 0x04 != 0 { 512 } else { 0 };
+    let start = 16usize + trainer;
+    let prg = usize::from(rom[4]) * 0x4000;
+    let chr = usize::from(rom[5]) * 0x2000;
+    let end = start
+        .checked_add(prg)
+        .and_then(|end| end.checked_add(chr))
+        .ok_or_else(|| "ROM size overflows".to_owned())?;
+    rom.get(start..end)
+        .ok_or_else(|| "ROM is truncated relative to its iNES header".to_owned())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -491,6 +588,42 @@ mod tests {
     }
 
     #[test]
+    fn retains_fm2_rom_checksum_and_embedded_state() {
+        let text = "version 3\nromChecksum base64:AAECAwQFBgcICQoLDA0ODw==\nsavestate base64:RkNTWA==\n|0|........|........||\n";
+        let movie = parse_fm2(text, PathBuf::from("state.fm2")).unwrap();
+        assert_eq!(
+            movie.fceux_rom_md5,
+            Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        );
+        assert_eq!(
+            movie.embedded_fceux_state.as_deref(),
+            Some(b"FCSX".as_slice())
+        );
+        assert_eq!(movie.suggested_start, TasStartType::SaveState);
+    }
+
+    #[test]
+    fn fceux_rom_check_hashes_only_prg_and_chr_payload() {
+        let mut rom = vec![0; 16 + 0x4000 + 0x2000];
+        rom[..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        rom[5] = 1;
+        for (index, byte) in rom[16..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let expected: [u8; 16] = Md5::digest(&rom[16..]).into();
+        let mut movie = parse_fm2(
+            "version 3\n|0|........|........||\n",
+            PathBuf::from("movie.fm2"),
+        )
+        .unwrap();
+        movie.fceux_rom_md5 = Some(expected);
+        movie.verify_fceux_rom(&rom).unwrap();
+        rom[16] ^= 1;
+        assert!(movie.verify_fceux_rom(&rom).is_err());
+    }
+
+    #[test]
     fn parses_extracted_bizhawk_neshawk_input_log() {
         let text = "[Input]\nLogKey:#Reset|P1 Up|P1 Down|P1 Left|P1 Right|P1 Start|P1 Select|P1 B|P1 A|\n|..|U...S..A|.D...sB.|\n|..|........|........|\n[/Input]\n";
         let movie = parse_bizhawk_input_log(
@@ -558,6 +691,8 @@ mod tests {
                 frame: 0,
                 description: "FM2 soft reset".into(),
             }],
+            fceux_rom_md5: None,
+            embedded_fceux_state: None,
         };
         let movie = source.to_native_movie("12".repeat(32), TasStartType::PowerOn, None);
         assert_eq!(movie.frames, source.frames);

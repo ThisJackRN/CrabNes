@@ -4,6 +4,7 @@ use super::{
     CartridgeError, Mirroring,
     mapper::{Mapper, MapperSnapshot, bank_offset, load_trainer},
 };
+use crate::fceux_state::FceuxMmc3State;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Mmc3Snapshot {
@@ -285,6 +286,27 @@ impl Mapper for Mmc3 {
         if self.chr_is_ram {
             self.chr.copy_from_slice(&s.chr);
         }
+        true
+    }
+    fn import_fceux_mmc3(&mut self, state: &FceuxMmc3State) -> bool {
+        if state.prg_ram.len() != self.prg_ram.len() {
+            return false;
+        }
+        self.bank_select = state.bank_select;
+        self.banks = state.banks;
+        self.mirroring = if state.mirroring & 1 == 0 {
+            Mirroring::Vertical
+        } else {
+            Mirroring::Horizontal
+        };
+        self.prg_ram_enabled = state.ram_control & 0x80 != 0;
+        self.prg_ram_write_protect = state.ram_control & 0x40 != 0;
+        self.irq_latch = state.irq_latch;
+        self.irq_counter = state.irq_counter;
+        self.irq_reload = state.irq_reload;
+        self.irq_enabled = state.irq_enabled;
+        self.irq_pending = state.irq_pending;
+        self.prg_ram.copy_from_slice(&state.prg_ram);
         true
     }
     fn prg_rom(&self) -> &[u8] {

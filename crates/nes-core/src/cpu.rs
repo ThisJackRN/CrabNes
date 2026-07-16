@@ -99,6 +99,34 @@ impl Default for Cpu {
 }
 
 impl Cpu {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_fceux_state(
+        &mut self,
+        a: u8,
+        x: u8,
+        y: u8,
+        sp: u8,
+        pc: u16,
+        status: u8,
+        jammed: bool,
+        interrupt_poll_status: u8,
+    ) {
+        self.a = a;
+        self.x = x;
+        self.y = y;
+        self.sp = sp;
+        self.pc = pc;
+        self.status = status | U;
+        self.instructions = 0;
+        self.jammed = jammed;
+        self.interrupt_poll_i = interrupt_poll_status & I != 0;
+        self.nmi_latched = false;
+        self.interrupt_poll_cycle = 0;
+        self.branch_irq_first_poll = false;
+        self.branch_irq_delay = false;
+        self.irq_poll_latched = false;
+    }
+
     pub fn reset(&mut self, bus: &mut Bus) {
         self.a = 0;
         self.x = 0;

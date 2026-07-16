@@ -2142,6 +2142,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2281,6 +2291,7 @@ name = "nes-core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "flate2",
  "serde",
  "serde-big-array",
  "sha2",
@@ -2296,6 +2307,7 @@ dependencies = [
  "gilrs",
  "image",
  "lz4_flex",
+ "md-5",
  "nes-achievements-native",
  "nes-audio-native",
  "nes-core",

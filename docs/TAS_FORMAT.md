@@ -64,6 +64,13 @@ boundaries:
 600|<64 hex characters>
 ```
 
+On a mismatch, CrabNes independently replays the preceding checkpoint interval.
+If replay and live execution agree, the old checksum is treated as stale
+metadata and refreshed. If replay instead reproduces the movie's expected
+checksum, playback restores that verified state and continues automatically.
+Playback pauses only when neither result can be verified, so recovery never
+silently accepts an unexplained state.
+
 Runtime checkpoint states are deliberately not serialized. They are rebuilt in
 memory while playing or seeking, keeping the movie inspectable and preventing it
 from accumulating many full snapshots.

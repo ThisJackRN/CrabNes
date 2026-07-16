@@ -24,6 +24,20 @@ pub struct Controller {
 }
 
 impl Controller {
+    pub(crate) fn import_fceux_serial_state(&mut self, buttons: u8, read_bit: u8, strobe: bool) {
+        self.buttons = buttons;
+        self.shift = if read_bit >= 8 {
+            0xff
+        } else if read_bit == 0 {
+            buttons
+        } else {
+            (buttons >> read_bit) | (!0u8 << (8 - read_bit))
+        };
+        self.strobe = strobe;
+        self.total_reads = 0;
+        self.coin = false;
+    }
+
     pub fn set_button(&mut self, button: Button, pressed: bool) {
         let mask = 1 << button as u8;
         if pressed {

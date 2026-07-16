@@ -79,6 +79,13 @@ enum TasTimelineAction {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum TasCheckpointRecovery {
+    RefreshedChecksum,
+    Resynchronized,
+    Unrecoverable,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum BindingCapture {
     Keyboard { player: usize, button: usize },
     Gamepad { player: usize, button: usize },
@@ -543,19 +550,24 @@ impl App {
             && let Ok(state) = nes.save_state()
         {
             let frame = self.tas.cursor;
-            let had_desync = self.tas.last_desync.is_some();
-            self.tas.maybe_checkpoint(frame, state);
-            if !had_desync && self.tas.last_desync.is_some() {
-                if self.confirm_and_repair_stale_tas_checkpoint(frame) {
-                    self.status = format!(
-                        "Repaired stale TAS checkpoint at frame {frame}; save the movie to persist it"
-                    );
-                } else {
-                    self.status = self.tas.last_desync.clone().unwrap_or_default();
-                    self.tas.pause();
-                    self.paused = true;
-                    self.follow_tas_cursor();
-                    return false;
+            if self.tas.maybe_checkpoint(frame, state) {
+                match self.reconcile_tas_checkpoint(frame) {
+                    TasCheckpointRecovery::RefreshedChecksum => {
+                        self.status = format!(
+                            "Refreshed stale TAS checkpoint at frame {frame}; save the movie to persist it"
+                        );
+                    }
+                    TasCheckpointRecovery::Resynchronized => {
+                        self.status =
+                            format!("TAS playback resynchronized automatically at frame {frame}");
+                    }
+                    TasCheckpointRecovery::Unrecoverable => {
+                        self.status = self.tas.last_desync.clone().unwrap_or_default();
+                        self.tas.pause();
+                        self.paused = true;
+                        self.follow_tas_cursor();
+                        return false;
+                    }
                 }
             }
         }
@@ -2951,7 +2963,11 @@ impl App {
                         ui.selectable_value(
                             &mut self.tas_control_start,
                             TasStartType::SaveState,
-                            "Current state",
+                            if movie.embedded_fceux_state.is_some() {
+                                "Embedded FCEUX state"
+                            } else {
+                                "Current state"
+                            },
                         );
                         convert = ui
                             .add_enabled(
@@ -3086,7 +3102,17 @@ impl App {
             return;
         }
         let start_type = self.tas_control_start;
-        self.new_tas_movie(start_type);
+        let imported_fceux =
+            start_type == TasStartType::SaveState && source.embedded_fceux_state.is_some();
+        if imported_fceux {
+            if let Err(error) = self.prepare_fceux_tas_start(&source) {
+                self.tas_control_status = format!("Could not import embedded state: {error}");
+                self.status = self.tas_control_status.clone();
+                return;
+            }
+        } else {
+            self.new_tas_movie(start_type);
+        }
         let Some(base) = self.tas.movie.as_ref() else {
             self.tas_control_status = "Could not create the native starting condition".into();
             return;
@@ -3108,10 +3134,56 @@ impl App {
         self.clear_audio_pipeline();
         self.show_tas = true;
         self.status = format!(
-            "Converted {frame_count} {} frames into the native TAS editor",
-            source.format
+            "Converted {frame_count} {} frames into the native TAS editor{}",
+            source.format,
+            if imported_fceux {
+                " from its embedded FCEUX state"
+            } else {
+                ""
+            }
         );
         self.tas_control_status = self.status.clone();
+    }
+
+    fn prepare_fceux_tas_start(&mut self, source: &ControlMovie) -> Result<(), String> {
+        source.verify_fceux_rom(&self.rom_bytes)?;
+        let fcs = source
+            .embedded_fceux_state
+            .as_deref()
+            .ok_or_else(|| "movie has no embedded FCEUX state".to_owned())?;
+        let mut nes = nes_from_rom_path(&self.rom_bytes, self.rom_path.as_deref())
+            .map_err(|error| error.to_string())?;
+        nes.import_fceux_state(fcs)
+            .map_err(|error| error.to_string())?;
+        let initial_state = nes.save_state().map_err(|error| error.to_string())?;
+        let movie = TasMovie::new(
+            tas::rom_sha256_hex(nes.rom_sha256()),
+            TasStartType::SaveState,
+            Some(initial_state.clone()),
+        );
+        self.last_controller_reads = nes
+            .controller_reads(0)
+            .wrapping_add(nes.controller_reads(1));
+        self.nes = Some(nes);
+        let _ = self.apply_video_palette();
+        self.tas.new_movie(movie, initial_state);
+        self.tas_held_input = TasFrame::default();
+        self.powered = true;
+        self.paused = false;
+        self.fast_forward = false;
+        self.last_controller_reads = self
+            .nes
+            .as_ref()
+            .map(|nes| {
+                nes.controller_reads(0)
+                    .wrapping_add(nes.controller_reads(1))
+            })
+            .unwrap_or(0);
+        self.clear_rewind_history();
+        self.lag_frames = 0;
+        self.frame_dirty = true;
+        self.clear_audio_pipeline();
+        Ok(())
     }
 
     fn input_mapping_ui(&mut self, ui: &mut egui::Ui) -> bool {
@@ -3723,9 +3795,10 @@ impl App {
     }
 
     /// Replay the segment a second time from the preceding known checkpoint.
-    /// If it produces the live state byte-for-byte, emulation is deterministic
-    /// and only the checksum stored in the edited movie is stale.
-    fn confirm_and_repair_stale_tas_checkpoint(&mut self, frame: usize) -> bool {
+    /// A matching live/replay pair proves stale metadata and refreshes it. If
+    /// replay instead matches the movie's expected hash, restore that verified
+    /// state so playback can continue without carrying a transient divergence.
+    fn reconcile_tas_checkpoint(&mut self, frame: usize) -> TasCheckpointRecovery {
         let Some(current) = self
             .tas
             .checkpoints
@@ -3733,7 +3806,7 @@ impl App {
             .find(|point| point.frame == frame)
             .cloned()
         else {
-            return false;
+            return TasCheckpointRecovery::Unrecoverable;
         };
         let Some(previous) = self
             .tas
@@ -3743,41 +3816,60 @@ impl App {
             .find(|point| point.frame < frame)
             .cloned()
         else {
-            return false;
+            return TasCheckpointRecovery::Unrecoverable;
         };
-        let Some(inputs) = self
-            .tas
-            .movie
-            .as_ref()
-            .and_then(|movie| movie.frames.get(previous.frame..frame))
-            .map(|inputs| inputs.to_vec())
-        else {
-            return false;
+        let Some((inputs, expected)) = self.tas.movie.as_ref().and_then(|movie| {
+            Some((
+                movie.frames.get(previous.frame..frame)?.to_vec(),
+                movie.state_checksums.get(&frame)?.clone(),
+            ))
+        }) else {
+            return TasCheckpointRecovery::Unrecoverable;
         };
         let Ok(mut verifier) = nes_from_rom_path(&self.rom_bytes, self.rom_path.as_deref()) else {
-            return false;
+            return TasCheckpointRecovery::Unrecoverable;
         };
         if verifier.load_state(&previous.state).is_err() {
-            return false;
+            return TasCheckpointRecovery::Unrecoverable;
         }
         let mut audio = Vec::new();
         for input in inputs {
             set_controller_mask(&mut verifier, 0, input.player1);
             set_controller_mask(&mut verifier, 1, input.player2);
             if verifier.run_frame().is_err() {
-                return false;
+                return TasCheckpointRecovery::Unrecoverable;
             }
             audio.clear();
             verifier.drain_audio_samples(&mut audio);
         }
         let Ok(verified) = verifier.save_state() else {
-            return false;
+            return TasCheckpointRecovery::Unrecoverable;
         };
-        if verified != current.state {
-            return false;
+        match tas::reconcile_checkpoint(&expected, &current.state, &verified) {
+            tas::CheckpointReconciliation::RefreshChecksum => {
+                self.tas.repair_checkpoint_checksum(frame, &current.state);
+                TasCheckpointRecovery::RefreshedChecksum
+            }
+            tas::CheckpointReconciliation::RestoreReplay => {
+                let controller_reads = {
+                    let Some(nes) = &mut self.nes else {
+                        return TasCheckpointRecovery::Unrecoverable;
+                    };
+                    if nes.load_state(&verified).is_err() {
+                        return TasCheckpointRecovery::Unrecoverable;
+                    }
+                    nes.controller_reads(0)
+                        .wrapping_add(nes.controller_reads(1))
+                };
+                self.last_controller_reads = controller_reads;
+                self.tas.accept_resynchronized_checkpoint(frame, verified);
+                self.clear_rewind_history();
+                self.clear_audio_pipeline();
+                self.frame_dirty = true;
+                TasCheckpointRecovery::Resynchronized
+            }
+            tas::CheckpointReconciliation::Unrecoverable => TasCheckpointRecovery::Unrecoverable,
         }
-        self.tas.repair_checkpoint_checksum(frame, &current.state);
-        true
     }
 
     fn toggle_pause(&mut self) {
@@ -4396,7 +4488,14 @@ impl App {
                         frame: 0,
                         state: initial_state.clone(),
                     }];
-                    self.tas.maybe_checkpoint(0, initial_state);
+                    let refreshed_start = self.tas.maybe_checkpoint(0, initial_state.clone());
+                    if refreshed_start {
+                        // Playback has just reconstructed the declared starting
+                        // condition, so a frame-zero mismatch is necessarily a
+                        // stale serialized-state checksum rather than input
+                        // divergence.
+                        self.tas.repair_checkpoint_checksum(0, &initial_state);
+                    }
                     self.lag_frames = 0;
                     if let Some(nes) = &self.nes {
                         self.last_controller_reads = nes
@@ -4409,7 +4508,9 @@ impl App {
                     self.frame_dirty = true;
                     self.follow_tas_cursor();
                     self.clear_audio_pipeline();
-                    self.status = if read_only {
+                    self.status = if refreshed_start {
+                        "TAS playback started; refreshed stale frame-0 checkpoint metadata".into()
+                    } else if read_only {
                         "Read-only TAS playback".into()
                     } else {
                         "TAS playback".into()
@@ -4447,27 +4548,45 @@ impl App {
             .as_ref()
             .map(|movie| movie.frames[checkpoint.frame..target].to_vec())
             .unwrap_or_default();
-        let Some(nes) = &mut self.nes else {
-            return false;
-        };
-        if let Err(error) = nes.load_state(&checkpoint.state) {
-            self.status = format!("Checkpoint load failed: {error}");
-            return false;
-        }
-        for (offset, input) in frames.into_iter().enumerate() {
-            set_controller_mask(nes, 0, input.player1);
-            set_controller_mask(nes, 1, input.player2);
-            if let Err(error) = nes.run_frame() {
-                self.status = format!("Seek stopped: {error}");
+        {
+            let Some(nes) = &mut self.nes else {
+                return false;
+            };
+            if let Err(error) = nes.load_state(&checkpoint.state) {
+                self.status = format!("Checkpoint load failed: {error}");
                 return false;
             }
-            self.audio_scratch.clear();
-            nes.drain_audio_samples(&mut self.audio_scratch);
+        }
+        for (offset, input) in frames.into_iter().enumerate() {
             let next_frame = checkpoint.frame + offset + 1;
-            if next_frame % self.tas.checkpoint_interval.max(1) == 0
-                && let Ok(state) = nes.save_state()
+            let checkpoint_state = {
+                let Some(nes) = &mut self.nes else {
+                    return false;
+                };
+                set_controller_mask(nes, 0, input.player1);
+                set_controller_mask(nes, 1, input.player2);
+                if let Err(error) = nes.run_frame() {
+                    self.status = format!("Seek stopped: {error}");
+                    return false;
+                }
+                self.audio_scratch.clear();
+                nes.drain_audio_samples(&mut self.audio_scratch);
+                (next_frame % self.tas.checkpoint_interval.max(1) == 0)
+                    .then(|| nes.save_state().ok())
+                    .flatten()
+            };
+            if let Some(state) = checkpoint_state
+                && self.tas.maybe_checkpoint(next_frame, state)
+                && self.reconcile_tas_checkpoint(next_frame) == TasCheckpointRecovery::Unrecoverable
             {
-                self.tas.maybe_checkpoint(next_frame, state);
+                self.status =
+                    self.tas.last_desync.clone().unwrap_or_else(|| {
+                        format!("TAS seek could not reconcile frame {next_frame}")
+                    });
+                self.tas.pause();
+                self.paused = true;
+                self.follow_tas_cursor();
+                return false;
             }
         }
         self.tas.set_cursor_paused_for_preview(target);

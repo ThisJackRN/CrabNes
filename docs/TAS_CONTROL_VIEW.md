@@ -19,7 +19,8 @@ Player 1 and Player 2 are retained.
 1. Open **TAS Control** from the main toolbar.
 2. Select **Open movie** and inspect the decoded frame list and warnings.
 3. Load the exact NES ROM and revision used to make the source movie.
-4. Select power-on, reset, or current state as the native starting condition.
+4. Select power-on, reset, current state, or the embedded FCEUX state as the
+   native starting condition.
 5. Select **Convert and open in TAS Editor**.
 6. Replay and verify synchronization, then save with the native TAS editor.
 
@@ -30,11 +31,14 @@ native editor.
 
 ## Accuracy and safety limits
 
-- FCEUX and BizHawk savestates are emulator-specific and cannot seed the native
-  deterministic state. Use a matching power-on/reset start or intentionally use
-  the emulator's current state.
-- FM2 ROM MD5 and BK2 ROM identity metadata are not currently cross-checked with
-  the loaded ROM SHA-256. The user must select the same dump and revision.
+- Text FM2 movies with an embedded chunked FCS state can seed the native
+  deterministic state for MMC3 (mapper 4). CPU, PPU, APU registers, RAM,
+  controllers, and mapper state are translated and then stored as a native
+  CrabNes state. Other FCEUX mapper states are rejected explicitly.
+- FM2 ROM MD5 is checked against the loaded ROM's PRG+CHR payload before an
+  embedded state is imported. BK2 ROM identity metadata is not currently
+  cross-checked, so BK2 users must select the same dump and revision.
+- BizHawk savestates remain emulator-specific and cannot seed the native state.
 - PAL inputs can be inspected, but the current emulator is NTSC-only and will not
   remain synchronized with a PAL movie.
 - Binary FM2, FCM, Mesen movie files, Zapper/paddle data, FDS behavior, and Four

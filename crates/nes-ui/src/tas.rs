@@ -124,6 +124,32 @@ pub struct TasCheckpoint {
     pub state: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointReconciliation {
+    /// The live and independently replayed states agree, so only the stored
+    /// checksum belongs to an older state layout or emulator revision.
+    RefreshChecksum,
+    /// Independent replay produced the state named by the movie checksum, so
+    /// playback can safely restore that state and continue.
+    RestoreReplay,
+    /// Neither current execution nor replay can reproduce the movie checksum.
+    Unrecoverable,
+}
+
+pub fn reconcile_checkpoint(
+    expected: &str,
+    live_state: &[u8],
+    replayed_state: &[u8],
+) -> CheckpointReconciliation {
+    if live_state == replayed_state {
+        CheckpointReconciliation::RefreshChecksum
+    } else if sha256_hex(replayed_state) == expected {
+        CheckpointReconciliation::RestoreReplay
+    } else {
+        CheckpointReconciliation::Unrecoverable
+    }
+}
+
 pub struct TasRecorder;
 pub struct TasPlayback;
 pub struct TasEditor;
@@ -512,11 +538,18 @@ impl TasManager {
         self.log(format!("preview paused at frame {frame}"));
     }
 
-    pub fn maybe_checkpoint(&mut self, frame: usize, state: Vec<u8>) {
+    /// Record or validate a periodic machine state.
+    ///
+    /// Returns `true` for every checksum mismatch, even when an older mismatch
+    /// is still displayed. Callers must use this return value rather than the
+    /// transition of `last_desync` so one stale checkpoint cannot suppress all
+    /// later reconciliation attempts.
+    pub fn maybe_checkpoint(&mut self, frame: usize, state: Vec<u8>) -> bool {
         if !frame.is_multiple_of(self.checkpoint_interval.max(1)) {
-            return;
+            return false;
         }
         let checksum = sha256_hex(&state);
+        let mut mismatched = false;
         let effective_mode = if self.mode == TasMode::Paused {
             self.resume_mode
         } else {
@@ -531,6 +564,7 @@ impl TasManager {
                     if let Some(expected) = movie.state_checksums.get(&frame)
                         && expected != &checksum
                     {
+                        mismatched = true;
                         self.last_desync = Some(format!(
                             "desync at frame {frame}: expected {expected}, got {checksum}"
                         ));
@@ -544,9 +578,10 @@ impl TasManager {
             self.checkpoints.sort_by_key(|point| point.frame);
             self.log(format!("checkpoint created at frame {frame}"));
         }
-        if let Some(desync) = self.last_desync.clone() {
+        if mismatched && let Some(desync) = self.last_desync.clone() {
             self.log(desync);
         }
+        mismatched
     }
 
     pub fn checkpoint_at_or_before(&self, target: usize) -> Option<TasCheckpoint> {
@@ -564,6 +599,23 @@ impl TasManager {
         self.last_desync = None;
         self.log(format!(
             "repaired stale checkpoint metadata at frame {frame} after deterministic replay"
+        ));
+    }
+
+    pub fn accept_resynchronized_checkpoint(&mut self, frame: usize, state: Vec<u8>) {
+        if let Some(checkpoint) = self
+            .checkpoints
+            .iter_mut()
+            .find(|checkpoint| checkpoint.frame == frame)
+        {
+            checkpoint.state = state;
+        } else {
+            self.checkpoints.push(TasCheckpoint { frame, state });
+            self.checkpoints.sort_by_key(|checkpoint| checkpoint.frame);
+        }
+        self.last_desync = None;
+        self.log(format!(
+            "resynchronized machine state at frame {frame} from deterministic replay"
         ));
     }
 
@@ -1400,15 +1452,26 @@ mod tests {
         let state = vec![1, 2, 3];
         let mut movie = TasMovie::new("12".repeat(32), TasStartType::PowerOn, None);
         movie.state_checksums.insert(0, sha256_hex(&state));
+        movie.state_checksums.insert(300, sha256_hex(&state));
         let mut manager = TasManager::default();
         manager.install_movie(movie);
         manager.start_playback(false);
-        manager.maybe_checkpoint(0, vec![9, 9, 9]);
+        assert!(manager.maybe_checkpoint(0, vec![9, 9, 9]));
         assert!(
             manager
                 .last_desync
                 .as_deref()
                 .is_some_and(|message| message.contains("frame 0"))
+        );
+
+        // A latched earlier error must not hide the next mismatch from the
+        // playback recovery path.
+        assert!(manager.maybe_checkpoint(300, vec![8, 8, 8]));
+        assert!(
+            manager
+                .last_desync
+                .as_deref()
+                .is_some_and(|message| message.contains("frame 300"))
         );
 
         let verified = vec![4, 5, 6];
@@ -1417,6 +1480,26 @@ mod tests {
         assert_eq!(
             manager.movie.as_ref().unwrap().state_checksums[&0],
             sha256_hex(&verified)
+        );
+    }
+
+    #[test]
+    fn checkpoint_reconciliation_refreshes_resyncs_or_stops_safely() {
+        let expected_state = vec![1, 2, 3];
+        let divergent_state = vec![9, 9, 9];
+        let expected = sha256_hex(&expected_state);
+
+        assert_eq!(
+            reconcile_checkpoint(&expected, &divergent_state, &divergent_state),
+            CheckpointReconciliation::RefreshChecksum
+        );
+        assert_eq!(
+            reconcile_checkpoint(&expected, &divergent_state, &expected_state),
+            CheckpointReconciliation::RestoreReplay
+        );
+        assert_eq!(
+            reconcile_checkpoint(&expected, &divergent_state, &[4, 5, 6]),
+            CheckpointReconciliation::Unrecoverable
         );
     }
 }
