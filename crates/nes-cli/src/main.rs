@@ -22,20 +22,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(rom_path) = args.next() else {
         return Err(
-            "usage: nes-cli <game.nes> [--frames N] [--insert-coin-at N] [--press-select-at N] [--press-start] [--press-start-at N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
+            "usage: nes-cli <game.nes> [--frames N] [--insert-coin-at N] [--press-select-at N] [--press-start] [--press-start-at N] [--accuracycoin-page N] [--accuracycoin-repeat N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
                 .into(),
         );
     };
-    let mut frames = 1_u64;
+    let mut frames = None;
     let mut screenshot = None;
     let mut press_start_at = None;
     let mut insert_coin_at = None;
     let mut press_select_at = None;
     let mut accuracycoin_report = false;
+    let mut accuracycoin_page = None;
+    let mut accuracycoin_repeat = 1_u16;
     let mut peek_addresses = Vec::new();
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--frames" => frames = args.next().ok_or("--frames needs a number")?.parse()?,
+            "--frames" => frames = Some(args.next().ok_or("--frames needs a number")?.parse()?),
             "--press-start" => press_start_at = Some(60),
             "--press-start-at" => {
                 press_start_at = Some(
@@ -59,6 +61,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
             "--accuracycoin-report" => accuracycoin_report = true,
+            "--accuracycoin-page" => {
+                let page: u8 = args
+                    .next()
+                    .ok_or("--accuracycoin-page needs a page number")?
+                    .parse()?;
+                if !(1..=20).contains(&page) {
+                    return Err("--accuracycoin-page must be between 1 and 20".into());
+                }
+                accuracycoin_page = Some(page);
+            }
+            "--accuracycoin-repeat" => {
+                accuracycoin_repeat = args
+                    .next()
+                    .ok_or("--accuracycoin-repeat needs a count")?
+                    .parse()?;
+                if accuracycoin_repeat == 0 {
+                    return Err("--accuracycoin-repeat must be at least 1".into());
+                }
+            }
             "--peek" => {
                 let address = args.next().ok_or("--peek needs an address")?;
                 let address = address
@@ -73,6 +94,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if accuracycoin_page.is_some() && press_start_at.is_some() {
+        return Err("--accuracycoin-page cannot be combined with --press-start".into());
+    }
+    if accuracycoin_page.is_none() && accuracycoin_repeat != 1 {
+        return Err("--accuracycoin-repeat requires --accuracycoin-page".into());
+    }
+
+    let frames = frames.unwrap_or(if accuracycoin_page.is_some() {
+        2_000
+    } else {
+        1
+    });
+
     let rom = fs::read(&rom_path)?;
     let mut nes = Nes::from_ines(&rom)?;
     println!(
@@ -80,7 +114,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         nes.mapper_id(),
         nes.has_battery()
     );
+    let mut accuracycoin_page_started = false;
+    let mut accuracycoin_page_completed = false;
+    let mut accuracycoin_page_runs = 0_u16;
+    let mut accuracycoin_input_cooldown = 0_u8;
     for frame in 0..frames {
+        if let Some(page) = accuracycoin_page {
+            if accuracycoin_page_started
+                && nes.cpu_state().program_counter == ACCURACYCOIN_MENU_IDLE_PC
+            {
+                accuracycoin_page_runs += 1;
+                accuracycoin_page_started = false;
+                if accuracycoin_repeat > 1 {
+                    print!("AccuracyCoin page {page} run {accuracycoin_page_runs}:");
+                    for address in &peek_addresses {
+                        print!(" ${address:04X}=${:02X}", nes.peek_cpu(*address));
+                    }
+                    println!();
+                }
+                if accuracycoin_page_runs == accuracycoin_repeat {
+                    accuracycoin_page_completed = true;
+                    break;
+                }
+                accuracycoin_input_cooldown = 1;
+            }
+            let (right, activate) = if accuracycoin_input_cooldown > 0 {
+                accuracycoin_input_cooldown -= 1;
+                (false, false)
+            } else {
+                accuracycoin_page_buttons(
+                    page,
+                    frame,
+                    nes.cpu_state().program_counter,
+                    nes.peek_cpu(0x0014),
+                    accuracycoin_page_started,
+                )
+            };
+            let controller = nes.controller_mut(0).expect("player one controller exists");
+            controller.set_button(Button::Right, right);
+            controller.set_button(Button::A, activate);
+            if right {
+                accuracycoin_input_cooldown = 1;
+            }
+            accuracycoin_page_started |= activate;
+        }
         if insert_coin_at == Some(frame) {
             nes.controller_mut(0)
                 .expect("player one controller exists")
@@ -110,6 +187,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         nes.run_frame()?;
     }
+    if accuracycoin_page_started && nes.cpu_state().program_counter == ACCURACYCOIN_MENU_IDLE_PC {
+        accuracycoin_page_runs += 1;
+        accuracycoin_page_completed = accuracycoin_page_runs == accuracycoin_repeat;
+    }
+    if let Some(page) = accuracycoin_page
+        && !accuracycoin_page_completed
+    {
+        return Err(format!(
+            "AccuracyCoin page {page} did not finish within {frames} frames (PC=${:04X}, menu page={}, started={accuracycoin_page_started})",
+            nes.cpu_state().program_counter,
+            nes.peek_cpu(0x0014) + 1,
+        )
+        .into());
+    }
     let state = nes.cpu_state();
     println!(
         "Frame {} | CPU PC={:04X} A={:02X} X={:02X} Y={:02X} P={:02X} SP={:02X} | {} cycles",
@@ -129,6 +220,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             nes.peek_cpu(0x0037)
         );
     }
+    if let Some(page) = accuracycoin_page {
+        println!(
+            "Completed AccuracyCoin page {page} {accuracycoin_page_runs} time(s) ({} tests per run)",
+            nes.peek_cpu(0x0017),
+        );
+    }
     for address in peek_addresses {
         println!("${address:04X} = ${:02X}", nes.peek_cpu(address));
     }
@@ -137,6 +234,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("Wrote {path}");
     }
     Ok(())
+}
+
+const ACCURACYCOIN_MENU_READY_FRAME: u64 = 120;
+const ACCURACYCOIN_MENU_IDLE_PC: u16 = 0x80df;
+
+fn accuracycoin_page_buttons(
+    page: u8,
+    frame: u64,
+    program_counter: u16,
+    current_page: u8,
+    started: bool,
+) -> (bool, bool) {
+    if frame < ACCURACYCOIN_MENU_READY_FRAME
+        || program_counter != ACCURACYCOIN_MENU_IDLE_PC
+        || started
+    {
+        return (false, false);
+    }
+    if current_page == page - 1 {
+        (false, true)
+    } else {
+        (true, false)
+    }
 }
 
 fn write_screenshot(path: &Path, pixels: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
@@ -186,5 +306,29 @@ mod tests {
         let encoded = fs::read(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(&encoded[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn accuracycoin_page_schedule_waits_for_the_idle_menu() {
+        assert_eq!(
+            accuracycoin_page_buttons(13, 119, 0x80df, 0, false),
+            (false, false)
+        );
+        assert_eq!(
+            accuracycoin_page_buttons(13, 120, 0x9000, 0, false),
+            (false, false)
+        );
+        assert_eq!(
+            accuracycoin_page_buttons(13, 120, 0x80df, 0, false),
+            (true, false)
+        );
+        assert_eq!(
+            accuracycoin_page_buttons(13, 120, 0x80df, 12, false),
+            (false, true)
+        );
+        assert_eq!(
+            accuracycoin_page_buttons(13, 120, 0x80df, 12, true),
+            (false, false)
+        );
     }
 }

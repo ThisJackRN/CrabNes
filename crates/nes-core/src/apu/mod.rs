@@ -142,7 +142,7 @@ impl Apu {
                 self.noise.set_enabled(value & 0x08 != 0);
                 self.dmc.set_enabled(value & 0x10 != 0, self.cycles);
             }
-            0x4017 => self.frame_counter.write(value, self.cycles),
+            0x4017 => self.frame_counter.write(value, self.cycles.wrapping_sub(1)),
             _ => {}
         }
     }
@@ -153,14 +153,13 @@ impl Apu {
             | (u8::from(self.triangle.length() > 0) << 2)
             | (u8::from(self.noise.length() > 0) << 3)
             | (u8::from(self.dmc.active()) << 4)
-            | (u8::from(self.frame_counter.irq_flag) << 6)
+            | (u8::from(self.frame_counter.read_irq_status(self.cycles)) << 6)
             | (u8::from(self.dmc.irq_flag()) << 7);
-        self.frame_counter.irq_flag = false;
         status
     }
 
     pub fn irq_pending(&self) -> bool {
-        self.frame_counter.irq_flag || self.dmc.irq_flag()
+        self.frame_counter.irq_pending() || self.dmc.irq_flag()
     }
 
     pub fn clock(&mut self) {
@@ -180,7 +179,7 @@ impl Apu {
             self.pulse[1].clock_timer();
         }
 
-        let events = self.frame_counter.clock(region);
+        let events = self.frame_counter.clock(region, self.cycles);
         if events.quarter {
             self.clock_quarter_frame();
         }
@@ -208,6 +207,18 @@ impl Apu {
 
     pub fn supply_dmc_sample(&mut self, value: u8) {
         self.dmc.supply_sample(value);
+    }
+
+    pub(crate) fn take_dmc_dma_abort(&mut self) -> bool {
+        self.dmc.take_dma_abort()
+    }
+
+    pub(crate) fn cancel_dmc_dma(&mut self) {
+        self.dmc.cancel_dma();
+    }
+
+    pub(crate) fn extend_dmc_disable_delay_for_active_dma(&mut self) {
+        self.dmc.extend_disable_delay_for_active_dma();
     }
 
     pub fn cycles(&self) -> u64 {
@@ -302,6 +313,9 @@ struct FrameCounter {
     reset_delay: u8,
     irq_inhibit: bool,
     irq_flag: bool,
+    /// A $4015 read removes the IRQ line immediately, but the status bit
+    /// itself remains readable until the next APU phase.
+    irq_clear_at: Option<u64>,
     block_counter: u8,
 }
 
@@ -324,11 +338,35 @@ impl FrameCounter {
         self.irq_inhibit = value & 0x40 != 0;
         if self.irq_inhibit {
             self.irq_flag = false;
+            self.irq_clear_at = None;
         }
         self.reset_delay = 3 + (cpu_cycles as u8 & 1);
     }
 
-    fn clock(&mut self, region: Region) -> FrameEvents {
+    fn read_irq_status(&mut self, cpu_cycles: u64) -> bool {
+        if self.irq_flag && self.irq_clear_at.is_none() {
+            // The frame interrupt status latch clears on the next APU phase,
+            // not in the $4015 read itself.  The IRQ line is nevertheless
+            // released as soon as the read occurs.
+            // In this scheduler, APU get phases are the even CPU clocks.
+            // Defer the latch clear to the next one of those phases.
+            self.irq_clear_at = Some(cpu_cycles + 2 - (cpu_cycles & 1));
+        }
+        self.irq_flag
+    }
+
+    fn irq_pending(&self) -> bool {
+        self.irq_flag && self.irq_clear_at.is_none()
+    }
+
+    fn clock(&mut self, region: Region, cpu_cycles: u64) -> FrameEvents {
+        if self
+            .irq_clear_at
+            .is_some_and(|clear_at| cpu_cycles >= clear_at)
+        {
+            self.irq_flag = false;
+            self.irq_clear_at = None;
+        }
         self.cycle += 1;
         let mut events = FrameEvents::default();
         let step_cycles = match (region, self.five_step) {
@@ -339,10 +377,17 @@ impl FrameCounter {
         };
 
         if self.cycle == step_cycles[self.step] {
-            if !self.five_step && self.step >= 3 && !self.irq_inhibit {
+            if !self.five_step && self.step >= 3 {
                 // The four-step sequencer asserts its IRQ across the final
                 // three CPU clocks, matching the hardware-visible race window.
                 self.irq_flag = true;
+                self.irq_clear_at = None;
+                // IRQ inhibition does not suppress the first two visible
+                // status-latch clocks, but the final sequencer clock clears
+                // them again before the next frame begins.
+                if self.irq_inhibit && self.step == 5 {
+                    self.irq_flag = false;
+                }
             }
             if self.block_counter == 0 {
                 match self.step {
@@ -442,6 +487,8 @@ mod tests {
         apu.clock();
         assert!(!apu.frame_counter.five_step);
         apu.clock();
+        assert!(!apu.frame_counter.five_step);
+        apu.clock();
         assert!(apu.frame_counter.five_step);
         assert_eq!(apu.frame_counter.cycle, 0);
     }
@@ -492,9 +539,40 @@ mod tests {
         assert_eq!(apu.take_dmc_dma_request(), None);
         apu.clock();
         apu.clock();
+        apu.clock();
         assert_eq!(apu.take_dmc_dma_request(), Some(0xc800));
         apu.supply_dmc_sample(0xff);
         assert_eq!(apu.read_status() & 0x10, 0x10);
+    }
+
+    #[test]
+    fn enabling_max_rate_one_shot_dmc_uses_a_stable_bus_visible_delay() {
+        let mut apu = Apu::default();
+        apu.clock();
+        apu.write(0x4010, 0x0f);
+        apu.write(0x4012, 0x20);
+        apu.write(0x4013, 0x01);
+        apu.write(0x4015, 0x10);
+
+        apu.clock();
+        assert_eq!(apu.take_dmc_dma_request(), None);
+        apu.clock();
+        assert_eq!(apu.take_dmc_dma_request(), None);
+        apu.clock();
+        assert_eq!(apu.take_dmc_dma_request(), Some(0xc800));
+    }
+
+    #[test]
+    fn enabling_looping_dmc_preserves_phase_sensitive_start_timing() {
+        let mut apu = Apu::default();
+        apu.clock();
+        apu.write(0x4010, 0x40);
+        apu.write(0x4015, 0x10);
+
+        apu.clock();
+        assert_eq!(apu.take_dmc_dma_request(), None);
+        apu.clock();
+        assert_eq!(apu.take_dmc_dma_request(), Some(0xc000));
     }
 
     #[test]
@@ -503,7 +581,7 @@ mod tests {
         let mut quarter_cycles = Vec::new();
         let mut half_cycles = Vec::new();
         for cycle in 1..=29_830 {
-            let events = counter.clock(Region::Ntsc);
+            let events = counter.clock(Region::Ntsc, cycle);
             if events.quarter {
                 quarter_cycles.push(cycle);
             }
@@ -524,12 +602,12 @@ mod tests {
     fn five_step_frame_counter_has_no_irq_and_clocks_on_write() {
         let mut counter = FrameCounter::default();
         counter.write(0x80, 0);
-        assert_eq!(counter.clock(Region::Ntsc), FrameEvents::default());
-        assert_eq!(counter.clock(Region::Ntsc), FrameEvents::default());
-        let immediate = counter.clock(Region::Ntsc);
+        assert_eq!(counter.clock(Region::Ntsc, 1), FrameEvents::default());
+        assert_eq!(counter.clock(Region::Ntsc, 2), FrameEvents::default());
+        let immediate = counter.clock(Region::Ntsc, 3);
         assert!(immediate.quarter && immediate.half);
-        for _ in 0..37_282 {
-            counter.clock(Region::Ntsc);
+        for cycle in 4..=37_285 {
+            counter.clock(Region::Ntsc, cycle);
         }
         assert!(!counter.irq_flag);
     }
@@ -551,7 +629,7 @@ mod tests {
         let mut quarter_cycles = Vec::new();
         let mut half_cycles = Vec::new();
         for cycle in 1..=33_254 {
-            let events = counter.clock(Region::Pal);
+            let events = counter.clock(Region::Pal, cycle);
             if events.quarter {
                 quarter_cycles.push(cycle);
             }

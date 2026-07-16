@@ -29,12 +29,12 @@ pub struct AccuracyEstimate {
     pub details: Vec<String>,
 }
 
-const ACCURACYCOIN_PASSED: u16 = 101;
+const ACCURACYCOIN_PASSED: u16 = 118;
 const ACCURACYCOIN_TOTAL: u16 = 141;
 const ACCURACYCOIN_OFFICIAL_CPU: (u16, u16, u8) = (22, 23, 10);
 const ACCURACYCOIN_UNOFFICIAL_CPU: (u16, u16, u8) = (66, 66, 5);
-const ACCURACYCOIN_PPU: (u16, u16, u8) = (8, 33, 15);
-const ACCURACYCOIN_APU_DMA: (u16, u16, u8) = (5, 19, 5);
+const ACCURACYCOIN_PPU: (u16, u16, u8) = (11, 33, 15);
+const ACCURACYCOIN_APU_DMA: (u16, u16, u8) = (19, 19, 5);
 
 #[derive(Clone)]
 pub struct LibraryEntry {
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(ready.accuracy.as_ref().unwrap().score, 100);
         assert_eq!(ready.accuracy.as_ref().unwrap().rating, "High");
         assert_eq!(ready.accuracy.as_ref().unwrap().mapper_coverage, "Focused");
-        assert_eq!(ready.accuracy.as_ref().unwrap().passed, 101);
+        assert_eq!(ready.accuracy.as_ref().unwrap().passed, 118);
         assert_eq!(ready.accuracy.as_ref().unwrap().total, 141);
         assert!(
             library
@@ -1130,7 +1130,7 @@ mod tests {
         let estimate = estimate_accuracy(&nes, &rom);
 
         assert_eq!(estimate.score, 95);
-        assert_eq!(estimate.passed, 101);
+        assert_eq!(estimate.passed, 118);
         assert_eq!(estimate.total, 141);
         assert_eq!(estimate.rating, "High");
         assert_eq!(estimate.mapper_coverage, "Partial");
@@ -1146,8 +1146,8 @@ mod tests {
     fn accuracycoin_category_weights_match_the_supplied_test_array() {
         assert_eq!(accuracycoin_penalty(ACCURACYCOIN_OFFICIAL_CPU), 0);
         assert_eq!(accuracycoin_penalty(ACCURACYCOIN_UNOFFICIAL_CPU), 0);
-        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_PPU), 11);
-        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_APU_DMA), 4);
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_PPU), 10);
+        assert_eq!(accuracycoin_penalty(ACCURACYCOIN_APU_DMA), 0);
         assert_eq!(
             ACCURACYCOIN_OFFICIAL_CPU.0
                 + ACCURACYCOIN_UNOFFICIAL_CPU.0
@@ -1183,7 +1183,7 @@ mod tests {
 
         let estimate = estimate_accuracy(&nes, &rom);
 
-        assert_eq!(estimate.score, 91);
+        assert_eq!(estimate.score, 93);
         assert!(
             estimate
                 .details
@@ -1194,7 +1194,7 @@ mod tests {
             estimate
                 .details
                 .iter()
-                .any(|detail| detail.contains("APU/DMA -2 at 50% exposure"))
+                .any(|detail| detail.contains("APU/DMA -0 at 50% exposure"))
         );
     }
 
@@ -1211,12 +1211,12 @@ mod tests {
 
         let estimate = estimate_accuracy(&nes, &rom);
 
-        assert_eq!(estimate.score, 96);
+        assert_eq!(estimate.score, 100);
         assert!(
             estimate
                 .details
                 .iter()
-                .any(|detail| detail.contains("APU/DMA -4 at 100% exposure"))
+                .any(|detail| detail.contains("APU/DMA -0 at 100% exposure"))
         );
     }
 

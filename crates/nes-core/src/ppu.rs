@@ -94,7 +94,11 @@ pub struct Ppu {
     frame: Frame,
     #[serde(skip, default = "default_output_palette")]
     output_palette: OutputPalette,
-    #[serde(skip, default)]
+    // Keep the canonical palette indices with snapshots. Reconstructing them
+    // from RGB pixels is lossy when a palette has duplicate colors, and makes
+    // Vs. System's scrambled RGB palette visibly corrupt for a frame on
+    // rewind restore.
+    #[serde(default)]
     frame_color_indices: Vec<u8>,
     // Pattern bytes live in PPU shift registers on hardware. Keeping a
     // scanline cache also ensures mapper latches see one fetch per tile rather
@@ -224,7 +228,14 @@ impl Ppu {
                 0xff
             }
             4 => {
-                let value = self.oam[self.oam_address as usize];
+                // Sprite attribute bytes expose only palette, priority, and
+                // flip bits. The three unused middle bits read as low.
+                let value = self.oam[self.oam_address as usize]
+                    & if self.oam_address & 3 == 2 {
+                        0xe3
+                    } else {
+                        0xff
+                    };
                 self.update_open_bus(value, 0xff);
                 value
             }
@@ -1191,6 +1202,16 @@ mod tests {
         assert_eq!(ppu.oam[1], 0x12);
         assert_eq!(ppu.oam_address, 5);
         assert_eq!(ppu.cpu_read(4, &mut cartridge), 0xff);
+    }
+
+    #[test]
+    fn oamdata_masks_unused_sprite_attribute_bits_on_read() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.oam_address = 2;
+        ppu.oam[2] = 0xff;
+
+        assert_eq!(ppu.cpu_read(4, &mut cartridge), 0xe3);
     }
 
     #[test]

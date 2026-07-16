@@ -48,9 +48,9 @@ impl Controller {
         self.coin
     }
 
-    pub(crate) fn write_strobe(&mut self, value: u8) {
+    pub(crate) fn write_strobe(&mut self, value: u8, sample_latch: bool) {
         let new_strobe = value & 1 != 0;
-        if self.strobe || new_strobe {
+        if sample_latch && (self.strobe || new_strobe) {
             self.shift = self.buttons;
         }
         self.strobe = new_strobe;
@@ -82,8 +82,8 @@ mod tests {
         let mut pad = Controller::default();
         pad.set_button(Button::A, true);
         pad.set_button(Button::Start, true);
-        pad.write_strobe(1);
-        pad.write_strobe(0);
+        pad.write_strobe(1, true);
+        pad.write_strobe(0, true);
         let bits: Vec<_> = (0..8).map(|_| pad.read() & 1).collect();
         assert_eq!(bits, vec![1, 0, 0, 1, 0, 0, 0, 0]);
     }
