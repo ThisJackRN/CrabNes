@@ -10,6 +10,7 @@ use crate::{
     cartridge::{Cartridge, CartridgeError},
     controller::Controller,
     cpu::{Cpu, CpuError, CpuState},
+    fceux_state::{FceuxState, FceuxStateError},
     ppu::{Frame, PpuState},
 };
 
@@ -281,6 +282,33 @@ impl Nes {
         }
         self.cpu = state.cpu;
         self.powered = state.powered;
+        Ok(())
+    }
+
+    /// Import an FCEUX FCS state embedded in a text FM2 movie.
+    ///
+    /// FCS is emulator-internal rather than a console standard. This bridge
+    /// deliberately accepts only the chunked state fields and mapper family
+    /// that CrabNes can translate without guessing.
+    pub fn import_fceux_state(&mut self, bytes: &[u8]) -> Result<(), FceuxStateError> {
+        let state = FceuxState::parse(bytes)?;
+        if self.mapper_id() != 4 {
+            return Err(FceuxStateError::UnsupportedMapper(self.mapper_id()));
+        }
+        let mut cpu = self.cpu.clone();
+        cpu.import_fceux_state(
+            state.byte(1, b"A\0\0\0")?,
+            state.byte(1, b"X\0\0\0")?,
+            state.byte(1, b"Y\0\0\0")?,
+            state.byte(1, b"S\0\0\0")?,
+            state.word(1, b"PC\0\0")?,
+            state.byte(1, b"P\0\0\0")?,
+            state.byte(2, b"JAMM")? != 0,
+            state.byte(2, b"MooP")?,
+        );
+        self.bus.import_fceux_state(&state)?;
+        self.cpu = cpu;
+        self.powered = true;
         Ok(())
     }
 

@@ -4,6 +4,7 @@ use crate::{
     apu::Apu,
     cartridge::{Cartridge, CartridgeSnapshot},
     controller::Controller,
+    fceux_state::{FceuxMmc3State, FceuxState, FceuxStateError},
     ppu::Ppu,
 };
 
@@ -85,6 +86,102 @@ impl Bus {
         let value = self.read_untimed(address);
         self.record_nmi_line();
         value
+    }
+
+    pub(crate) fn import_fceux_state(&mut self, state: &FceuxState) -> Result<(), FceuxStateError> {
+        let ram = state.required(1, b"RAM\0", 0x800)?;
+        let data_bus = state.byte(1, b"DB\0\0")?;
+        let nametable = state.required(3, b"NTAR", 0x800)?;
+        let palette = state.required(3, b"PRAM", 0x20)?;
+        let oam = state.required(3, b"SPRA", 0x100)?;
+        let ppu_registers = state.required(3, b"PPUR", 4)?;
+        let fine_x = state.byte(3, b"XOFF")?;
+        let write_latch = state.byte(3, b"VTGL")? != 0;
+        let vram_address = state.word(3, b"RADD")?;
+        let temp_address = state.word(3, b"TADD")?;
+        let read_buffer = state.byte(3, b"VBUF")?;
+        let ppu_open_bus = state.byte(3, b"PGEN")?;
+        let scanline = i32::from_le_bytes(state.required(31, b"PST0", 4)?.try_into().unwrap());
+        let dot = i32::from_le_bytes(state.required(31, b"PST1", 4)?.try_into().unwrap());
+        let odd_frame = state.byte(3, b"KOOK")? != 0;
+
+        let joy_read_bits = state.required(4, b"JYRB", 2)?;
+        let joy = state.required(4, b"JOYS", 4)?;
+        let last_strobe = state.byte(4, b"LSTS")? != 0;
+
+        let psg = state.required(5, b"PSG\0", 16)?;
+        let enabled = state.byte(5, b"ENCH")?;
+        let irq_frame_mode = state.byte(5, b"IQFM")?;
+        let dmc_format = state.byte(5, b"5FMT")?;
+        let dmc_output = state.byte(5, b"RWDA")?;
+        let dmc_address = state.byte(5, b"5ADL")?;
+        let dmc_length = state.byte(5, b"5SZL")?;
+
+        let prg_ram = state.required(16, b"WRAM", 0x2000)?.to_vec();
+        let banks: [u8; 8] = state.required(16, b"REGS", 8)?.try_into().unwrap();
+        let irq_low = u32::from_le_bytes(state.required(2, b"IQLB", 4)?.try_into().unwrap());
+        let mapper = FceuxMmc3State {
+            bank_select: state.byte(16, b"CMD\0")?,
+            banks,
+            mirroring: state.byte(16, b"A000")?,
+            ram_control: state.byte(16, b"A001")?,
+            irq_reload: state.byte(16, b"IRQR")? != 0,
+            irq_counter: state.byte(16, b"IRQC")?,
+            irq_latch: state.byte(16, b"IRQL")?,
+            irq_enabled: state.byte(16, b"IRQA")? != 0,
+            irq_pending: irq_low & 0x001 != 0,
+            prg_ram,
+        };
+        if !self.cartridge.import_fceux_mmc3(&mapper) {
+            return Err(FceuxStateError::UnsupportedMapper(
+                self.cartridge.mapper_id(),
+            ));
+        }
+
+        self.ram.copy_from_slice(ram);
+        self.ppu.import_fceux_state(
+            nametable,
+            palette,
+            oam,
+            ppu_registers,
+            fine_x,
+            write_latch,
+            vram_address,
+            temp_address,
+            read_buffer,
+            ppu_open_bus,
+            scanline,
+            dot,
+            odd_frame,
+        );
+        let region = self.cartridge.region();
+        self.apu.import_fceux_state(
+            region,
+            psg,
+            enabled,
+            dmc_format,
+            dmc_output,
+            dmc_address,
+            dmc_length,
+            irq_frame_mode,
+        );
+        for port in 0..2 {
+            self.controllers[port].import_fceux_serial_state(
+                joy[port],
+                joy_read_bits[port],
+                last_strobe,
+            );
+        }
+        self.oam_dma = None;
+        self.dmc_dma = None;
+        self.cpu_cycles = 0;
+        self.internal_data_bus = data_bus;
+        self.open_bus = data_bus;
+        self.dmc_completed_last_cpu_slot = false;
+        self.cpu_sequence_cycles = 0;
+        self.nmi_samples.clear();
+        self.irq_samples.clear();
+        Ok(())
     }
 
     fn read_untimed(&mut self, address: u16) -> u8 {

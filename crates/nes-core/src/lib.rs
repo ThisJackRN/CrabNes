@@ -9,6 +9,7 @@ pub mod cartridge;
 pub mod controller;
 pub mod cpu;
 pub mod emulator;
+mod fceux_state;
 pub mod ppu;
 pub mod timing;
 
@@ -16,6 +17,7 @@ pub use apu::{ApuChannel, ApuState};
 pub use cartridge::{Cartridge, CartridgeError, Mirroring};
 pub use controller::{Button, Controller};
 pub use emulator::{EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VERSION, StateError};
+pub use fceux_state::FceuxStateError;
 pub use ppu::{
     FRAME_HEIGHT, FRAME_WIDTH, Frame, NTSC_2C02_PALETTE, OutputPalette, PpuState, RGB_2C03_PALETTE,
     RGB_2C04_0004_PALETTE,

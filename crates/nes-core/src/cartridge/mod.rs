@@ -334,6 +334,10 @@ impl Cartridge {
         snapshot.mapper_id == self.mapper_id && self.mapper.restore_snapshot(&snapshot.mapper)
     }
 
+    pub(crate) fn import_fceux_mmc3(&mut self, state: &crate::fceux_state::FceuxMmc3State) -> bool {
+        self.mapper_id == 4 && self.mapper.import_fceux_mmc3(state)
+    }
+
     pub(crate) fn prg_rom(&self) -> &[u8] {
         self.mapper.prg_rom()
     }

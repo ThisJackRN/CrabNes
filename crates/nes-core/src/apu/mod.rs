@@ -121,6 +121,36 @@ impl Apu {
         self.channel_output_enabled = channel_output_enabled;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_fceux_state(
+        &mut self,
+        region: Region,
+        psg: &[u8],
+        enabled: u8,
+        dmc_format: u8,
+        dmc_output: u8,
+        dmc_address: u8,
+        dmc_length: u8,
+        irq_frame_mode: u8,
+    ) {
+        self.reset(region);
+        for (register, &value) in psg.iter().enumerate() {
+            self.write(0x4000 + register as u16, value);
+        }
+        self.write(0x4010, dmc_format);
+        self.write(0x4011, dmc_output);
+        self.write(0x4012, dmc_address);
+        self.write(0x4013, dmc_length);
+        self.write(0x4015, enabled);
+        // FCEUX stores an internal normalized mode here (the supplied value
+        // is not necessarily a literal $4017 write). Preserve the two pieces
+        // that affect program-visible behavior.
+        let frame_counter =
+            (u8::from(irq_frame_mode & 2 != 0) << 7) | (u8::from(irq_frame_mode & 1 != 0) << 6);
+        self.write(0x4017, frame_counter);
+        self.samples.clear();
+    }
+
     pub fn write(&mut self, address: u16, value: u8) {
         match address {
             0x4000..=0x4003 => self.pulse[0].write((address - 0x4000) as u8, value),

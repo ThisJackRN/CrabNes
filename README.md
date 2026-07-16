@@ -86,7 +86,8 @@ run the workflow manually or [build from source](#build-from-source).
 - Versioned save states with screenshots and ROM validation.
 - LZ4-compressed rewind: two minutes by default, configurable up to ten minutes.
 - TAS recording, playback, rerecording, frame editing, seeking, and checkpoints.
-- FCEUX `.fm2` and BizHawk `.bk2`/`Input Log.txt` movie import.
+- FCEUX `.fm2` and BizHawk `.bk2`/`Input Log.txt` movie import, including
+  checksum-checked embedded FCEUX MMC3 start states.
 - Debugger, guarded hex editor, custom palettes, and optional CRT rendering.
 - Standard, Speedrun, and Achievement play profiles.
 - RetroAchievements sign-in, badge artwork, progress, unlock archive, and

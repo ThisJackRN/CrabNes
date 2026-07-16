@@ -6,6 +6,7 @@ use super::{
     mmc5::Mmc5Snapshot, n163::N163Snapshot, nrom::NromSnapshot, uxrom::UxromSnapshot,
     vrc::VrcSnapshot, vrc6::Vrc6Snapshot, vrc7::Vrc7Snapshot,
 };
+use crate::fceux_state::FceuxMmc3State;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum MapperSnapshot {
@@ -61,6 +62,9 @@ pub trait Mapper {
     fn load_battery_ram(&mut self, _data: &[u8]) {}
     fn snapshot(&self) -> MapperSnapshot;
     fn restore_snapshot(&mut self, snapshot: &MapperSnapshot) -> bool;
+    fn import_fceux_mmc3(&mut self, _state: &FceuxMmc3State) -> bool {
+        false
+    }
     fn prg_rom(&self) -> &[u8];
     fn chr(&self) -> &[u8];
     fn chr_is_writable(&self) -> bool {

@@ -248,6 +248,97 @@ impl Default for Ppu {
 }
 
 impl Ppu {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_fceux_state(
+        &mut self,
+        nametable: &[u8],
+        palette: &[u8],
+        oam: &[u8],
+        registers: &[u8],
+        fine_x: u8,
+        write_latch: bool,
+        vram_address: u16,
+        temp_address: u16,
+        read_buffer: u8,
+        open_bus: u8,
+        scanline: i32,
+        dot: i32,
+        odd_frame: bool,
+    ) {
+        self.nametable[..0x800].copy_from_slice(nametable);
+        self.nametable[0x800..0x1000].copy_from_slice(nametable);
+        self.palette.copy_from_slice(palette);
+        self.oam.copy_from_slice(oam);
+        self.secondary_oam.fill(0xff);
+        self.oam_data_bus = 0;
+        self.oam_bus_primary_address = 0;
+        self.oam_bus_secondary_address = 0;
+        self.oam_bus_copy_remaining = 0;
+        self.oam_bus_post_wrap_replay = 0;
+        self.oam_bus_evaluation_done = false;
+        self.oam_bus_idle_value = 0xff;
+        self.oam_bus_overflow_aligned = false;
+        self.control = registers[0];
+        self.mask = registers[1];
+        self.pending_mask = None;
+        self.status = registers[2];
+        self.oam_address = registers[3];
+        self.oam_evaluation_start_address = registers[3];
+        self.vram_address = vram_address & 0x7fff;
+        self.temp_address = temp_address & 0x7fff;
+        self.fine_x = fine_x & 7;
+        self.write_latch = write_latch;
+        self.read_buffer = read_buffer;
+        self.external_address_high = 0;
+        self.external_low_latch = 0;
+        self.external_data_bus = 0;
+        self.pending_ppudata_read = None;
+        self.open_bus = open_bus;
+        self.open_bus_decay = restored_open_bus_decay();
+        self.scroll_x = ((temp_address as u8 & 0x1f) << 3) | self.fine_x;
+        self.scroll_y =
+            (((temp_address >> 5) as u8 & 0x1f) << 3) | ((temp_address >> 12) as u8 & 7);
+        self.line_origin_x = 0;
+        self.line_origin_y = 0;
+        self.line_origin_address = self.vram_address;
+        self.background_pipeline_warmup = 0;
+        self.background_pattern_lo = 0;
+        self.background_pattern_hi = 0;
+        self.background_attribute_lo = 0;
+        self.background_attribute_hi = 0;
+        self.next_background_tile = 0;
+        self.next_background_attribute = 0;
+        self.next_background_pattern_lo = 0;
+        self.next_background_pattern_hi = 0;
+        self.corrupt_next_pattern_low = false;
+        self.hybrid_nametable_low = None;
+
+        // FCEUX FM2 savestates are normally captured at the vblank frame
+        // boundary. Move past CrabNes's frame-complete edge so the first FM2
+        // input record runs a full frame instead of stopping one dot later.
+        let at_frame_boundary = scanline == 241 && dot <= 1;
+        self.scanline = scanline.clamp(-1, 260) as i16;
+        self.dot = if at_frame_boundary {
+            2
+        } else {
+            dot.clamp(0, 340) as u16
+        };
+        if at_frame_boundary {
+            self.status |= 0x80;
+        }
+        self.frame_complete = false;
+        self.nmi_output_active = at_frame_boundary || (self.status & 0x80 != 0);
+        self.nmi_pending = at_frame_boundary && self.control & 0x80 != 0;
+        self.suppress_vblank = false;
+        self.odd_frame = odd_frame;
+        self.evaluated_sprites.clear();
+        self.next_sprites.clear();
+        self.next_sprites_valid = false;
+        self.active_sprites.clear();
+        self.oam_corruption_pending = None;
+        self.sprite_overflow_pending = false;
+    }
+
     pub fn set_output_palette(&mut self, palette: OutputPalette) {
         if self.frame_color_indices.len() == FRAME_WIDTH * FRAME_HEIGHT {
             for (pixel, &index) in self
