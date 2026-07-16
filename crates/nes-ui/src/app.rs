@@ -225,6 +225,8 @@ pub struct App {
     achievement_badges: HashMap<String, TextureHandle>,
     achievement_badges_requested: HashSet<String>,
     achievement_toasts: VecDeque<AchievementToast>,
+    achievement_known_unlocked: HashSet<u32>,
+    achievement_game_mastered: bool,
     settings: Settings,
     active_play_mode: PlayMode,
     per_game: PerGameSettings,
@@ -357,11 +359,13 @@ impl App {
             achievement_password: String::new(),
             achievement_feed: VecDeque::new(),
             achievement_panel: AchievementPanel::CurrentSet,
-            achievement_filter: AchievementFilter::All,
+            achievement_filter: AchievementFilter::Locked,
             achievement_archive: AchievementArchive::load(),
             achievement_badges: HashMap::new(),
             achievement_badges_requested: HashSet::new(),
             achievement_toasts: VecDeque::new(),
+            achievement_known_unlocked: HashSet::new(),
+            achievement_game_mastered: false,
             settings,
             active_play_mode: play_mode,
             per_game: PerGameSettings::default(),
@@ -1151,27 +1155,26 @@ impl App {
                 ui.separator();
                 ui.selectable_value(&mut self.page, MainPage::Game, "Game");
                 ui.selectable_value(&mut self.page, MainPage::Library, "Library");
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.settings.video.show_fps {
-                        ui.label(format!("{:.1} FPS", self.measured_fps));
-                        ui.separator();
-                    }
-                    if let Some(nes) = &self.nes {
-                        let region = match nes.region() {
-                            Region::Ntsc => "NTSC",
-                            Region::Pal => "PAL",
-                        };
-                        ui.label(format!("{region} · {:.2} Hz", nes.frame_rate()));
-                        ui.separator();
-                    }
-                    let frame = self.nes.as_ref().map_or(0, |nes| nes.frame().number);
-                    ui.label(format!("Frame {frame} · Lag {}", self.lag_frames));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(if self.paused { "Paused" } else { "Running" });
+                ui.separator();
+                ui.label(self.play_mode().label());
+                ui.separator();
+                let frame = self.nes.as_ref().map_or(0, |nes| nes.frame().number);
+                ui.label(format!("Frame {frame} · Lag {}", self.lag_frames));
+                if let Some(nes) = &self.nes {
                     ui.separator();
-                    ui.label(self.play_mode().label());
+                    let region = match nes.region() {
+                        Region::Ntsc => "NTSC",
+                        Region::Pal => "PAL",
+                    };
+                    ui.label(format!("{region} · {:.2} Hz", nes.frame_rate()));
+                }
+                if self.settings.video.show_fps {
                     ui.separator();
-                    ui.label(if self.paused { "Paused" } else { "Running" });
-                });
+                    ui.label(format!("{:.1} FPS", self.measured_fps));
+                }
             });
         });
 
@@ -1244,10 +1247,15 @@ impl App {
                 size = Vec2::new(available.y * aspect, available.y);
             }
             if self.settings.video.integer_scaling {
-                let scale = (size.x / FRAME_WIDTH as f32)
-                    .min(size.y / FRAME_HEIGHT as f32)
-                    .floor()
-                    .max(1.0);
+                let available_scale =
+                    (size.x / FRAME_WIDTH as f32).min(size.y / FRAME_HEIGHT as f32);
+                let scale = if available_scale >= 1.0 {
+                    available_scale.floor()
+                } else {
+                    // A fractional fallback keeps the complete frame visible when the
+                    // native resolution cannot fit in a small or snapped window.
+                    available_scale.max(0.01)
+                };
                 size = Vec2::new(FRAME_WIDTH as f32 * scale, FRAME_HEIGHT as f32 * scale);
             }
             ui.vertical_centered(|ui| {
@@ -1417,7 +1425,7 @@ impl App {
                                     ));
                                 }
                                 ui.add_space(8.0);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     let (ready, unavailable) = match &entry.status {
                                         EntryStatus::Ready => (true, String::new()),
                                         EntryStatus::Missing => {
@@ -1523,6 +1531,7 @@ impl App {
             egui::Window::new("Rename Library Game")
                 .collapsible(false)
                 .resizable(false)
+                .max_size(floating_window_max_size(ui.ctx()))
                 .show(ui, |ui| {
                     ui.label("Library title");
                     let response = ui.text_edit_singleline(&mut self.library_rename_text);
@@ -1599,7 +1608,7 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
                 ui.separator();
                 ui.label(format!("{}x", self.current_speed()));
@@ -1674,6 +1683,8 @@ impl App {
             .open(&mut open)
             .default_width(680.0)
             .default_height(620.0)
+            .min_size([320.0, 260.0])
+            .max_size(floating_window_max_size(ui.ctx()))
             .resizable(true)
             .show(ui, |ui| {
                 egui::Frame::new()
@@ -1714,15 +1725,35 @@ impl App {
                         });
                     });
 
+                if user.is_some() {
+                    if ui
+                        .checkbox(
+                            &mut self.settings.achievements.show_replayed_unlocks,
+                            "Show previously earned unlock popups",
+                        )
+                        .changed()
+                    {
+                        self.settings_dirty = true;
+                    }
+                    ui.small(
+                        "Off by default. Completed achievements remain available under All and Unlocked below.",
+                    );
+                }
+
                 for warning in &client_warnings {
                     achievement_warning_banner(ui, warning);
                 }
 
                 if user.is_none() {
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Username");
-                        ui.text_edit_singleline(&mut self.settings.achievements.username);
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.settings.achievements.username,
+                            )
+                            .desired_width(150.0),
+                        );
                         ui.label("Password");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.achievement_password)
@@ -1744,7 +1775,7 @@ impl App {
                 }
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
                         &mut self.achievement_panel,
                         AchievementPanel::CurrentSet,
@@ -1756,14 +1787,7 @@ impl App {
                         format!("Unlock archive ({})", archive_entries.len()),
                     );
                     if user.is_some() {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("Sign out").clicked() {
-                                    logout = true;
-                                }
-                            },
-                        );
+                        logout = ui.small_button("Sign out").clicked();
                     }
                 });
                 ui.separator();
@@ -1785,7 +1809,7 @@ impl App {
                                 .map(|achievement| achievement.points)
                                 .sum();
                             ui.heading(&game.title);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(format!(
                                     "{unlocked}/{} unlocked",
                                     achievement_rows.len()
@@ -1801,7 +1825,7 @@ impl App {
                                 unlocked as f32 / achievement_rows.len() as f32
                             };
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Show:");
                                 ui.selectable_value(
                                     &mut self.achievement_filter,
@@ -1944,10 +1968,14 @@ impl App {
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(true)
-            .constrain(false)
+            .default_size([640.0, 520.0])
+            .min_size([320.0, 240.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .vscroll(true)
+            .constrain(true)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Drag this window beyond the game area if needed.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Resize the window or scroll to reach every setting.");
                     if ui.button("Close Settings").clicked() {
                         close_requested = true;
                     }
@@ -2286,6 +2314,11 @@ impl App {
         let mut delete = false;
         egui::Window::new("Save States")
             .open(&mut open)
+            .default_size([360.0, 420.0])
+            .min_size([280.0, 220.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .resizable(true)
+            .vscroll(true)
             .show(ui, |ui| {
                 if self.nes.is_none() {
                     ui.label("Load a ROM first.");
@@ -2311,9 +2344,13 @@ impl App {
                     ui.label("Empty slot");
                 }
                 if let Some(texture) = &self.state_preview {
-                    ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(256.0, 240.0)));
+                    let scale = (ui.available_width() / 256.0).min(1.0).max(0.1);
+                    ui.add(
+                        egui::Image::new(texture)
+                            .fit_to_exact_size(Vec2::new(256.0 * scale, 240.0 * scale)),
+                    );
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     save = ui.button("Save").clicked();
                     load = ui
                         .add_enabled(
@@ -2362,6 +2399,11 @@ impl App {
         let mut open = self.show_time;
         egui::Window::new("Rewind & Speed")
             .open(&mut open)
+            .default_size([460.0, 300.0])
+            .min_size([280.0, 180.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .resizable(true)
+            .vscroll(true)
             .show(ui, |ui| {
                 speed_ui(ui, &mut self.speed_index);
                 ui.checkbox(&mut self.fast_forward, "Fast forward (audio muted)");
@@ -2457,7 +2499,10 @@ impl App {
         egui::Window::new("TAS Editor")
             .open(&mut open)
             .resizable(true)
-            .default_width(940.0)
+            .default_size([940.0, 720.0])
+            .min_size([360.0, 280.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .vscroll(true)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.menu_button("New movie", |ui| {
@@ -2581,12 +2626,20 @@ impl App {
                         ui.monospace(format!("ROM {}…", &movie.rom_sha256[..12]));
                     });
                     ui.add_enabled_ui(!read_only, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Author");
-                            ui.text_edit_singleline(movie.author.get_or_insert_with(String::new));
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    movie.author.get_or_insert_with(String::new),
+                                )
+                                .desired_width(180.0),
+                            );
                             ui.label("Description");
-                            ui.text_edit_singleline(
-                                movie.description.get_or_insert_with(String::new),
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    movie.description.get_or_insert_with(String::new),
+                                )
+                                .desired_width(260.0),
                             );
                         });
                     });
@@ -2662,7 +2715,7 @@ impl App {
                             ui.add_enabled_ui(!read_only, |ui| {
                                 input_mask_editor(ui, &mut input.player1, "Player 1", selected);
                                 input_mask_editor(ui, &mut input.player2, "Player 2", selected);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("Copy previous frame").clicked() && selected > 0 {
                                         input = movie.frames[selected - 1];
                                     }
@@ -2717,7 +2770,7 @@ impl App {
                         // could outrun the virtualized viewport.
                         let row_height = ui.spacing().interact_size.y;
                         let row_stride = row_height + ui.spacing().item_spacing.y;
-                        let mut timeline = egui::ScrollArea::vertical()
+                        let mut timeline = egui::ScrollArea::both()
                             .id_salt("tas-v1-timeline")
                             .max_height(380.0)
                             .auto_shrink([false, false])
@@ -2779,14 +2832,14 @@ impl App {
 
                     ui.separator();
                     ui.strong("Bookmarks / markers");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.text_edit_singleline(&mut self.tas.marker_label);
                         add_marker = ui
                             .add_enabled(!read_only, egui::Button::new("Add at selected"))
                             .clicked();
                     });
                     for marker in movie.markers.clone() {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui
                                 .link(format!("Frame {} — {}", marker.frame, marker.label))
                                 .clicked()
@@ -2898,7 +2951,10 @@ impl App {
         egui::Window::new("TAS Control View")
             .open(&mut open)
             .resizable(true)
-            .default_width(900.0)
+            .default_size([900.0, 680.0])
+            .min_size([360.0, 280.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .vscroll(true)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     load = ui.button("Open movie…").clicked();
@@ -2985,7 +3041,7 @@ impl App {
                     } else {
                         self.tas_control_selected =
                             self.tas_control_selected.min(movie.frames.len() - 1);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Inspect frame");
                             if ui
                                 .add(
@@ -3007,7 +3063,7 @@ impl App {
                         });
                         let row_height = ui.spacing().interact_size.y;
                         let row_stride = row_height + ui.spacing().item_spacing.y;
-                        let mut inputs = egui::ScrollArea::vertical()
+                        let mut inputs = egui::ScrollArea::both()
                             .id_salt("tas-control-inputs")
                             .max_height(420.0)
                             .auto_shrink([false, false]);
@@ -3285,7 +3341,7 @@ impl App {
         }
 
         if let Some(capture) = self.binding_capture {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let (kind, target) = match capture {
                     BindingCapture::Keyboard { player, button } => (
                         "key",
@@ -3379,107 +3435,111 @@ impl App {
         ui.separator();
         ui.strong("VS System arcade controls");
         ui.small("These apply automatically to supported Nintendo VS arcade games.");
-        egui::Grid::new(ui.id().with("vs-arcade-inputs"))
-            .striped(true)
-            .show(ui, |ui| {
-                ui.strong("Arcade input");
-                ui.strong("Keyboard");
-                ui.strong("Controller");
-                ui.end_row();
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::Grid::new(ui.id().with("vs-arcade-inputs"))
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Arcade input");
+                    ui.strong("Keyboard");
+                    ui.strong("Controller");
+                    ui.end_row();
 
-                ui.label("Insert coin");
-                let coin_key_capture = BindingCapture::VsCoinKeyboard;
-                let coin_key_label = if self.binding_capture == Some(coin_key_capture) {
-                    "Press a key…"
-                } else {
-                    self.settings.input.vs_coin_binding.label()
-                };
-                if ui.button(coin_key_label).clicked() {
-                    self.binding_capture = Some(coin_key_capture);
-                }
-                let coin_gamepad_capture = BindingCapture::VsCoinGamepad;
-                let coin_gamepad_label = if self.binding_capture == Some(coin_gamepad_capture) {
-                    "Press input…".into()
-                } else {
-                    self.settings
-                        .input
-                        .vs_coin_gamepad_binding
-                        .map(gamepad_binding_label)
-                        .unwrap_or_else(|| "Select + Start chord".into())
-                };
-                let response = ui.button(coin_gamepad_label).on_hover_text(
-                    "Click to capture. Right-click to restore the Select+Start chord.",
-                );
-                if response.clicked() {
-                    self.binding_capture = Some(coin_gamepad_capture);
-                }
-                if response.secondary_clicked() {
-                    self.settings.input.vs_coin_gamepad_binding = None;
-                    if self.binding_capture == Some(coin_gamepad_capture) {
-                        self.binding_capture = None;
+                    ui.label("Insert coin");
+                    let coin_key_capture = BindingCapture::VsCoinKeyboard;
+                    let coin_key_label = if self.binding_capture == Some(coin_key_capture) {
+                        "Press a key…"
+                    } else {
+                        self.settings.input.vs_coin_binding.label()
+                    };
+                    if ui.button(coin_key_label).clicked() {
+                        self.binding_capture = Some(coin_key_capture);
                     }
-                    changed = true;
-                }
-                ui.end_row();
+                    let coin_gamepad_capture = BindingCapture::VsCoinGamepad;
+                    let coin_gamepad_label = if self.binding_capture == Some(coin_gamepad_capture) {
+                        "Press input…".into()
+                    } else {
+                        self.settings
+                            .input
+                            .vs_coin_gamepad_binding
+                            .map(gamepad_binding_label)
+                            .unwrap_or_else(|| "Select + Start chord".into())
+                    };
+                    let response = ui.button(coin_gamepad_label).on_hover_text(
+                        "Click to capture. Right-click to restore the Select+Start chord.",
+                    );
+                    if response.clicked() {
+                        self.binding_capture = Some(coin_gamepad_capture);
+                    }
+                    if response.secondary_clicked() {
+                        self.settings.input.vs_coin_gamepad_binding = None;
+                        if self.binding_capture == Some(coin_gamepad_capture) {
+                            self.binding_capture = None;
+                        }
+                        changed = true;
+                    }
+                    ui.end_row();
 
-                ui.label("Start 1 player");
-                let select_key_capture = BindingCapture::Keyboard {
-                    player: 0,
-                    button: 2,
-                };
-                let select_key_label = if self.binding_capture == Some(select_key_capture) {
-                    "Press a key…"
-                } else {
-                    self.settings.input.bindings[2].label()
-                };
-                if ui.button(select_key_label).clicked() {
-                    self.binding_capture = Some(select_key_capture);
-                }
-                let select_gamepad_capture = BindingCapture::Gamepad {
-                    player: 0,
-                    button: 2,
-                };
-                let select_gamepad_label = if self.binding_capture == Some(select_gamepad_capture) {
-                    "Press input…".into()
-                } else {
-                    self.settings.input.gamepad_bindings[2]
-                        .map(gamepad_binding_label)
-                        .unwrap_or_else(|| "Not bound".into())
-                };
-                if ui.button(select_gamepad_label).clicked() {
-                    self.binding_capture = Some(select_gamepad_capture);
-                }
-                ui.end_row();
+                    ui.label("Start 1 player");
+                    let select_key_capture = BindingCapture::Keyboard {
+                        player: 0,
+                        button: 2,
+                    };
+                    let select_key_label = if self.binding_capture == Some(select_key_capture) {
+                        "Press a key…"
+                    } else {
+                        self.settings.input.bindings[2].label()
+                    };
+                    if ui.button(select_key_label).clicked() {
+                        self.binding_capture = Some(select_key_capture);
+                    }
+                    let select_gamepad_capture = BindingCapture::Gamepad {
+                        player: 0,
+                        button: 2,
+                    };
+                    let select_gamepad_label =
+                        if self.binding_capture == Some(select_gamepad_capture) {
+                            "Press input…".into()
+                        } else {
+                            self.settings.input.gamepad_bindings[2]
+                                .map(gamepad_binding_label)
+                                .unwrap_or_else(|| "Not bound".into())
+                        };
+                    if ui.button(select_gamepad_label).clicked() {
+                        self.binding_capture = Some(select_gamepad_capture);
+                    }
+                    ui.end_row();
 
-                ui.label("Start 2 players");
-                let start_key_capture = BindingCapture::Keyboard {
-                    player: 0,
-                    button: 3,
-                };
-                let start_key_label = if self.binding_capture == Some(start_key_capture) {
-                    "Press a key…"
-                } else {
-                    self.settings.input.bindings[3].label()
-                };
-                if ui.button(start_key_label).clicked() {
-                    self.binding_capture = Some(start_key_capture);
-                }
-                let start_gamepad_capture = BindingCapture::Gamepad {
-                    player: 0,
-                    button: 3,
-                };
-                let start_gamepad_label = if self.binding_capture == Some(start_gamepad_capture) {
-                    "Press input…".into()
-                } else {
-                    self.settings.input.gamepad_bindings[3]
-                        .map(gamepad_binding_label)
-                        .unwrap_or_else(|| "Not bound".into())
-                };
-                if ui.button(start_gamepad_label).clicked() {
-                    self.binding_capture = Some(start_gamepad_capture);
-                }
-                ui.end_row();
-            });
+                    ui.label("Start 2 players");
+                    let start_key_capture = BindingCapture::Keyboard {
+                        player: 0,
+                        button: 3,
+                    };
+                    let start_key_label = if self.binding_capture == Some(start_key_capture) {
+                        "Press a key…"
+                    } else {
+                        self.settings.input.bindings[3].label()
+                    };
+                    if ui.button(start_key_label).clicked() {
+                        self.binding_capture = Some(start_key_capture);
+                    }
+                    let start_gamepad_capture = BindingCapture::Gamepad {
+                        player: 0,
+                        button: 3,
+                    };
+                    let start_gamepad_label = if self.binding_capture == Some(start_gamepad_capture)
+                    {
+                        "Press input…".into()
+                    } else {
+                        self.settings.input.gamepad_bindings[3]
+                            .map(gamepad_binding_label)
+                            .unwrap_or_else(|| "Not bound".into())
+                    };
+                    if ui.button(start_gamepad_label).clicked() {
+                        self.binding_capture = Some(start_gamepad_capture);
+                    }
+                    ui.end_row();
+                });
+        });
 
         let player1 = self.gamepad_mask(0, &self.settings.input.gamepad_bindings);
         let player2 = self.gamepad_mask(1, &self.settings.input.player2_gamepad_bindings);
@@ -3498,8 +3558,11 @@ impl App {
         let mut open = self.show_input;
         egui::Window::new("Input Configuration")
             .open(&mut open)
-            .default_width(760.0)
+            .default_size([760.0, 660.0])
+            .min_size([320.0, 260.0])
+            .max_size(floating_window_max_size(ui.ctx()))
             .resizable(true)
+            .vscroll(true)
             .show(ui, |ui| {
                 if self.input_mapping_ui(ui) {
                     self.settings_dirty = true;
@@ -3522,6 +3585,11 @@ impl App {
         let mut import_palette = false;
         egui::Window::new("Audio / Video")
             .open(&mut open)
+            .default_size([520.0, 600.0])
+            .min_size([300.0, 240.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .resizable(true)
+            .vscroll(true)
             .show(ui, |ui| {
                 let mut changed = false;
                 changed |= ui
@@ -3605,6 +3673,11 @@ impl App {
         let mut open = self.show_debugger;
         egui::Window::new("Debugger")
             .open(&mut open)
+            .default_size([520.0, 240.0])
+            .min_size([300.0, 180.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .resizable(true)
+            .vscroll(true)
             .show(ui, |ui| {
                 if let Some(nes) = &self.nes {
                     let c = nes.cpu_state();
@@ -3631,7 +3704,7 @@ impl App {
                 } else {
                     ui.label("No ROM loaded");
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .button(if self.paused { "Resume" } else { "Pause" })
                         .clicked()
@@ -3657,7 +3730,11 @@ impl App {
         let mut open = self.show_hex;
         egui::Window::new("Hex Editor")
             .open(&mut open)
+            .default_size([820.0, 560.0])
+            .min_size([340.0, 260.0])
+            .max_size(floating_window_max_size(ui.ctx()))
             .resizable(true)
+            .vscroll(true)
             .show(ui, |ui| {
                 let Some(nes) = &mut self.nes else {
                     ui.label("No ROM loaded");
@@ -3690,7 +3767,7 @@ impl App {
                 } else {
                     "Read-only"
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Address");
                     ui.text_edit_singleline(&mut self.hex_jump);
                     if ui.button("Jump").clicked()
@@ -3713,8 +3790,9 @@ impl App {
                             & !15;
                     }
                 });
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .max_height(380.0)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for row in 0..self.settings.debugging.hex_rows {
                             let offset = self.hex_start + row * 16;
@@ -3753,7 +3831,7 @@ impl App {
                         }
                     });
                 if let Some(offset) = self.hex_selected {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Offset {offset:04X}"));
                         ui.text_edit_singleline(&mut self.hex_value);
                         if ui
@@ -4276,6 +4354,9 @@ impl App {
             (_, None) => "ROM loaded".into(),
         };
         if self.play_mode() == PlayMode::Achievement && self.achievements.user().is_some() {
+            self.achievement_toasts.clear();
+            self.achievement_known_unlocked.clear();
+            self.achievement_game_mastered = false;
             if let Err(error) = self.achievements.load_game(&path, &self.rom_bytes) {
                 self.status = format!("ROM loaded; achievements could not start: {error}");
             } else {
@@ -4765,6 +4846,8 @@ impl App {
             self.achievements.unload_game();
             self.show_achievements = false;
             self.achievement_toasts.clear();
+            self.achievement_known_unlocked.clear();
+            self.achievement_game_mastered = false;
         }
         self.active_play_mode = mode;
         self.fast_forward = false;
@@ -4826,6 +4909,8 @@ impl App {
         if self.rom_bytes.is_empty() {
             return;
         }
+        self.achievement_known_unlocked.clear();
+        self.achievement_game_mastered = false;
         match self.achievements.load_game(path, &self.rom_bytes) {
             Ok(()) => self.status = "Loading RetroAchievements set…".into(),
             Err(error) => self.status = format!("Could not load achievement set: {error}"),
@@ -4858,6 +4943,10 @@ impl App {
                     };
                 }
                 AchievementEventKind::GameLoad if event.result == 0 => {
+                    let rows = self.achievements.achievements();
+                    let (known_unlocked, mastered) = achievement_unlock_baseline(&rows);
+                    self.achievement_known_unlocked = known_unlocked;
+                    self.achievement_game_mastered = mastered;
                     if let Some(game) = self.achievements.game() {
                         self.status = format!("Achievements loaded: {} (hardcore)", game.title);
                     } else {
@@ -4888,6 +4977,14 @@ impl App {
                         };
                         continue;
                     }
+                    let (first_unlock, show_notification) = register_achievement_unlock(
+                        &mut self.achievement_known_unlocked,
+                        event.id,
+                        self.settings.achievements.show_replayed_unlocks,
+                    );
+                    if !show_notification {
+                        continue;
+                    }
                     let game = self.achievements.game();
                     let description = details
                         .as_ref()
@@ -4906,7 +5003,7 @@ impl App {
                         badge_url: badge_url.clone(),
                         started_at: None,
                     });
-                    if let Some(game) = game {
+                    if first_unlock && let Some(game) = game {
                         let archive_result = self.achievement_archive.record(UnlockEntry {
                             game_id: game.id,
                             achievement_id: event.id,
@@ -4928,12 +5025,18 @@ impl App {
                     self.status = text;
                 }
                 AchievementEventKind::GameCompleted => {
+                    let already_mastered = self.achievement_game_mastered;
+                    self.achievement_game_mastered = true;
+                    if already_mastered && !self.settings.achievements.show_replayed_unlocks {
+                        continue;
+                    }
                     let text = "Game mastered — all core achievements unlocked".to_owned();
                     self.push_achievement_activity(text.clone());
                     self.status = text;
                 }
                 AchievementEventKind::Reset => {
                     self.reset();
+                    self.achievement_toasts.clear();
                     self.status = "Reset for RetroAchievements hardcore mode".into();
                 }
                 AchievementEventKind::Disconnected
@@ -5037,8 +5140,9 @@ impl App {
                     .corner_radius(12)
                     .inner_margin(12)
                     .show(ui, |ui| {
-                        ui.set_width(430.0);
-                        ui.horizontal(|ui| {
+                        let toast_width = (ctx.content_rect().width() - 48.0).clamp(240.0, 430.0);
+                        ui.set_width(toast_width);
+                        ui.horizontal_wrapped(|ui| {
                             if let Some(texture) = &texture {
                                 ui.add(
                                     egui::Image::new(texture)
@@ -5134,6 +5238,14 @@ impl App {
     }
 }
 
+fn floating_window_max_size(ctx: &egui::Context) -> Vec2 {
+    let available = ctx.content_rect().size();
+    Vec2::new(
+        (available.x - 24.0).max(280.0),
+        (available.y - 24.0).max(180.0),
+    )
+}
+
 fn inferred_region_from_rom_path(path: &Path) -> Option<Region> {
     let file_name = path.file_name()?.to_str()?.to_ascii_lowercase();
     const PAL_TAGS: [&str; 11] = [
@@ -5166,6 +5278,39 @@ fn is_achievement_client_warning(achievement: &nes_achievements_native::Achievem
     achievement.bucket == AchievementBucket::Unsupported
         || achievement.id == 0
         || is_achievement_warning_title(&achievement.title)
+}
+
+fn achievement_unlock_baseline(
+    achievements: &[nes_achievements_native::Achievement],
+) -> (HashSet<u32>, bool) {
+    let mut known_unlocked = HashSet::new();
+    let mut core_count = 0usize;
+    let mut core_unlocked = 0usize;
+    for achievement in achievements
+        .iter()
+        .filter(|achievement| !is_achievement_client_warning(achievement))
+    {
+        if achievement.unlocked {
+            known_unlocked.insert(achievement.id);
+        }
+        if achievement.bucket != AchievementBucket::Unofficial {
+            core_count += 1;
+            core_unlocked += usize::from(achievement.unlocked);
+        }
+    }
+    (
+        known_unlocked,
+        core_count != 0 && core_unlocked == core_count,
+    )
+}
+
+fn register_achievement_unlock(
+    known_unlocked: &mut HashSet<u32>,
+    achievement_id: u32,
+    show_replayed: bool,
+) -> (bool, bool) {
+    let first_unlock = known_unlocked.insert(achievement_id);
+    (first_unlock, first_unlock || show_replayed)
 }
 
 fn is_achievement_warning_title(title: &str) -> bool {
@@ -5290,12 +5435,12 @@ fn achievement_card(
                             .color(egui::Color32::from_gray(180)),
                     );
                     if !achievement.measured_progress.is_empty() {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.add(
                                 egui::ProgressBar::new(
                                     (achievement.measured_percent / 100.0).clamp(0.0, 1.0),
                                 )
-                                .desired_width(180.0),
+                                .desired_width(ui.available_width().min(180.0)),
                             );
                             ui.small(&achievement.measured_progress);
                         });
@@ -5457,7 +5602,7 @@ fn palette_settings_ui(
                 ui.selectable_value(&mut video.palette_mode, mode, mode.label());
             }
         });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button("Import palette…").clicked() {
             *import_requested = true;
         }
@@ -5931,14 +6076,16 @@ fn load_battery(nes: &mut Nes, rom_path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod input_filter_tests {
     use std::{
+        collections::HashSet,
         path::Path,
         time::{Duration, Instant},
     };
 
     use super::{
-        RewindCapture, RewindPoint, advance_rewind_deadline, inferred_region_from_rom_path,
-        is_achievement_client_warning, is_archived_achievement_warning, low_input_active,
-        neutralize_opposite_directions,
+        RewindCapture, RewindPoint, achievement_unlock_baseline, advance_rewind_deadline,
+        inferred_region_from_rom_path, is_achievement_client_warning,
+        is_archived_achievement_warning, low_input_active, neutralize_opposite_directions,
+        register_achievement_unlock,
     };
     use crate::achievement_archive::UnlockEntry;
     use nes_achievements_native::{Achievement, AchievementBucket};
@@ -6029,6 +6176,46 @@ mod input_filter_tests {
             unlocked_at: 0,
         };
         assert!(is_archived_achievement_warning(&archived));
+    }
+
+    #[test]
+    fn achievement_baseline_suppresses_completed_unlock_replays() {
+        let achievement = |id, unlocked, bucket| Achievement {
+            id,
+            points: 5,
+            unlocked,
+            bucket,
+            measured_percent: 0.0,
+            title: format!("Achievement {id}"),
+            description: String::new(),
+            measured_progress: String::new(),
+            badge_url: String::new(),
+            badge_locked_url: String::new(),
+        };
+        let rows = [
+            achievement(1, true, AchievementBucket::Unlocked),
+            achievement(2, true, AchievementBucket::Unlocked),
+            achievement(3, false, AchievementBucket::Unofficial),
+            achievement(0, true, AchievementBucket::Unsupported),
+        ];
+        let (mut known, mastered) = achievement_unlock_baseline(&rows);
+        assert_eq!(known, HashSet::from([1, 2]));
+        assert!(mastered);
+        assert_eq!(
+            register_achievement_unlock(&mut known, 1, false),
+            (false, false),
+            "a reboot replay is suppressed by default"
+        );
+        assert_eq!(
+            register_achievement_unlock(&mut known, 1, true),
+            (false, true),
+            "the saved preference can opt back into replay popups"
+        );
+        assert_eq!(
+            register_achievement_unlock(&mut known, 4, false),
+            (true, true),
+            "a newly earned achievement always produces a notification"
+        );
     }
 
     #[test]

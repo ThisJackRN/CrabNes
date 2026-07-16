@@ -258,6 +258,10 @@ pub struct DebugSettings {
 pub struct AchievementSettings {
     pub username: String,
     pub token: String,
+    /// Re-display unlock events that were already earned when a game loaded.
+    /// Disabled by default so completed games do not flood the player with
+    /// historical notifications after a reset or restart.
+    pub show_replayed_unlocks: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -505,6 +509,7 @@ mod tests {
         assert_eq!(settings.general.play_mode, PlayMode::Standard);
         assert!(settings.achievements.username.is_empty());
         assert!(settings.achievements.token.is_empty());
+        assert!(!settings.achievements.show_replayed_unlocks);
         assert_eq!(
             settings.video.crt_halation_strength,
             VideoSettings::default().crt_halation_strength
