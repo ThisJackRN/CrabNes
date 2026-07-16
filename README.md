@@ -14,10 +14,10 @@ RetroAchievements support.
 
 ## Measured emulation accuracy
 
-**83.7% — 118 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
+**94.3% — 133 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
 
 This is CrabNes's current automated hardware-conformance test pass rate, not a
-claim that every NES game is exactly 83.7% accurate. Compatibility varies by
+claim that every NES game is exactly 94.3% accurate. Compatibility varies by
 game, mapper, and the hardware behavior it relies on. The score is updated only
 when it has been reproduced with the headless runner:
 

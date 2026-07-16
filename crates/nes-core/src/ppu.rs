@@ -45,6 +45,14 @@ struct CachedBackgroundTile {
     attribute: u8,
 }
 
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+struct EvaluatedSprite {
+    bytes: [u8; 4],
+    sprite_zero: bool,
+    pattern_lo: u8,
+    pattern_hi: u8,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Frame {
     /// RGB888 pixels, row major.
@@ -72,6 +80,8 @@ pub struct Ppu {
     mask: u8,
     status: u8,
     oam_address: u8,
+    #[serde(default)]
+    oam_evaluation_start_address: u8,
     vram_address: u16,
     temp_address: u16,
     fine_x: u8,
@@ -84,10 +94,16 @@ pub struct Ppu {
     scroll_y: u8,
     line_origin_x: usize,
     line_origin_y: usize,
+    #[serde(default)]
+    line_origin_address: u16,
+    #[serde(default)]
+    background_pipeline_warmup: u8,
     scanline: i16,
     dot: u16,
     frame_complete: bool,
     nmi_pending: bool,
+    #[serde(default)]
+    nmi_output_active: bool,
     #[serde(default)]
     suppress_vblank: bool,
     odd_frame: bool,
@@ -105,8 +121,18 @@ pub struct Ppu {
     // than one fetch per output pixel.
     #[serde(skip, default)]
     background_tiles: Vec<CachedBackgroundTile>,
-    #[serde(skip, default)]
-    sprite_patterns: Vec<Option<(u8, u8)>>,
+    #[serde(default)]
+    evaluated_sprites: Vec<EvaluatedSprite>,
+    #[serde(default)]
+    next_sprites: Vec<EvaluatedSprite>,
+    #[serde(default)]
+    next_sprites_valid: bool,
+    #[serde(default)]
+    active_sprites: Vec<EvaluatedSprite>,
+    #[serde(default)]
+    oam_corruption_pending: Option<u8>,
+    #[serde(default)]
+    sprite_overflow_pending: bool,
 }
 
 impl Default for Ppu {
@@ -119,6 +145,7 @@ impl Default for Ppu {
             mask: 0,
             status: 0,
             oam_address: 0,
+            oam_evaluation_start_address: 0,
             vram_address: 0,
             temp_address: 0,
             fine_x: 0,
@@ -130,17 +157,25 @@ impl Default for Ppu {
             scroll_y: 0,
             line_origin_x: 0,
             line_origin_y: 0,
+            line_origin_address: 0,
+            background_pipeline_warmup: 0,
             scanline: -1,
             dot: 0,
             frame_complete: false,
             nmi_pending: false,
+            nmi_output_active: false,
             suppress_vblank: false,
             odd_frame: false,
             frame: Frame::default(),
             output_palette: default_output_palette(),
             frame_color_indices: vec![0; FRAME_WIDTH * FRAME_HEIGHT],
             background_tiles: Vec::new(),
-            sprite_patterns: Vec::new(),
+            evaluated_sprites: Vec::new(),
+            next_sprites: Vec::new(),
+            next_sprites_valid: false,
+            active_sprites: Vec::new(),
+            oam_corruption_pending: None,
+            sprite_overflow_pending: false,
         }
     }
 }
@@ -199,33 +234,60 @@ impl Ppu {
         self.mask = 0;
         self.status &= 0x1f;
         self.oam_address = 0;
+        self.oam_evaluation_start_address = 0;
         self.vram_address = 0;
         self.temp_address = 0;
         self.fine_x = 0;
         self.write_latch = false;
+        self.line_origin_address = 0;
+        self.background_pipeline_warmup = 0;
         self.scanline = -1;
         self.dot = 0;
         self.frame_complete = false;
         self.nmi_pending = false;
+        self.nmi_output_active = false;
         self.suppress_vblank = false;
+        self.evaluated_sprites.clear();
+        self.next_sprites.clear();
+        self.next_sprites_valid = false;
+        self.active_sprites.clear();
+        self.oam_corruption_pending = None;
+        self.sprite_overflow_pending = false;
     }
 
     pub fn cpu_read(&mut self, register: u16, cartridge: &mut Cartridge) -> u8 {
         match register & 7 {
             2 => {
-                let value = (self.status & 0xe0) | (self.open_bus & 0x1f);
+                // PPUSTATUS latches vblank near the beginning of the CPU read,
+                // while the sprite flags remain live until its end. At the
+                // pre-render boundary this exposes cleared sprite flags one
+                // dot before the vblank bit appears clear.
+                let sprite_flags = if self.scanline == -1 && self.dot == 1 {
+                    0
+                } else {
+                    self.status & 0x60
+                };
+                let value = sprite_flags | (self.status & 0x80) | (self.open_bus & 0x1f);
                 if self.scanline == 241 && self.dot <= 1 {
                     self.suppress_vblank = true;
                 }
                 self.status &= !0x80;
+                self.nmi_output_active = false;
                 self.write_latch = false;
                 self.nmi_pending = false;
                 self.update_open_bus(value, 0xe0);
                 value
             }
-            4 if self.rendering_oam_access() => {
+            4 if self.rendering_oam_read_returns_ff() => {
                 self.update_open_bus(0xff, 0xff);
                 0xff
+            }
+            4 if self.rendering_oam_evaluation_read() => {
+                let offset = ((self.dot - 65) / 2) as u8;
+                let address = self.oam_evaluation_start_address.wrapping_add(offset);
+                let value = self.oam[address as usize] & if address & 3 == 2 { 0xe3 } else { 0xff };
+                self.update_open_bus(value, 0xff);
+                value
             }
             4 => {
                 // Sprite attribute bytes expose only palette, priority, and
@@ -270,19 +332,44 @@ impl Ppu {
                 let nmi_was_off = self.control & 0x80 == 0;
                 self.control = value;
                 self.temp_address = (self.temp_address & !0x0c00) | (((value as u16) & 3) << 10);
-                if nmi_was_off && value & 0x80 != 0 && self.status & 0x80 != 0 {
+                if nmi_was_off && value & 0x80 != 0 && self.nmi_output_active {
                     self.nmi_pending = true;
                 } else if value & 0x80 == 0 {
                     self.nmi_pending = false;
                 }
             }
-            1 => self.mask = value,
+            1 => {
+                let was_rendering = self.mask & 0x18 != 0;
+                let will_render = value & 0x18 != 0;
+                if was_rendering && !will_render {
+                    if self.scanline == -1 || (0..240).contains(&self.scanline) {
+                        // Disabling the rendering pipeline leaves its current
+                        // secondary-OAM address as the seed for the next
+                        // rendering start. The transfer itself is deferred.
+                        let row = ((self.dot.saturating_add(1) / 2) as u8).clamp(1, 31);
+                        self.oam_corruption_pending = Some(row);
+                    } else {
+                        // Re-enabling and disabling again during blanking does
+                        // not let a pending transfer reach an active scanline.
+                        self.oam_corruption_pending = None;
+                    }
+                }
+                if self.mask & 0x18 == 0 && value & 0x18 != 0 {
+                    // A disabled rendering pipeline does not clock or refill
+                    // its 16-bit background shift registers. It takes two
+                    // tile fetch groups before newly fetched pixels reach the
+                    // output after rendering is enabled in the picture area.
+                    self.background_pipeline_warmup = 16;
+                }
+                self.mask = value;
+            }
             3 => self.oam_address = value,
             4 => {
-                if self.rendering_oam_access() {
+                if self.rendering_oam_write_blocked() {
                     // During rendering OAM is owned by sprite evaluation. CPU
-                    // writes do not reach OAM and advance the address by four.
-                    self.oam_address = self.oam_address.wrapping_add(4);
+                    // writes do not reach OAM. The internal row counter moves
+                    // to the next aligned four-byte group.
+                    self.oam_address = self.oam_address.wrapping_add(4) & 0xfc;
                 } else {
                     self.oam[self.oam_address as usize] = value;
                     self.oam_address = self.oam_address.wrapping_add(1);
@@ -333,6 +420,17 @@ impl Ppu {
     pub(crate) fn clock_for_region(&mut self, cartridge: &mut Cartridge, region: Region) {
         self.clock_open_bus_decay();
         let rendering = self.mask & 0x18 != 0;
+        if self.dot == 0 && (self.scanline == -1 || (0..240).contains(&self.scanline)) {
+            if rendering && let Some(row) = self.oam_corruption_pending.take() {
+                let source: [u8; 8] = self.oam[..8].try_into().unwrap();
+                let start = usize::from(row) * 8;
+                self.oam[start..start + 8].copy_from_slice(&source);
+            }
+            if self.next_sprites_valid {
+                self.active_sprites = std::mem::take(&mut self.next_sprites);
+                self.next_sprites_valid = false;
+            }
+        }
         if rendering && self.scanline >= 0 && self.scanline < 240 && self.dot == 1 {
             self.capture_line_origin();
             if matches!(cartridge.mapper_id(), 9 | 10) {
@@ -345,25 +443,50 @@ impl Ppu {
             self.render_pixel(self.dot as usize - 1, self.scanline as usize, cartridge);
         }
 
+        // The PPU's NMI output changes one dot before the readable vblank
+        // flag. Keep this window separate so precisely timed $2000 writes
+        // see the hardware boundary without moving $2002's tested timing.
+        if self.scanline == 241 && self.dot == 0 {
+            self.nmi_output_active = true;
+            if self.control & 0x80 != 0 {
+                self.nmi_pending = true;
+            }
+        } else if self.scanline == -1 && self.dot == 0 {
+            self.nmi_output_active = false;
+        }
+
         if self.scanline == -1 && self.dot == 1 {
             self.status &= !0xe0;
         } else if self.scanline == 241 && self.dot == 1 {
             if self.suppress_vblank {
                 self.suppress_vblank = false;
                 self.status &= !0x80;
+                self.nmi_output_active = false;
+                self.nmi_pending = false;
             } else {
                 self.status |= 0x80;
             }
             self.frame_complete = true;
             self.frame.number = self.frame.number.wrapping_add(1);
-            if self.status & 0x80 != 0 && self.control & 0x80 != 0 {
-                self.nmi_pending = true;
-            }
         }
 
         if rendering && (self.scanline == -1 || (0..240).contains(&self.scanline)) {
-            if (0..240).contains(&self.scanline) && self.dot == 65 {
-                self.evaluate_sprite_overflow(self.scanline as usize);
+            if self.background_pipeline_warmup != 0
+                && ((1..=256).contains(&self.dot) || (321..=336).contains(&self.dot))
+            {
+                self.background_pipeline_warmup -= 1;
+            }
+            if (257..=320).contains(&self.dot) {
+                // Sprite evaluation owns OAM during rendering. While the
+                // sprite pattern fetches run, the hardware repeatedly forces
+                // OAMADDR to zero so a following DMA starts at sprite zero.
+                self.oam_address = 0;
+            }
+            if self.dot == 65 {
+                self.evaluate_sprites_for_next_scanline();
+            } else if self.dot == 130 && self.sprite_overflow_pending {
+                self.status |= 0x20;
+                self.sprite_overflow_pending = false;
             }
             if (8..=256).contains(&self.dot) && self.dot.is_multiple_of(8) {
                 self.increment_coarse_x();
@@ -372,16 +495,8 @@ impl Ppu {
                 self.increment_render_y();
             } else if self.dot == 257 {
                 self.copy_horizontal_scroll();
-                if matches!(cartridge.mapper_id(), 9 | 10) {
-                    let next_scanline = if self.scanline < 0 {
-                        0
-                    } else {
-                        self.scanline as usize + 1
-                    };
-                    self.cache_next_scanline_sprites(next_scanline, cartridge);
-                } else {
-                    self.sprite_patterns.clear();
-                }
+            } else if self.dot == 264 {
+                self.fetch_evaluated_sprite_patterns(cartridge);
             }
             if self.scanline == -1 && (280..=304).contains(&self.dot) {
                 self.copy_vertical_scroll();
@@ -521,25 +636,113 @@ impl Ppu {
         }
     }
 
-    fn rendering_oam_access(&self) -> bool {
+    fn rendering_oam_read_returns_ff(&self) -> bool {
         self.mask & 0x18 != 0
             && (self.scanline == -1 || (0..240).contains(&self.scanline))
-            && (1..=320).contains(&self.dot)
+            && ((1..=64).contains(&self.dot) || (257..=320).contains(&self.dot))
     }
 
-    fn evaluate_sprite_overflow(&mut self, scanline: usize) {
+    fn rendering_oam_write_blocked(&self) -> bool {
+        self.mask & 0x18 != 0 && (self.scanline == -1 || (0..240).contains(&self.scanline))
+    }
+
+    fn rendering_oam_evaluation_read(&self) -> bool {
+        self.mask & 0x18 != 0
+            && (self.scanline == -1 || (0..240).contains(&self.scanline))
+            && (65..=256).contains(&self.dot)
+    }
+
+    fn evaluate_sprites_for_next_scanline(&mut self) {
         let sprite_height = if self.control & 0x20 != 0 { 16 } else { 8 };
-        let mut sprites = 0;
-        for sprite in self.oam.chunks_exact(4) {
-            let top = sprite[0] as usize + 1;
-            if scanline >= top && scanline < top + sprite_height {
-                sprites += 1;
-                if sprites > 8 {
-                    self.status |= 0x20;
+        let start_address = self.oam_address;
+        self.oam_evaluation_start_address = start_address;
+        let mut address = start_address;
+        let mut inspected = 0u16;
+        self.evaluated_sprites.clear();
+        self.sprite_overflow_pending = false;
+
+        while inspected < 64 && self.evaluated_sprites.len() < 8 {
+            let y = self.oam[address as usize];
+            if sprite_y_in_range(self.scanline, y, sprite_height) {
+                let mut bytes = [0; 4];
+                for byte in &mut bytes {
+                    *byte = self.oam[address as usize];
+                    address = address.wrapping_add(1);
+                }
+                self.evaluated_sprites.push(EvaluatedSprite {
+                    bytes,
+                    sprite_zero: inspected == 0,
+                    ..EvaluatedSprite::default()
+                });
+                // The X byte is also fed through the range comparator. When
+                // it misses, the next Y read is realigned down to that byte.
+                if !sprite_y_in_range(self.scanline, bytes[3], sprite_height) {
+                    address &= 0xfc;
+                }
+            } else {
+                address = address.wrapping_add(4) & 0xfc;
+            }
+            inspected += 1;
+            if address == start_address {
+                break;
+            }
+        }
+
+        // Once secondary OAM is full, the diagonal overflow scan advances
+        // five bytes after a miss. A hit is enough to assert the flag.
+        if self.evaluated_sprites.len() == 8 {
+            while inspected < 64 {
+                let candidate = self.oam[address as usize];
+                if sprite_y_in_range(self.scanline, candidate, sprite_height) {
+                    self.sprite_overflow_pending = true;
+                    break;
+                }
+                address = address.wrapping_add(5);
+                inspected += 1;
+                if address == start_address {
                     break;
                 }
             }
         }
+        self.oam_address = address;
+    }
+
+    fn fetch_evaluated_sprite_patterns(&mut self, cartridge: &mut Cartridge) {
+        let sprite_height = if self.control & 0x20 != 0 { 16 } else { 8 };
+        let scanline = self.scanline as u8;
+        self.next_sprites = self.evaluated_sprites.clone();
+        for index in 0..self.next_sprites.len() {
+            let sprite = self.next_sprites[index];
+            let tile = sprite.bytes[1];
+            let attributes = sprite.bytes[2];
+            let mut row = usize::from(scanline.wrapping_sub(sprite.bytes[0]));
+            if attributes & 0x80 != 0 {
+                row = sprite_height - 1 - row.min(sprite_height - 1);
+            }
+            let (pattern_base, tile_number, tile_row) = if sprite_height == 16 {
+                let table = (tile as u16 & 1) * 0x1000;
+                let tile_number = (tile as u16 & 0xfe) + (row / 8) as u16;
+                (table, tile_number, row & 7)
+            } else {
+                let table = if self.control & 0x08 != 0 { 0x1000 } else { 0 };
+                (table, tile as u16, row & 7)
+            };
+            let address = pattern_base + tile_number * 16 + tile_row as u16;
+            let pattern_lo = self.read_memory(address, cartridge);
+            let pattern_hi = self.read_memory(address + 8, cartridge);
+            self.next_sprites[index].pattern_lo = pattern_lo;
+            self.next_sprites[index].pattern_hi = pattern_hi;
+        }
+        let dummy_address = if sprite_height == 16 {
+            0x1fe0
+        } else {
+            (if self.control & 0x08 != 0 { 0x1000 } else { 0 }) + 0x0ff0
+        };
+        for _ in self.next_sprites.len()..8 {
+            self.read_memory(dummy_address, cartridge);
+            self.read_memory(dummy_address + 8, cartridge);
+        }
+        self.next_sprites_valid = true;
     }
 
     fn read_memory(&mut self, address: u16, cartridge: &mut Cartridge) -> u8 {
@@ -583,108 +786,66 @@ impl Ppu {
         let mut color = universal;
         let mut background_pixel = 0;
 
-        if self.mask & 0x08 != 0 && (x >= 8 || self.mask & 0x02 != 0) {
-            let world_x = (self.line_origin_x + x) % 512;
-            let world_y = self.line_origin_y % 480;
-            let table_x = world_x / 256;
-            let table_y = world_y / 240;
-            let local_x = world_x % 256;
-            let local_y = world_y % 240;
-            let table = table_y * 2 + table_x;
-            let tile_x = local_x / 8;
-            let tile_y = local_y / 8;
-            let (pattern_lo, pattern_hi, attribute, bit) = if let Some(cached) = self
-                .background_tiles
-                .get(((self.line_origin_x & 7) + x) / 8)
-            {
-                (
-                    cached.pattern_lo,
-                    cached.pattern_hi,
-                    cached.attribute,
-                    7 - (local_x & 7),
-                )
-            } else {
-                let name_addr = 0x2000 + table as u16 * 0x400 + (tile_y * 32 + tile_x) as u16;
-                let attribute_addr =
-                    0x23c0 + table as u16 * 0x400 + ((tile_y / 4) * 8 + tile_x / 4) as u16;
-                let tile = self.read_memory(name_addr, cartridge);
-                let attribute = self.read_memory(attribute_addr, cartridge);
-                let pattern_base = if self.control & 0x10 != 0 { 0x1000 } else { 0 };
-                let row = (local_y & 7) as u16;
-                (
-                    self.read_memory(pattern_base + tile as u16 * 16 + row, cartridge),
-                    self.read_memory(pattern_base + tile as u16 * 16 + row + 8, cartridge),
-                    attribute,
-                    7 - (local_x & 7),
-                )
-            };
+        if self.mask & 0x08 != 0
+            && self.background_pipeline_warmup == 0
+            && (x >= 8 || self.mask & 0x02 != 0)
+        {
+            let pixel_x = self.fine_x as usize + x;
+            let coarse_x_total = (self.line_origin_address & 0x001f) as usize + pixel_x / 8;
+            let coarse_x = coarse_x_total & 0x1f;
+            let nametable_x =
+                ((self.line_origin_address >> 10) as usize & 1) ^ ((coarse_x_total / 32) & 1);
+            let tile_address =
+                (self.line_origin_address & !0x041f) | (nametable_x as u16) << 10 | coarse_x as u16;
+            let name_addr = 0x2000 | (tile_address & 0x0fff);
+            let attribute_addr = 0x23c0
+                | (tile_address & 0x0c00)
+                | ((tile_address >> 4) & 0x38)
+                | ((tile_address >> 2) & 0x07);
+            let row = (tile_address >> 12) & 7;
+            let bit = 7 - (pixel_x & 7);
+            let attribute_shift = (((tile_address >> 4) & 4) | (tile_address & 2)) as u8;
+            let (pattern_lo, pattern_hi, attribute, bit) =
+                if let Some(cached) = self.background_tiles.get(pixel_x / 8) {
+                    (cached.pattern_lo, cached.pattern_hi, cached.attribute, bit)
+                } else {
+                    let tile = self.read_memory(name_addr, cartridge);
+                    let attribute = self.read_memory(attribute_addr, cartridge);
+                    let pattern_base = if self.control & 0x10 != 0 { 0x1000 } else { 0 };
+                    (
+                        self.read_memory(pattern_base + tile as u16 * 16 + row, cartridge),
+                        self.read_memory(pattern_base + tile as u16 * 16 + row + 8, cartridge),
+                        attribute,
+                        bit,
+                    )
+                };
             background_pixel = ((pattern_lo >> bit) & 1) | (((pattern_hi >> bit) & 1) << 1);
             if background_pixel != 0 {
-                let shift = ((tile_y & 2) * 2 + (tile_x & 2)) as u8;
-                let palette = (attribute >> shift) & 3;
+                let palette = (attribute >> attribute_shift) & 3;
                 color =
                     self.palette[(palette as usize * 4 + background_pixel as usize) & 0x1f] & 0x3f;
             }
         }
 
         if self.mask & 0x10 != 0 && (x >= 8 || self.mask & 0x04 != 0) {
-            let sprite_height = if self.control & 0x20 != 0 { 16 } else { 8 };
-            let mut sprites_on_line = 0;
-            for sprite_index in 0..64 {
-                let base = sprite_index * 4;
-                // OAM stores one less than the first visible scanline.
-                let sprite_y = self.oam[base] as usize + 1;
-                if y < sprite_y || y >= sprite_y + sprite_height {
-                    continue;
-                }
-                sprites_on_line += 1;
-                if sprites_on_line > 8 {
-                    break;
-                }
-
-                let sprite_x = self.oam[base + 3] as usize;
+            for sprite in &self.active_sprites {
+                let sprite_x = sprite.bytes[3] as usize;
                 if x < sprite_x || x >= sprite_x + 8 {
                     continue;
                 }
-                let tile = self.oam[base + 1];
-                let attributes = self.oam[base + 2];
-                let mut row = y - sprite_y;
+                let attributes = sprite.bytes[2];
                 let mut column = x - sprite_x;
-                if attributes & 0x80 != 0 {
-                    row = sprite_height - 1 - row;
-                }
                 if attributes & 0x40 != 0 {
                     column = 7 - column;
                 }
-
-                let (pattern_base, tile_number, tile_row) = if sprite_height == 16 {
-                    let table = (tile as u16 & 1) * 0x1000;
-                    let tile_number = (tile as u16 & 0xfe) + (row / 8) as u16;
-                    (table, tile_number, row & 7)
-                } else {
-                    let table = if self.control & 0x08 != 0 { 0x1000 } else { 0 };
-                    (table, tile as u16, row)
-                };
-                let address = pattern_base + tile_number * 16 + tile_row as u16;
-                let (lo, hi) = if self.sprite_patterns.is_empty() {
-                    (
-                        self.read_memory(address, cartridge),
-                        self.read_memory(address + 8, cartridge),
-                    )
-                } else if let Some(pattern) =
-                    self.sprite_patterns.get(sprite_index).copied().flatten()
-                {
-                    pattern
-                } else {
-                    continue;
-                };
                 let bit = 7 - column;
-                let sprite_pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+                let sprite_pixel =
+                    ((sprite.pattern_lo >> bit) & 1) | (((sprite.pattern_hi >> bit) & 1) << 1);
                 if sprite_pixel == 0 {
                     continue;
                 }
 
-                if sprite_index == 0 && background_pixel != 0 && x != 0 && x != 255 {
+                if sprite.sprite_zero && background_pixel != 0 && x != 0 && x != 255 {
                     self.status |= 0x40;
                 }
                 let behind_background = attributes & 0x20 != 0;
@@ -707,6 +868,7 @@ impl Ppu {
     }
 
     fn capture_line_origin(&mut self) {
+        self.line_origin_address = self.vram_address;
         let coarse_x = (self.vram_address & 0x001f) as usize;
         let coarse_y = ((self.vram_address >> 5) & 0x001f) as usize;
         let nametable_x = ((self.vram_address >> 10) & 1) as usize;
@@ -747,57 +909,6 @@ impl Ppu {
         }
     }
 
-    fn cache_next_scanline_sprites(&mut self, y: usize, cartridge: &mut Cartridge) {
-        self.sprite_patterns.clear();
-        self.sprite_patterns.resize(64, None);
-        let sprite_height = if self.control & 0x20 != 0 { 16 } else { 8 };
-        let mut sprites_on_line = 0;
-
-        for sprite_index in 0..64 {
-            let base = sprite_index * 4;
-            let sprite_y = self.oam[base] as usize + 1;
-            if y < sprite_y || y >= sprite_y + sprite_height {
-                continue;
-            }
-            if sprites_on_line == 8 {
-                break;
-            }
-            sprites_on_line += 1;
-
-            let tile = self.oam[base + 1];
-            let attributes = self.oam[base + 2];
-            let mut row = y - sprite_y;
-            if attributes & 0x80 != 0 {
-                row = sprite_height - 1 - row;
-            }
-            let (pattern_base, tile_number, tile_row) = if sprite_height == 16 {
-                let table = (tile as u16 & 1) * 0x1000;
-                let tile_number = (tile as u16 & 0xfe) + (row / 8) as u16;
-                (table, tile_number, row & 7)
-            } else {
-                let table = if self.control & 0x08 != 0 { 0x1000 } else { 0 };
-                (table, tile as u16, row)
-            };
-            let address = pattern_base + tile_number * 16 + tile_row as u16;
-            let lo = self.read_memory(address, cartridge);
-            let hi = self.read_memory(address + 8, cartridge);
-            self.sprite_patterns[sprite_index] = Some((lo, hi));
-        }
-
-        // The PPU still fetches tile $FF for every unused one of its eight
-        // sprite slots. In 8x16 mode this reads $1FE0/$1FE8, which sets the
-        // MMC2's right-hand latch to FE before the next background fetches.
-        let dummy_address = if sprite_height == 16 {
-            0x1fe0
-        } else {
-            (if self.control & 0x08 != 0 { 0x1000 } else { 0 }) + 0x0ff0
-        };
-        for _ in sprites_on_line..8 {
-            self.read_memory(dummy_address, cartridge);
-            self.read_memory(dummy_address + 8, cartridge);
-        }
-    }
-
     fn increment_coarse_x(&mut self) {
         if self.vram_address & 0x001f == 31 {
             self.vram_address &= !0x001f;
@@ -832,6 +943,10 @@ impl Ppu {
     fn copy_vertical_scroll(&mut self) {
         self.vram_address = (self.vram_address & !0x7be0) | (self.temp_address & 0x7be0);
     }
+}
+
+fn sprite_y_in_range(scanline: i16, y: u8, sprite_height: usize) -> bool {
+    scanline >= i16::from(y) && scanline < i16::from(y) + sprite_height as i16
 }
 
 fn mirror_nametable(address: u16, mirroring: Mirroring) -> usize {
@@ -1200,8 +1315,22 @@ mod tests {
         ppu.oam[1] = 0x12;
         ppu.cpu_write(4, 0xaa, &mut cartridge);
         assert_eq!(ppu.oam[1], 0x12);
-        assert_eq!(ppu.oam_address, 5);
+        assert_eq!(ppu.oam_address, 4);
         assert_eq!(ppu.cpu_read(4, &mut cartridge), 0xff);
+    }
+
+    #[test]
+    fn sprite_fetch_window_forces_oam_address_to_zero() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.mask = 0x08;
+        ppu.scanline = 0;
+        ppu.dot = 257;
+        ppu.oam_address = 0x5d;
+
+        ppu.clock(&mut cartridge);
+
+        assert_eq!(ppu.oam_address, 0);
     }
 
     #[test]
@@ -1230,6 +1359,32 @@ mod tests {
     }
 
     #[test]
+    fn nmi_output_window_leads_the_readable_vblank_flag_by_one_dot() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.control = 0x80;
+        ppu.scanline = 241;
+        ppu.dot = 0;
+
+        ppu.clock(&mut cartridge);
+
+        assert!(ppu.nmi_output_active);
+        assert_eq!(ppu.status & 0x80, 0);
+        assert!(ppu.take_nmi());
+
+        ppu.status |= 0x80;
+        ppu.scanline = -1;
+        ppu.dot = 0;
+        ppu.clock(&mut cartridge);
+        assert!(!ppu.nmi_output_active);
+        assert_ne!(ppu.status & 0x80, 0);
+
+        ppu.cpu_write(0, 0x00, &mut cartridge);
+        ppu.cpu_write(0, 0x80, &mut cartridge);
+        assert!(!ppu.take_nmi());
+    }
+
+    #[test]
     fn sprite_overflow_is_evaluated_during_the_sprite_window() {
         let mut ppu = Ppu::default();
         let mut cartridge = test_cartridge();
@@ -1237,7 +1392,25 @@ mod tests {
         ppu.scanline = 1;
         ppu.dot = 65;
         ppu.clock(&mut cartridge);
+        assert_eq!(ppu.status & 0x20, 0);
+        assert!(ppu.sprite_overflow_pending);
+        while ppu.dot < 130 {
+            ppu.clock(&mut cartridge);
+        }
+        assert_eq!(ppu.status & 0x20, 0);
+        ppu.clock(&mut cartridge);
         assert_ne!(ppu.status & 0x20, 0);
+    }
+
+    #[test]
+    fn status_read_sees_cleared_sprite_flags_before_vblank_clears() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.status = 0xe0;
+        ppu.scanline = -1;
+        ppu.dot = 1;
+
+        assert_eq!(ppu.cpu_read(2, &mut cartridge) & 0xe0, 0x80);
     }
 
     #[test]
@@ -1283,6 +1456,10 @@ mod tests {
         ppu.palette[1] = 1;
         ppu.palette[0x11] = 2;
         ppu.oam[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        ppu.scanline = 0;
+        ppu.evaluate_sprites_for_next_scanline();
+        ppu.fetch_evaluated_sprite_patterns(&mut cartridge);
+        ppu.active_sprites = std::mem::take(&mut ppu.next_sprites);
         ppu.scanline = 1;
         ppu.dot = 1;
 
@@ -1290,6 +1467,42 @@ mod tests {
         assert_eq!(ppu.status & 0x40, 0);
         ppu.clock(&mut cartridge);
         assert_ne!(ppu.status & 0x40, 0);
+    }
+
+    #[test]
+    fn background_pipeline_refills_before_drawing_after_midline_enable() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = chr_ram_cartridge();
+        assert!(cartridge.debug_write_chr(0, 0xff));
+        ppu.palette[1] = 1;
+        ppu.scanline = 0;
+        ppu.dot = 100;
+        ppu.cpu_write(1, 0x0a, &mut cartridge);
+
+        for _ in 0..16 {
+            ppu.clock(&mut cartridge);
+        }
+        assert_eq!(ppu.background_pipeline_warmup, 0);
+        assert_eq!(ppu.frame_color_indices[115], 0);
+
+        ppu.clock(&mut cartridge);
+        assert_eq!(ppu.frame_color_indices[115], 1);
+    }
+
+    #[test]
+    fn invalid_coarse_y_fetches_attribute_bytes_as_tile_ids() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = chr_ram_cartridge();
+        assert!(cartridge.debug_write_chr(0x0252, 0xff));
+        ppu.nametable[mirror_nametable(0x2fc8, Mirroring::Horizontal)] = 0x25;
+        ppu.palette[1] = 1;
+        ppu.mask = 0x0a;
+        ppu.vram_address = 0x2fc0;
+        ppu.capture_line_origin();
+
+        ppu.render_pixel(64, 0, &mut cartridge);
+
+        assert_eq!(ppu.frame_color_indices[64], 1);
     }
 
     #[test]
@@ -1349,7 +1562,10 @@ mod tests {
         ppu.mask = 0x14;
         ppu.palette[0x11] = 1;
         ppu.oam[0..4].copy_from_slice(&[0, 0xfd, 0, 0]);
-        ppu.cache_next_scanline_sprites(1, &mut cartridge);
+        ppu.scanline = 0;
+        ppu.evaluate_sprites_for_next_scanline();
+        ppu.fetch_evaluated_sprite_patterns(&mut cartridge);
+        ppu.active_sprites = std::mem::take(&mut ppu.next_sprites);
         for x in 0..8 {
             ppu.render_pixel(x, 1, &mut cartridge);
         }
@@ -1373,7 +1589,9 @@ mod tests {
         let mut ppu = Ppu::default();
         ppu.control = 0x20;
         ppu.oam.fill(0xff);
-        ppu.cache_next_scanline_sprites(1, &mut cartridge);
+        ppu.scanline = 0;
+        ppu.evaluate_sprites_for_next_scanline();
+        ppu.fetch_evaluated_sprite_patterns(&mut cartridge);
 
         assert_eq!(cartridge.ppu_read(0x1000), Some(0x22));
     }

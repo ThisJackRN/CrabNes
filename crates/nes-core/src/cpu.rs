@@ -174,7 +174,11 @@ impl Cpu {
             return;
         }
         if bus.nmi_pending_at_slot(self.interrupt_poll_cycle) {
-            self.nmi_latched = bus.ppu.take_nmi();
+            // The 2A03 latches the NMI edge at its interrupt-poll cycle.
+            // Lowering the PPU's NMI output later in the same instruction
+            // cannot retract an edge that the CPU has already sampled.
+            self.nmi_latched = true;
+            bus.ppu.take_nmi();
         }
         let irq_at_poll = bus.irq_pending_at_slot(self.interrupt_poll_cycle);
         self.irq_poll_latched = irq_at_poll && !self.interrupt_poll_i;
@@ -1675,6 +1679,21 @@ mod tests {
         run_instruction(&mut cpu, &mut bus);
         assert!(!cpu.irq_masked_at_poll());
         assert!(cpu.flag(I));
+    }
+
+    #[test]
+    fn sampled_nmi_survives_a_later_status_read_in_the_same_instruction() {
+        let mut bus = nrom_bus(&[0xad, 0x02, 0x20]);
+        let mut cpu = Cpu {
+            pc: 0x8000,
+            ..Cpu::default()
+        };
+        bus.ppu.force_nmi_for_test();
+
+        run_instruction(&mut cpu, &mut bus);
+
+        assert!(cpu.take_latched_nmi());
+        assert!(!bus.ppu.nmi_pending());
     }
 
     #[test]

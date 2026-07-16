@@ -356,7 +356,10 @@ impl FrameCounter {
     }
 
     fn irq_pending(&self) -> bool {
-        self.irq_flag && self.irq_clear_at.is_none()
+        // The inhibited sequencer can briefly expose the frame flag through
+        // $4015 at the end of a four-step sequence. That status-latch quirk
+        // must not drive the CPU's IRQ input.
+        self.irq_flag && !self.irq_inhibit && self.irq_clear_at.is_none()
     }
 
     fn clock(&mut self, region: Region, cpu_cycles: u64) -> FrameEvents {
@@ -609,6 +612,23 @@ mod tests {
         for cycle in 4..=37_285 {
             counter.clock(Region::Ntsc, cycle);
         }
+        assert!(!counter.irq_flag);
+    }
+
+    #[test]
+    fn inhibited_frame_status_window_does_not_drive_the_irq_line() {
+        let mut counter = FrameCounter {
+            irq_inhibit: true,
+            ..FrameCounter::default()
+        };
+
+        for cycle in 1..=29_829 {
+            counter.clock(Region::Ntsc, cycle);
+        }
+
+        assert!(counter.irq_flag);
+        assert!(!counter.irq_pending());
+        counter.clock(Region::Ntsc, 29_830);
         assert!(!counter.irq_flag);
     }
 
