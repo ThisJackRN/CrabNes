@@ -13,7 +13,7 @@ pub struct Bus {
     pub apu: Apu,
     pub cartridge: Cartridge,
     pub controllers: [Controller; 2],
-    dma_stall: u16,
+    oam_dma: Option<OamDma>,
     dmc_dma: Option<DmcDma>,
     cpu_cycles: u64,
     /// Data latch inside the 2A03. A $4015 read affects this latch without
@@ -34,7 +34,7 @@ pub(crate) struct BusSnapshot {
     apu: Apu,
     cartridge: CartridgeSnapshot,
     controllers: [Controller; 2],
-    dma_stall: u16,
+    oam_dma: Option<OamDma>,
     dmc_dma: Option<DmcDma>,
     cpu_cycles: u64,
     internal_data_bus: u8,
@@ -51,7 +51,7 @@ impl Bus {
             apu: Apu::new(region),
             cartridge,
             controllers: [Controller::default(), Controller::default()],
-            dma_stall: 0,
+            oam_dma: None,
             dmc_dma: None,
             cpu_cycles: 0,
             internal_data_bus: 0,
@@ -68,7 +68,7 @@ impl Bus {
         self.ppu.reset();
         self.apu.reset(region);
         self.cartridge.reset();
-        self.dma_stall = 0;
+        self.oam_dma = None;
         self.dmc_dma = None;
         self.cpu_cycles = 0;
         self.internal_data_bus = 0;
@@ -80,7 +80,7 @@ impl Bus {
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
-        self.advance_cpu_slot(true);
+        self.advance_cpu_slot(true, Some(address));
         self.record_irq_line();
         let value = self.read_untimed(address);
         self.record_nmi_line();
@@ -120,7 +120,7 @@ impl Bus {
     }
 
     pub fn write(&mut self, address: u16, value: u8) {
-        self.advance_cpu_slot(false);
+        self.advance_cpu_slot(false, None);
         self.record_irq_line();
         self.write_untimed(address, value);
         self.record_nmi_line();
@@ -135,11 +135,24 @@ impl Bus {
         match address {
             0x0000..=0x1fff => self.ram[address as usize & 0x07ff] = value,
             0x2000..=0x3fff => self.ppu.cpu_write(address & 7, value, &mut self.cartridge),
-            0x4000..=0x4013 | 0x4015 | 0x4017 => self.apu.write(address, value),
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu.write(address, value);
+                if address == 0x4015 && value & 0x10 == 0 && self.dmc_dma.is_some() {
+                    // A disable write landing after the DMA request has
+                    // reached the CPU is latched on the following APU phase.
+                    self.apu.extend_dmc_disable_delay_for_active_dma();
+                }
+            }
             0x4014 => self.perform_oam_dma(value),
             0x4016 => {
-                self.controllers[0].write_strobe(value);
-                self.controllers[1].write_strobe(value);
+                // The CPU drives the strobe level on every write, but the
+                // controller latches an RMW pulse when it falls on the APU
+                // get phase. This makes the one-cycle high pulse visible
+                // only for the correct get/put ordering.
+                let sample_latch =
+                    self.cpu_sequence_cycles < 5 || (value & 1 == 0 && self.cpu_cycles & 1 != 0);
+                self.controllers[0].write_strobe(value, sample_latch);
+                self.controllers[1].write_strobe(value, sample_latch);
             }
             _ => {}
         }
@@ -156,7 +169,7 @@ impl Bus {
     /// sequence. Memory accesses have already advanced their individual slots.
     pub(crate) fn finish_cpu_sequence(&mut self, target_cycles: u16) -> u16 {
         while self.cpu_sequence_cycles < target_cycles {
-            self.advance_cpu_slot(true);
+            self.advance_cpu_slot(true, None);
             self.record_irq_line();
             self.record_nmi_line();
         }
@@ -194,51 +207,173 @@ impl Bus {
         self.nmi_samples.push(self.ppu.nmi_pending());
     }
 
-    fn advance_cpu_slot(&mut self, can_service_dmc: bool) -> bool {
-        let dmc_completed = self.service_dma_stalls(can_service_dmc);
+    fn advance_cpu_slot(&mut self, can_service_dmc: bool, halted_address: Option<u16>) -> bool {
+        let dmc_completed = self.service_dma_stalls(can_service_dmc, halted_address);
         self.clock_hardware_cycle();
         self.cpu_sequence_cycles = self.cpu_sequence_cycles.saturating_add(1);
         self.dmc_completed_last_cpu_slot = dmc_completed;
         dmc_completed
     }
 
-    fn service_dma_stalls(&mut self, can_service_dmc: bool) -> bool {
+    fn service_dma_stalls(&mut self, can_service_dmc: bool, halted_address: Option<u16>) -> bool {
         let mut dmc_completed = false;
-        if self.dma_stall == 0 && !can_service_dmc {
+        if self.oam_dma.is_none() && self.dmc_dma.is_none() {
             return false;
         }
-        if self.dma_stall == 0
-            && self
+        // RDY can only halt the 6502 during a read. DMA requests remain
+        // pending through all consecutive CPU write slots.
+        if !can_service_dmc {
+            return false;
+        }
+
+        let skip_dummy_reads = self.cartridge.region() == crate::Region::Ntsc
+            && matches!(halted_address, Some(0x4016 | 0x4017));
+
+        // OAM and DMC share the first halt cycle when both are pending.
+        let halt_pending = self.oam_dma.as_ref().is_some_and(|dma| dma.halt_pending)
+            || self.dmc_dma.as_ref().is_some_and(|dma| dma.need_halt);
+        if halt_pending {
+            if let Some(dma) = self.oam_dma.as_mut() {
+                dma.halt_pending = false;
+            }
+            if let Some(dma) = self.dmc_dma.as_mut() {
+                dma.need_halt = false;
+            }
+            self.clock_hardware_cycle();
+            if let Some(address) = halted_address {
+                self.read_untimed(address);
+            }
+            if self.dmc_dma.as_ref().is_some_and(|dma| dma.abort) {
+                self.cancel_dmc_dma();
+                if self.oam_dma.is_none() {
+                    return false;
+                }
+            }
+        }
+
+        while self.oam_dma.is_some() || self.dmc_dma.is_some() {
+            if self.dmc_dma.as_ref().is_some_and(|dma| dma.abort) {
+                self.cancel_dmc_dma();
+                if self.oam_dma.is_none() {
+                    break;
+                }
+            }
+
+            // The DMA get/put cadence is tied to the APU clock. A DMC get has
+            // priority over an OAM get; all setup/no-op work can overlap OAM.
+            let get_cycle = self.cpu_cycles & 1 != 0;
+            let dmc_ready = self
                 .dmc_dma
                 .as_ref()
-                .is_some_and(|dma| dma.wait_for_alignment)
-        {
-            self.dmc_dma.as_mut().unwrap().wait_for_alignment = false;
-            return false;
-        }
-        while self.dma_stall != 0 || self.dmc_dma.is_some() {
-            let servicing_dmc = self.dmc_dma.is_some();
-            self.clock_hardware_cycle();
+                .is_some_and(|dma| !dma.need_halt && !dma.need_dummy);
 
-            if servicing_dmc {
-                let completed = self.dmc_dma.as_mut().and_then(|dma| {
-                    dma.cycles_remaining -= 1;
-                    (dma.cycles_remaining == 0).then_some(dma.address)
-                });
-                if let Some(address) = completed {
-                    self.dmc_dma = None;
-                    let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
-                    // The DMC owns the external CPU bus during its fetch, but
-                    // does not overwrite the 2A03's internal data latch.
-                    self.open_bus = value;
-                    self.apu.supply_dmc_sample(value);
-                    dmc_completed = true;
+            if get_cycle && dmc_ready {
+                let address = self.dmc_dma.unwrap().address;
+                self.clock_hardware_cycle();
+                let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
+                self.open_bus = value;
+                if self.cartridge.region() == crate::Region::Ntsc
+                    && let Some(cpu_address @ 0x4000..=0x401f) = halted_address
+                {
+                    let conflict_address = (cpu_address & 0xffe0) | (address & 0x001f);
+                    self.read_untimed(conflict_address);
+                }
+                self.dmc_dma = None;
+                self.apu.supply_dmc_sample(value);
+                if let Some(next_address) = self.apu.take_dmc_dma_request() {
+                    self.dmc_dma = Some(DmcDma {
+                        address: next_address,
+                        need_halt: true,
+                        need_dummy: true,
+                        abort: false,
+                    });
+                }
+                dmc_completed = true;
+            } else if get_cycle && self.oam_dma.is_some() {
+                self.advance_dmc_setup();
+                let (page, index) = {
+                    let dma = self.oam_dma.as_ref().unwrap();
+                    (dma.page, dma.index)
+                };
+                self.clock_hardware_cycle();
+                let value =
+                    self.read_oam_dma_untimed((u16::from(page) << 8) | index, halted_address);
+                if let Some(dma) = self.oam_dma.as_mut() {
+                    dma.latch = value;
+                    dma.read_pending = true;
+                }
+            } else if !get_cycle && self.oam_dma.as_ref().is_some_and(|dma| dma.read_pending) {
+                self.advance_dmc_setup();
+                let value = self.oam_dma.as_ref().unwrap().latch;
+                self.clock_hardware_cycle();
+                self.ppu.cpu_write(4, value, &mut self.cartridge);
+                let dma = self.oam_dma.as_mut().unwrap();
+                dma.read_pending = false;
+                dma.index += 1;
+                if dma.index == 0x100 {
+                    self.oam_dma = None;
                 }
             } else {
-                self.dma_stall -= 1;
+                self.advance_dmc_setup();
+                self.clock_hardware_cycle();
+                if !skip_dummy_reads && let Some(address) = halted_address {
+                    self.read_untimed(address);
+                }
             }
         }
         dmc_completed
+    }
+
+    /// The OAM DMA address bus alone does not activate the CPU's internal
+    /// APU/I/O register decode.  The CPU address bus must be in the
+    /// $4000-$401F window; then its low-five-bit register select can conflict
+    /// with the OAM source data.
+    fn read_oam_dma_untimed(&mut self, address: u16, cpu_address: Option<u16>) -> u8 {
+        let Some(cpu_address @ 0x4000..=0x401f) = cpu_address else {
+            return if (0x4000..=0x401f).contains(&address) {
+                self.internal_data_bus
+            } else {
+                self.read_untimed(address)
+            };
+        };
+
+        if (0x4000..=0x401f).contains(&address) || matches!(address & 0x001f, 0x0015..=0x0017) {
+            let active_register = (cpu_address & 0xffe0) | (address & 0x001f);
+            if matches!(address & 0x001f, 0x0016 | 0x0017) {
+                let port = (address & 1) as usize;
+                // The controller shift clock still sees this read, but a
+                // mapped OAM source wins the data-bus conflict. That makes
+                // controller bits visible for open-bus source pages while
+                // preserving the source byte for RAM pages.
+                let controller_bit = self.controllers[port].read();
+                if address < 0x2000 {
+                    return self.read_untimed(address);
+                }
+                let value = controller_bit | (self.internal_data_bus & 0xe0);
+                self.internal_data_bus = value;
+                self.open_bus = value;
+                value
+            } else {
+                self.read_untimed(active_register)
+            }
+        } else {
+            self.read_untimed(address)
+        }
+    }
+
+    fn advance_dmc_setup(&mut self) {
+        if let Some(dma) = self.dmc_dma.as_mut() {
+            if dma.need_halt {
+                dma.need_halt = false;
+            } else if dma.need_dummy {
+                dma.need_dummy = false;
+            }
+        }
+    }
+
+    fn cancel_dmc_dma(&mut self) {
+        self.dmc_dma = None;
+        self.apu.cancel_dmc_dma();
     }
 
     /// Complete an unstable NMOS store. A DMC DMA immediately before the
@@ -252,7 +387,7 @@ impl Bus {
         unmasked_value: u8,
     ) {
         let dmc_interrupted_previous_slot = self.dmc_completed_last_cpu_slot;
-        let dmc_completed = self.advance_cpu_slot(false);
+        let dmc_completed = self.advance_cpu_slot(false, None);
         self.record_irq_line();
         if dmc_interrupted_previous_slot || dmc_completed {
             self.write_untimed(unmasked_address, unmasked_value);
@@ -277,6 +412,14 @@ impl Bus {
         }
         self.cpu_cycles = self.cpu_cycles.wrapping_add(1);
 
+        if self.apu.take_dmc_dma_abort() {
+            if self.dmc_dma.as_ref().is_some_and(|dma| dma.need_halt) {
+                self.cancel_dmc_dma();
+            } else if let Some(dma) = self.dmc_dma.as_mut() {
+                dma.abort = true;
+            }
+        }
+
         if self.dmc_dma.is_none()
             && let Some(address) = self.apu.take_dmc_dma_request()
         {
@@ -285,8 +428,9 @@ impl Bus {
             // changing the CPU instruction decoder.
             self.dmc_dma = Some(DmcDma {
                 address,
-                cycles_remaining: 4,
-                wait_for_alignment: self.cpu_cycles & 1 == 0,
+                need_halt: true,
+                need_dummy: true,
+                abort: false,
             });
         }
     }
@@ -310,7 +454,7 @@ impl Bus {
             apu: self.apu.clone(),
             cartridge: self.cartridge.snapshot(),
             controllers: self.controllers.clone(),
-            dma_stall: self.dma_stall,
+            oam_dma: self.oam_dma,
             dmc_dma: self.dmc_dma,
             cpu_cycles: self.cpu_cycles,
             internal_data_bus: self.internal_data_bus,
@@ -341,7 +485,7 @@ impl Bus {
         self.apu = snapshot.apu;
         self.apu.clear_samples();
         self.controllers = snapshot.controllers;
-        self.dma_stall = snapshot.dma_stall;
+        self.oam_dma = snapshot.oam_dma;
         self.dmc_dma = snapshot.dmc_dma;
         self.cpu_cycles = snapshot.cpu_cycles;
         self.internal_data_bus = snapshot.internal_data_bus;
@@ -379,13 +523,13 @@ impl Bus {
     }
 
     fn perform_oam_dma(&mut self, page: u8) {
-        let mut data = [0; 256];
-        let base = (page as u16) << 8;
-        for (offset, slot) in data.iter_mut().enumerate() {
-            *slot = self.read_untimed(base.wrapping_add(offset as u16));
-        }
-        self.ppu.write_oam_dma(&data);
-        self.dma_stall = 513 + (self.cpu_cycles as u16 & 1);
+        self.oam_dma = Some(OamDma {
+            page,
+            index: 0,
+            latch: 0,
+            halt_pending: true,
+            read_pending: false,
+        });
     }
 }
 
@@ -418,7 +562,7 @@ mod tests {
         bus.internal_data_bus = 0xa0;
         assert_eq!(bus.read_untimed(0x4016), 0xa0);
         bus.controllers[0].set_button(crate::controller::Button::A, true);
-        bus.controllers[0].write_strobe(1);
+        bus.controllers[0].write_strobe(1, true);
         bus.open_bus = 0xe0;
         bus.internal_data_bus = 0xe0;
         assert_eq!(bus.read_untimed(0x4016), 0xe1);
@@ -456,8 +600,9 @@ mod tests {
         let mut bus = Bus::new(nrom_cartridge());
         bus.dmc_dma = Some(DmcDma {
             address: 0x8000,
-            cycles_remaining: 1,
-            wait_for_alignment: false,
+            need_halt: true,
+            need_dummy: true,
+            abort: false,
         });
 
         bus.write_unstable_store(0x0001, 0x11, 0x0002, 0x22);
@@ -471,8 +616,9 @@ mod tests {
         let mut bus = Bus::new(nrom_cartridge());
         bus.dmc_dma = Some(DmcDma {
             address: 0x8000,
-            cycles_remaining: 1,
-            wait_for_alignment: false,
+            need_halt: true,
+            need_dummy: true,
+            abort: false,
         });
         bus.read(0x0000);
         bus.write_unstable_store(0x0001, 0x11, 0x0002, 0x22);
@@ -481,12 +627,13 @@ mod tests {
     }
 
     #[test]
-    fn dmc_dma_waits_through_cpu_writes_and_alignment_slot() {
+    fn dmc_dma_waits_through_cpu_writes() {
         let mut bus = Bus::new(nrom_cartridge());
         bus.dmc_dma = Some(DmcDma {
             address: 0x8000,
-            cycles_remaining: 1,
-            wait_for_alignment: true,
+            need_halt: true,
+            need_dummy: true,
+            abort: false,
         });
 
         bus.write(0x0000, 0x5a);
@@ -494,18 +641,96 @@ mod tests {
         assert!(bus.dmc_dma.is_some());
 
         bus.read(0x0000);
-        assert!(
-            bus.dmc_dma.is_some(),
-            "first eligible read is the alignment slot"
-        );
-        bus.read(0x0000);
         assert!(bus.dmc_dma.is_none());
+    }
+
+    #[test]
+    fn dmc_dma_collision_clocks_ntsc_controller_before_retried_read() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.controllers[0].set_button(crate::controller::Button::A, true);
+        bus.controllers[0].write_strobe(1, true);
+        bus.controllers[0].write_strobe(0, true);
+        bus.dmc_dma = Some(DmcDma {
+            address: 0xc000,
+            need_halt: true,
+            need_dummy: true,
+            abort: false,
+        });
+
+        assert_eq!(bus.read(0x4016) & 1, 0, "the retried read sees B, not A");
+        assert_eq!(bus.controllers[0].total_reads(), 2);
+    }
+
+    #[test]
+    fn dmc_no_op_cycles_repeat_a_read_sensitive_ppu_access() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.write_untimed(0x2006, 0x20);
+        bus.write_untimed(0x2006, 0x00);
+        bus.dmc_dma = Some(DmcDma {
+            address: 0xc000,
+            need_halt: true,
+            need_dummy: true,
+            abort: false,
+        });
+
+        bus.read(0x2007);
+
+        assert_eq!(bus.ppu.state().vram_address, 0x2004);
+    }
+
+    #[test]
+    fn dmc_fetch_low_address_bits_can_activate_a_controller_register() {
+        let mut rom = vec![0; 16 + 0x4000 + 0x2000];
+        rom[0..4].copy_from_slice(b"NES\x1a");
+        rom[4] = 1;
+        rom[5] = 1;
+        rom[16 + 0x16] = 0xe0;
+        let mut bus = Bus::new(Cartridge::from_ines(&rom).unwrap());
+        bus.controllers[0].set_button(crate::controller::Button::A, true);
+        bus.controllers[0].write_strobe(1, true);
+        bus.controllers[0].write_strobe(0, true);
+        bus.dmc_dma = Some(DmcDma {
+            address: 0xc016,
+            need_halt: false,
+            need_dummy: false,
+            abort: false,
+        });
+
+        assert_eq!(bus.read(0x4000), 0xe1);
+        assert_eq!(bus.controllers[0].total_reads(), 1);
+    }
+
+    #[test]
+    fn active_apu_oam_dma_uses_internal_latch_or_a_mapped_source() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.controllers[0].set_button(crate::controller::Button::A, true);
+        bus.controllers[0].write_strobe(1, true);
+        bus.controllers[0].write_strobe(0, true);
+        bus.internal_data_bus = 0x40;
+        bus.open_bus = 0x50;
+
+        assert_eq!(bus.read_oam_dma_untimed(0x4036, Some(0x4001)), 0x41);
+        assert_eq!(bus.open_bus, 0x41);
+
+        bus.ram[0x216] = 0xff;
+        assert_eq!(bus.read_oam_dma_untimed(0x0216, Some(0x4001)), 0xff);
+        assert_eq!(bus.controllers[0].total_reads(), 2);
     }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 struct DmcDma {
     address: u16,
-    cycles_remaining: u8,
-    wait_for_alignment: bool,
+    need_halt: bool,
+    need_dummy: bool,
+    abort: bool,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct OamDma {
+    page: u8,
+    index: u16,
+    latch: u8,
+    halt_pending: bool,
+    read_pending: bool,
 }

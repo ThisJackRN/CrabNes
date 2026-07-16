@@ -14,16 +14,32 @@ RetroAchievements support.
 
 ## Measured emulation accuracy
 
-**71.6% — 101 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
+**83.7% — 118 of 141 [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) tests passing.**
 
 This is CrabNes's current automated hardware-conformance test pass rate, not a
-claim that every NES game is exactly 71.6% accurate. Compatibility varies by
+claim that every NES game is exactly 83.7% accurate. Compatibility varies by
 game, mapper, and the hardware behavior it relies on. The score is updated only
 when it has been reproduced with the headless runner:
 
 ```powershell
 cargo run --release -p nes-cli -- AccuracyCoin.nes --frames 5000 --press-start-at 120 --accuracycoin-report
 ```
+
+During development, run only the affected one-based test page. The runner
+navigates to that page, executes its built-in suite, and stops as soon as the
+page finishes:
+
+```powershell
+cargo run --release -p nes-cli -- AccuracyCoin.nes --accuracycoin-page 13
+```
+
+Intermittent failures can be checked repeatedly in one emulator session:
+
+```powershell
+cargo run --release -p nes-cli -- AccuracyCoin.nes --accuracycoin-page 13 --accuracycoin-repeat 20 --frames 2500 --peek 0488
+```
+
+Use the complete 141-test command above once as the final regression check.
 
 AccuracyCoin targets the RP2A03G CPU/APU and RP2C02G PPU used by NTSC NES
 hardware. PAL support is tested separately because it uses different timing.

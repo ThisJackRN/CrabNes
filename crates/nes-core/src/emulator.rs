@@ -20,7 +20,7 @@ pub enum EmulationError {
 }
 
 const STATE_MAGIC: &[u8; 8] = b"MONESST\0";
-pub const SAVE_STATE_VERSION: u32 = 5;
+pub const SAVE_STATE_VERSION: u32 = 6;
 
 #[derive(Debug)]
 pub enum StateError {
@@ -671,6 +671,21 @@ mod tests {
 
         assert_ne!(nes.frame().pixels, default_pixels);
         assert_eq!(nes.save_state().unwrap(), default_state);
+    }
+
+    #[test]
+    fn loading_a_snapshot_preserves_the_active_output_palette_exactly() {
+        let rom = test_rom(&[0x4c, 0x00, 0x80]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        nes.run_frame().unwrap();
+        nes.set_output_palette(crate::ppu::RGB_2C04_0004_PALETTE);
+        let expected_pixels = nes.frame().pixels.clone();
+        let state = nes.save_state().unwrap();
+
+        nes.run_frame().unwrap();
+        nes.load_state(&state).unwrap();
+
+        assert_eq!(nes.frame().pixels, expected_pixels);
     }
 
     #[test]
