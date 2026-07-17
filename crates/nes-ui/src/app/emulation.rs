@@ -434,6 +434,9 @@ impl App {
         load_battery(&mut replacement, &path)?;
         let hash = replacement.rom_hash();
         self.per_game = settings::load_per_game(hash);
+        if self.play_mode() == PlayMode::Standard {
+            replacement.set_cheats(decoded_enabled_cheats(&self.per_game).0);
+        }
         self.speed_index = if self.play_mode().restricts_assists() {
             NORMAL_SPEED_INDEX
         } else {
@@ -604,6 +607,9 @@ impl App {
         self.fast_forward = false;
         self.frame_budget = 0.0;
         if mode.restricts_assists() {
+            if let Some(nes) = &mut self.nes {
+                nes.set_cheats(Vec::new());
+            }
             self.speed_index = NORMAL_SPEED_INDEX;
             self.show_states = false;
             self.show_time = false;
@@ -611,6 +617,7 @@ impl App {
             self.show_tas_control = false;
             self.show_debugger = false;
             self.show_hex = false;
+            self.show_cheats = false;
             self.frame_advance_held = false;
             self.rewind_active = false;
             self.resume_after_rewind = false;
@@ -630,8 +637,33 @@ impl App {
                 .speed_index
                 .unwrap_or(self.settings.emulation.speed_index)
                 .min(SPEEDS.len() - 1);
+            self.apply_per_game_cheats();
             self.status = "Standard mode enabled".into();
         }
+    }
+
+    pub(super) fn apply_per_game_cheats(&mut self) {
+        let (cheats, invalid) = if self.play_mode() == PlayMode::Standard {
+            decoded_enabled_cheats(&self.per_game)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let enabled = cheats.len();
+        if let Some(nes) = &mut self.nes {
+            nes.set_cheats(cheats);
+        }
+        self.clear_rewind_history();
+        self.status = if invalid.is_empty() {
+            format!(
+                "Applied {enabled} cheat{}",
+                if enabled == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "Applied {enabled} cheats; {} saved code(s) are invalid",
+                invalid.len()
+            )
+        };
     }
 
     pub(super) fn current_speed(&self) -> f64 {
@@ -670,6 +702,18 @@ impl App {
             }
         }
     }
+}
+
+fn decoded_enabled_cheats(per_game: &PerGameSettings) -> (Vec<Cheat>, Vec<String>) {
+    let mut cheats = Vec::new();
+    let mut invalid = Vec::new();
+    for entry in per_game.cheats.iter().filter(|entry| entry.enabled) {
+        match Cheat::parse(&entry.code) {
+            Ok(cheat) => cheats.push(cheat),
+            Err(error) => invalid.push(format!("{}: {error}", entry.code)),
+        }
+    }
+    (cheats, invalid)
 }
 
 pub(super) fn inferred_region_from_rom_path(path: &Path) -> Option<Region> {

@@ -1104,6 +1104,142 @@ impl App {
         self.show_debugger = open;
     }
 
+    pub(super) fn cheats_window(&mut self, ui: &mut egui::Ui) {
+        if !self.show_cheats {
+            return;
+        }
+        let mut open = self.show_cheats;
+        let mut changed = false;
+        let mut remove = None;
+        egui::Window::new("Cheat Codes")
+            .open(&mut open)
+            .default_size([620.0, 480.0])
+            .min_size([320.0, 240.0])
+            .max_size(floating_window_max_size(ui.ctx()))
+            .resizable(true)
+            .vscroll(true)
+            .show(ui, |ui| {
+                let Some(nes) = self.nes.as_ref() else {
+                    ui.label("Load a game before adding cheat codes.");
+                    return;
+                };
+                ui.label(
+                    "Standard NES Game Genie codes may contain 6 or 8 letters. Raw CPU read patches use ADDRESS:VALUE or ADDRESS?COMPARE:VALUE.",
+                );
+                if nes.mapper_id() == 20 {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_BLUE,
+                        "FDS mode: raw patches can target disk-loaded program RAM at $6000-$DFFF. Game Genie codes can patch the $8000-$FFFF portion.",
+                    );
+                }
+                ui.small("Examples: GOSSIP   APEETPEY   6000:EA   810E?F0:10");
+                ui.separator();
+
+                egui::Grid::new("add-cheat-grid")
+                    .num_columns(2)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut self.cheat_name);
+                        ui.end_row();
+                        ui.label("Code");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.cheat_code)
+                                .hint_text("6/8-letter Game Genie or raw patch"),
+                        );
+                        ui.end_row();
+                    });
+                if ui.button("Add code").clicked() {
+                    let code = self.cheat_code.trim().to_ascii_uppercase();
+                    match Cheat::parse(&code) {
+                        Ok(_) if self
+                            .per_game
+                            .cheats
+                            .iter()
+                            .any(|entry| entry.code.eq_ignore_ascii_case(&code)) =>
+                        {
+                            self.cheat_error = Some("That code is already in this list".into());
+                        }
+                        Ok(_) => {
+                            let name = self.cheat_name.trim();
+                            self.per_game.cheats.push(CheatSetting {
+                                name: if name.is_empty() {
+                                    format!("Cheat {}", self.per_game.cheats.len() + 1)
+                                } else {
+                                    name.into()
+                                },
+                                code,
+                                enabled: true,
+                            });
+                            self.cheat_name.clear();
+                            self.cheat_code.clear();
+                            self.cheat_error = None;
+                            changed = true;
+                        }
+                        Err(error) => self.cheat_error = Some(error.to_string()),
+                    }
+                }
+                if let Some(error) = &self.cheat_error {
+                    ui.colored_label(egui::Color32::YELLOW, error);
+                }
+
+                ui.separator();
+                if self.per_game.cheats.is_empty() {
+                    ui.label("No cheats saved for this game.");
+                } else {
+                    for (index, entry) in self.per_game.cheats.iter_mut().enumerate() {
+                        ui.horizontal_wrapped(|ui| {
+                            changed |= ui.checkbox(&mut entry.enabled, "").changed();
+                            ui.strong(&entry.name);
+                            ui.monospace(&entry.code);
+                            match Cheat::parse(&entry.code) {
+                                Ok(cheat) => {
+                                    let decoded = match cheat.compare {
+                                        Some(compare) => format!(
+                                            "${:04X}: ${:02X} if ${compare:02X}",
+                                            cheat.address, cheat.value
+                                        ),
+                                        None => format!(
+                                            "${:04X}: ${:02X}",
+                                            cheat.address, cheat.value
+                                        ),
+                                    };
+                                    ui.small(decoded);
+                                }
+                                Err(error) => {
+                                    ui.colored_label(egui::Color32::YELLOW, error.to_string());
+                                }
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(index);
+                            }
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Disable all").clicked() {
+                            for entry in &mut self.per_game.cheats {
+                                entry.enabled = false;
+                            }
+                            changed = true;
+                        }
+                        if ui.button("Remove all").clicked() {
+                            self.per_game.cheats.clear();
+                            changed = true;
+                        }
+                    });
+                }
+            });
+        if let Some(index) = remove {
+            self.per_game.cheats.remove(index);
+            changed = true;
+        }
+        if changed {
+            self.save_per_game();
+            self.apply_per_game_cheats();
+        }
+        self.show_cheats = open;
+    }
+
     pub(super) fn hex_window(&mut self, ui: &mut egui::Ui) {
         if !self.show_hex {
             return;

@@ -194,6 +194,10 @@ impl App {
                             ui.close();
                         }
                         ui.separator();
+                        if ui.button("Cheat Codes…").clicked() {
+                            self.show_cheats = true;
+                            ui.close();
+                        }
                         if ui.button("TAS Editor…").clicked() {
                             self.show_tas = true;
                             ui.close();
@@ -462,7 +466,7 @@ impl App {
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "NES",
+                                    library_placeholder_label(&entry.path),
                                     egui::FontId::proportional(18.0),
                                     ui.visuals().weak_text_color(),
                                 );
@@ -731,6 +735,7 @@ impl App {
         if self.play_mode() == PlayMode::Standard {
             self.states_window(ui);
             self.time_window(ui);
+            self.cheats_window(ui);
             self.tas_window(ui);
             self.tas_control_window(ui);
             self.debugger_window(ui);
@@ -778,6 +783,17 @@ fn overscan_uv(crop_x: usize, crop_y: usize) -> egui::Rect {
     )
 }
 
+fn library_placeholder_label(path: &Path) -> &'static str {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("fds"))
+    {
+        "FDS"
+    } else {
+        "NES"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,5 +805,11 @@ mod tests {
         assert_eq!(uv.max.x, 248.0 / 256.0);
         assert_eq!(uv.min.y, 8.0 / 240.0);
         assert_eq!(uv.max.y, 232.0 / 240.0);
+    }
+
+    #[test]
+    fn missing_fds_cover_uses_an_fds_placeholder() {
+        assert_eq!(library_placeholder_label(Path::new("game.fds")), "FDS");
+        assert_eq!(library_placeholder_label(Path::new("game.nes")), "NES");
     }
 }

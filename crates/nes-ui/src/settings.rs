@@ -277,6 +277,15 @@ pub struct PerGameSettings {
     pub volume: Option<f32>,
     pub muted: Option<bool>,
     pub speed_index: Option<usize>,
+    pub cheats: Vec<CheatSetting>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheatSetting {
+    pub name: String,
+    pub code: String,
+    pub enabled: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -581,5 +590,25 @@ mod tests {
             let encoded = serde_json::to_string(&mode).unwrap();
             assert_eq!(serde_json::from_str::<PlayMode>(&encoded).unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn per_game_cheats_round_trip_and_old_files_default_to_none() {
+        let old: PerGameSettings = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
+        assert!(old.cheats.is_empty());
+
+        let settings = PerGameSettings {
+            cheats: vec![CheatSetting {
+                name: "Infinite lives".into(),
+                code: "SXIOPO".into(),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        let decoded: PerGameSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(decoded.cheats.len(), 1);
+        assert_eq!(decoded.cheats[0].code, "SXIOPO");
+        assert!(decoded.cheats[0].enabled);
     }
 }

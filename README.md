@@ -2,15 +2,16 @@
 
 [![Windows build](https://github.com/ThisJackRN/CrabNes/actions/workflows/windows-build.yml/badge.svg)](https://github.com/ThisJackRN/CrabNes/actions/workflows/windows-build.yml)
 
-CrabNes is a from-scratch NES emulator written in Rust. It combines a
-deterministic emulation core with a native Windows desktop interface, responsive
-audio, long smooth rewind, TAS tools, speedrun-safe play profiles, and
-RetroAchievements support.
+CrabNes is a from-scratch NES and Famicom Disk System emulator written in Rust.
+It combines a deterministic emulation core with a native Windows desktop
+interface, responsive audio, long smooth rewind, TAS tools, speedrun-safe play
+profiles, and RetroAchievements support.
 
 > [!IMPORTANT]
 > CrabNes supports the major Nintendo, Konami, Sunsoft, and Namco mapper families
-> listed in the compatibility table below. Accuracy work is ongoing. No commercial ROMs are included;
-> use legally obtained games or homebrew.
+> listed in the compatibility table below. Accuracy work is ongoing. No commercial
+> ROMs or system BIOS files are included; use legally obtained games, BIOS dumps,
+> or homebrew.
 
 ## Measured emulation accuracy
 
@@ -77,12 +78,16 @@ run the workflow manually or [build from source](#build-from-source).
 - Cycle-driven NTSC and PAL CPU, PPU, and APU emulation, including stable
   unofficial NMOS 6502 opcodes and observable dummy bus accesses.
 - Cartridge IRQs, banked RAM/ROM, dynamic mirroring, and expansion audio.
+- Famicom Disk System disk I/O, timer and transfer IRQs, writable disk data,
+  multi-side images, save states, and wavetable expansion audio.
 - Native low-latency Windows audio with per-channel controls.
 - Keyboard and hot-pluggable gamepad support for two players.
 - Searchable ROM library with custom titles, automatic RetroAchievements
   artwork, user-selected artwork overrides, and a per-ROM compatibility estimate
   weighted from likely reachable ROM code, measured AccuracyCoin categories,
   and cartridge mapper coverage.
+- Per-game cheat manager for 6/8-letter NES Game Genie codes and raw CPU read
+  patches, including disk-loaded FDS program RAM.
 - Versioned save states with screenshots and ROM validation.
 - LZ4-compressed rewind: two minutes by default, configurable up to ten minutes.
 - TAS recording, playback, rerecording, frame editing, seeking, and checkpoints.
@@ -131,12 +136,12 @@ restores the cached one.
 | Area | Current support |
 |---|---|
 | Region | NTSC and PAL; standard Europe/Australia/PAL filename tags correct legacy ROMs with missing timing flags; multi-region NES 2.0 images default to NTSC |
-| ROM format | iNES 1.0 and NES 2.0 for supported boards |
-| Mapper | 0 NROM; 1 MMC1; 2 UxROM; 3 CNROM; 4 MMC3; 5 MMC5; 7 AxROM; 9 MMC2; 10 MMC4; 19 Namco 163; 21/22/23/25 VRC2/VRC4; 24/26 VRC6; 69 FME-7/5B; 85 VRC7; 99 Nintendo Vs. System |
-| Expansion audio | Sunsoft 5B, VRC6, Namco 163, MMC5, and VRC7 FM |
+| ROM format | iNES 1.0 and NES 2.0 for supported boards; headered and headerless `.fds` disk images |
+| Mapper | 0 NROM; 1 MMC1; 2 UxROM; 3 CNROM; 4 MMC3; 5 MMC5; 7 AxROM; 9 MMC2; 10 MMC4; 19 Namco 163; 20 Famicom Disk System; 21/22/23/25 VRC2/VRC4; 24/26 VRC6; 69 FME-7/5B; 85 VRC7; 99 Nintendo Vs. System |
+| Expansion audio | Famicom Disk System wavetable, Sunsoft 5B, VRC6, Namco 163, MMC5, and VRC7 FM |
 | Desktop | Windows x64 |
 | Controllers | Two NES controllers through keyboard and gamepads |
-| Battery RAM | `.sav` beside the ROM |
+| Battery data | Cartridge RAM and writable FDS disk data in a `.sav` beside the game image |
 | Save states | Versioned, validated, and separated by ROM hash |
 
 The PPU models rendering-time VRAM increments, palette bus behavior, VBlank/NMI
@@ -146,6 +151,41 @@ fetch-pipeline quirk. MMC5 extended attributes and vertical split rendering,
 exact VRC7 FM operator/envelope behavior, and unusual board variants still need
 accuracy work. Dendy timing, light guns, Four Score, and cartridge families
 outside the table are not implemented yet.
+
+## Famicom Disk System setup
+
+FDS games require both a `.fds` disk image and the Famicom Disk System BIOS.
+CrabNes does not distribute the copyrighted BIOS. Dump it from hardware you own
+and select the resulting, exactly 8 KiB (8192-byte) `disksys.rom` file under
+**Settings > Paths > Choose FDS BIOS…**.
+
+If no BIOS has been selected, the desktop application also looks for
+`disksys.rom` in the current working directory and beside the `.fds` image. FDS
+images in the configured ROM folder appear in the searchable library even when
+they have no cover artwork; they can also be opened through **File > Open ROM…**
+or `Ctrl+O`. Side A starts inserted. Press `6` once to eject the disk and again
+to insert the next side; multi-side images wrap back to the first side. The
+keyboard and gamepad bindings can be changed under **Settings > Input > Famicom
+Disk System controls**.
+
+Disk writes are persisted in a `.sav` beside the `.fds` image. Save states retain
+the complete drive, disk, timer, IRQ, and FDS audio state. Keep backups of the
+original disk image and save data when testing software that writes to disk.
+
+The headless runner accepts the BIOS explicitly:
+
+```powershell
+cargo run --release -p nes-cli -- path\to\game.fds --fds-bios path\to\disksys.rom --frames 1200 --screenshot fds.png
+```
+
+## Video output and overscan
+
+The presentation settings include independent **Crop 8px vertical overscan** and
+**Crop 8px horizontal overscan** options. Vertical cropping is enabled by default;
+horizontal cropping is disabled by default and can hide the edge pixels visible
+in games such as Super Mario Bros. 3. Cropping affects only the displayed image,
+and both native and CRT rendering preserve the visible area's aspect ratio and
+integer-scaling dimensions.
 
 ## Controls
 
@@ -164,6 +204,7 @@ All gameplay bindings can be changed in **Settings > Input**.
 | R | Reset |
 | P | Power off or on |
 | Ctrl+P | Power cycle |
+| 6 | FDS eject / insert next side |
 | F5 / F8 | Quick save / quick load |
 | N | Advance one frame |
 | Backspace (hold) | Rewind |
@@ -175,6 +216,28 @@ All gameplay bindings can be changed in **Settings > Input**.
 
 Assist hotkeys are ignored in Speedrun and Achievement profiles. Hotkeys are
 also ignored while typing in a text field.
+
+Reset and power cycle restart the emulated frame counter at zero. Powering the
+console off pauses emulation and displays a black screen; powering it on performs
+a fresh reset.
+
+## Cheat codes
+
+While a game is running in the Standard profile, open **Tools > Cheat Codes…**.
+Each game keeps its own named list, and enabled codes apply immediately and stay
+active across reset, rewind, and save-state loads. Cheats are automatically
+disabled in Speedrun and Achievement profiles.
+
+CrabNes accepts standard six- and eight-letter NES Game Genie codes, with or
+without hyphens. Eight-letter codes include an original-byte comparison, which
+helps codes select the intended bank in bank-switched cartridges. Raw CPU read
+patches use either `ADDRESS:VALUE` or `ADDRESS?COMPARE:VALUE`, with hexadecimal
+numbers; for example, `6000:EA` or `810E?F0:10`.
+
+FDS games can use both formats. Since FDS software is loaded into writable
+program RAM rather than cartridge ROM, raw patches are usually more useful and
+can target the full disk-loaded `$6000-$DFFF` range. Game Genie codes cover
+`$8000-$FFFF`. Codes are specific to the game's region and revision.
 
 ## Save states and rewind
 
