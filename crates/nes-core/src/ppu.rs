@@ -435,6 +435,8 @@ impl Ppu {
         self.active_sprites.clear();
         self.oam_corruption_pending = None;
         self.sprite_overflow_pending = false;
+        self.frame.number = 0;
+        self.odd_frame = false;
     }
 
     pub fn cpu_read(&mut self, register: u16, cartridge: &mut Cartridge) -> u8 {

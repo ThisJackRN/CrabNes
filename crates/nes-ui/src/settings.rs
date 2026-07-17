@@ -6,7 +6,7 @@ use gilrs::{Axis, Button as GamepadButton, ev::Code};
 
 use crate::persistence;
 
-pub const SETTINGS_VERSION: u32 = 4;
+pub const SETTINGS_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -156,6 +156,8 @@ impl CrtMask {
 #[serde(default)]
 pub struct VideoSettings {
     pub integer_scaling: bool,
+    pub crop_overscan: bool,
+    pub crop_overscan_horizontal: bool,
     pub show_fps: bool,
     pub fullscreen_on_start: bool,
     pub palette_mode: PaletteMode,
@@ -176,6 +178,8 @@ impl Default for VideoSettings {
     fn default() -> Self {
         Self {
             integer_scaling: false,
+            crop_overscan: true,
+            crop_overscan_horizontal: false,
             show_fps: false,
             fullscreen_on_start: false,
             palette_mode: PaletteMode::default(),
@@ -212,6 +216,8 @@ pub struct InputSettings {
     pub player2_gamepad_bindings: [Option<GamepadBinding>; 8],
     pub vs_coin_binding: KeyBinding,
     pub vs_coin_gamepad_binding: Option<GamepadBinding>,
+    pub fds_swap_binding: KeyBinding,
+    pub fds_swap_gamepad_binding: Option<GamepadBinding>,
     /// Connected-controller index for each player. `None` assigns controllers in player order.
     pub gamepad_slots: [Option<usize>; 2],
     pub gamepad_axis_threshold: f32,
@@ -230,6 +236,7 @@ pub struct EmulationSettings {
 #[serde(default)]
 pub struct PathSettings {
     pub rom_folder: PathBuf,
+    pub fds_bios_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -341,6 +348,8 @@ impl Default for InputSettings {
             player2_gamepad_bindings: default_gamepad_bindings(),
             vs_coin_binding: KeyBinding::new("5"),
             vs_coin_gamepad_binding: None,
+            fds_swap_binding: KeyBinding::new("6"),
+            fds_swap_gamepad_binding: None,
             gamepad_slots: [None, None],
             gamepad_axis_threshold: 0.5,
             allow_opposite_directions: false,
@@ -377,6 +386,10 @@ impl Default for PathSettings {
             .unwrap_or_default();
         Self {
             rom_folder: root.join("Documents").join("NES ROMs"),
+            fds_bios_path: std::env::current_dir()
+                .ok()
+                .map(|directory| directory.join("disksys.rom"))
+                .filter(|path| path.is_file()),
         }
     }
 }
@@ -427,6 +440,12 @@ fn migrate(mut settings: Settings) -> Settings {
     }
     if settings.version < 4 {
         settings.version = 4;
+    }
+    if settings.version < 5 {
+        settings.version = 5;
+    }
+    if settings.version < 6 {
+        settings.version = 6;
     }
     settings
 }
@@ -500,6 +519,8 @@ mod tests {
         assert!(!settings.input.allow_opposite_directions);
         assert_eq!(settings.tas.checkpoint_interval, 300);
         assert!(!settings.video.crt_enabled);
+        assert!(settings.video.crop_overscan);
+        assert!(!settings.video.crop_overscan_horizontal);
         assert_eq!(
             settings.video.crt_scanline_strength,
             VideoSettings::default().crt_scanline_strength

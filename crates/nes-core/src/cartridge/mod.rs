@@ -1,5 +1,6 @@
 mod axrom;
 mod cnrom;
+pub(crate) mod fds;
 mod fme7;
 mod ines;
 mod mapper;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::Region;
 use axrom::Axrom;
 use cnrom::Cnrom;
+use fds::Fds;
 use fme7::Fme7;
 pub use ines::{InesHeader, RomFormat, TimingMode};
 use mapper::{Mapper, MapperSnapshot};
@@ -68,6 +70,8 @@ pub enum CartridgeError {
         kind: &'static str,
         size: usize,
     },
+    InvalidFdsBiosSize(usize),
+    InvalidFdsImage(&'static str),
 }
 
 impl fmt::Display for CartridgeError {
@@ -104,6 +108,10 @@ impl fmt::Display for CartridgeError {
                     "mapper {mapper} has an invalid {kind} size of {size} bytes"
                 )
             }
+            Self::InvalidFdsBiosSize(size) => {
+                write!(f, "FDS BIOS must be exactly 8192 bytes, got {size} bytes")
+            }
+            Self::InvalidFdsImage(reason) => write!(f, "invalid FDS image: {reason}"),
         }
     }
 }
@@ -127,6 +135,16 @@ pub(crate) struct CartridgeSnapshot {
 impl Cartridge {
     pub fn from_ines(bytes: &[u8]) -> Result<Self, CartridgeError> {
         Self::from_ines_inner(bytes, None)
+    }
+
+    pub fn from_fds(disk_data: &[u8], bios: &[u8]) -> Result<Self, CartridgeError> {
+        Ok(Self {
+            mapper: Box::new(Fds::new(bios, disk_data)?),
+            mapper_id: 20, // Technically FDS is Mapper 20
+            header_mirroring: Mirroring::Horizontal,
+            battery_backed: true,
+            region: Region::Ntsc,
+        })
     }
 
     pub fn from_ines_with_region(bytes: &[u8], region: Region) -> Result<Self, CartridgeError> {
@@ -315,6 +333,9 @@ impl Cartridge {
     }
     pub fn reset(&mut self) {
         self.mapper.reset();
+    }
+    pub fn swap_disk(&mut self) {
+        self.mapper.swap_disk();
     }
     pub fn battery_ram(&self) -> Option<&[u8]> {
         self.mapper.battery_ram()

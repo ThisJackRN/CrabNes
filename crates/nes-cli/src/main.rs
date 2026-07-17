@@ -22,7 +22,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(rom_path) = args.next() else {
         return Err(
-            "usage: nes-cli <game.nes> [--frames N] [--insert-coin-at N] [--press-select-at N] [--press-start] [--press-start-at N] [--accuracycoin-page N] [--accuracycoin-repeat N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
+            "usage: nes-cli <game.nes|disk.fds> [--fds-bios disksys.rom] [--frames N] [--insert-coin-at N] [--press-select-at N] [--press-start] [--press-start-at N] [--accuracycoin-page N] [--accuracycoin-repeat N] [--accuracycoin-report] [--peek ADDRESS] [--screenshot output.png]"
                 .into(),
         );
     };
@@ -35,9 +35,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut accuracycoin_page = None;
     let mut accuracycoin_repeat = 1_u16;
     let mut peek_addresses = Vec::new();
+    let mut fds_bios = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--frames" => frames = Some(args.next().ok_or("--frames needs a number")?.parse()?),
+            "--fds-bios" => fds_bios = Some(args.next().ok_or("--fds-bios needs a path")?),
             "--press-start" => press_start_at = Some(60),
             "--press-start-at" => {
                 press_start_at = Some(
@@ -108,7 +110,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let rom = fs::read(&rom_path)?;
-    let mut nes = Nes::from_ines(&rom)?;
+    let is_fds = Path::new(&rom_path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("fds"))
+        || rom.starts_with(b"FDS\x1a");
+    let mut nes = if is_fds {
+        let bios_path = fds_bios.map(Into::into).unwrap_or_else(|| {
+            let beside_disk = Path::new(&rom_path)
+                .parent()
+                .map(|parent| parent.join("disksys.rom"));
+            beside_disk
+                .filter(|path| path.is_file())
+                .unwrap_or_else(|| "disksys.rom".into())
+        });
+        let bios = fs::read(&bios_path).map_err(|error| {
+            format!(
+                "could not read FDS BIOS '{}': {error}; pass --fds-bios <path>",
+                bios_path.display()
+            )
+        })?;
+        Nes::from_fds(&rom, &bios)?
+    } else {
+        Nes::from_ines(&rom)?
+    };
     println!(
         "Loaded {rom_path} (mapper {}, battery: {})",
         nes.mapper_id(),

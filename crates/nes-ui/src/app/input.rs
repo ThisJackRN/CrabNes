@@ -60,6 +60,12 @@ impl App {
         if assists_allowed && shift && self.hotkey_pressed(ctx, Key::F5) {
             self.show_states = true;
         }
+        if self.fds_swap_pressed(ctx)
+            && let Some(nes) = &mut self.nes
+            && nes.mapper_id() == 20
+        {
+            nes.swap_disk();
+        }
     }
 
     pub(super) fn hotkey_pressed(&self, ctx: &egui::Context, key: Key) -> bool {
@@ -130,6 +136,37 @@ impl App {
             mask & 0x0c == 0x0c
         }
     }
+    pub(super) fn fds_swap_pressed(&mut self, ctx: &egui::Context) -> bool {
+        if self.binding_capture.is_some() || ctx.egui_wants_keyboard_input() {
+            return false;
+        }
+        let keyboard = binding_pressed(ctx, &self.settings.input.fds_swap_binding);
+
+        let gamepad_down = self.fds_swap_gamepad_down();
+        let gamepad_pressed = gamepad_down && !self.fds_swap_was_down;
+        self.fds_swap_was_down = gamepad_down;
+
+        keyboard || gamepad_pressed
+    }
+
+    pub(super) fn fds_swap_gamepad_down(&self) -> bool {
+        let Some(gamepads) = &self.gamepads else {
+            return false;
+        };
+        let slot = self.settings.input.gamepad_slots[0].unwrap_or(0);
+        let Some((_, gamepad)) = gamepads.gamepads().nth(slot) else {
+            return false;
+        };
+        if let Some(binding) = self.settings.input.fds_swap_gamepad_binding {
+            gamepad_binding_down(
+                &gamepad,
+                binding,
+                self.settings.input.gamepad_axis_threshold.clamp(0.1, 0.9),
+            )
+        } else {
+            false
+        }
+    }
 
     pub(super) fn filter_live_dpad(&self, input: TasFrame) -> TasFrame {
         if self.play_mode() == PlayMode::Standard && self.settings.input.allow_opposite_directions {
@@ -197,6 +234,26 @@ impl App {
                 self.status = format!("VS insert coin is now bound to {}", key.name());
             }
         }
+        if self.binding_capture == Some(BindingCapture::FdsSwapKeyboard) {
+            let key = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(physical_key.unwrap_or(*key)),
+                    _ => None,
+                })
+            });
+            if let Some(key) = key {
+                self.settings.input.fds_swap_binding = KeyBinding::new(key.name());
+                self.binding_capture = None;
+                self.settings_dirty = true;
+                self.status = format!("FDS swap disk is now bound to {}", key.name());
+            }
+        }
 
         let mut captured = None;
         if let Some(gamepads) = &mut self.gamepads {
@@ -213,7 +270,9 @@ impl App {
                     });
                 }
                 if let Some(
-                    capture @ (BindingCapture::Gamepad { .. } | BindingCapture::VsCoinGamepad),
+                    capture @ (BindingCapture::Gamepad { .. }
+                    | BindingCapture::VsCoinGamepad
+                    | BindingCapture::FdsSwapGamepad),
                 ) = self.binding_capture
                 {
                     let threshold = self.settings.input.gamepad_axis_threshold.clamp(0.1, 0.9);
@@ -279,6 +338,14 @@ impl App {
                     self.settings.input.gamepad_slots[0] = slot;
                     format!(
                         "VS insert coin is now bound to {}",
+                        gamepad_binding_label(binding)
+                    )
+                }
+                BindingCapture::FdsSwapGamepad => {
+                    self.settings.input.fds_swap_gamepad_binding = Some(binding);
+                    self.settings.input.gamepad_slots[0] = slot;
+                    format!(
+                        "FDS swap disk is now bound to {}",
                         gamepad_binding_label(binding)
                     )
                 }
@@ -394,6 +461,17 @@ pub(super) fn binding_down(ctx: &egui::Context, binding: &KeyBinding) -> bool {
         .copied()
         .find(|key| key.name() == binding.label())
         .is_some_and(|key| ctx.input(|input| input.key_down(key)))
+}
+
+pub(super) fn binding_pressed(ctx: &egui::Context, binding: &KeyBinding) -> bool {
+    if binding.label() == "Shift" {
+        return ctx.input(|i| i.key_pressed(Key::ShiftLeft) || i.key_pressed(Key::ShiftRight));
+    }
+    Key::ALL
+        .iter()
+        .copied()
+        .find(|key| key.name() == binding.label())
+        .is_some_and(|key| ctx.input(|input| input.key_pressed(key)))
 }
 
 pub(super) fn nes_button_label(index: usize) -> &'static str {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Mirroring, axrom::AxromSnapshot, cnrom::CnromSnapshot, fme7::Fme7Snapshot,
+    Mirroring, axrom::AxromSnapshot, cnrom::CnromSnapshot, fds::FdsSnapshot, fme7::Fme7Snapshot,
     mapper99::Mapper99Snapshot, mmc1::Mmc1Snapshot, mmc2::Mmc2Snapshot, mmc3::Mmc3Snapshot,
     mmc5::Mmc5Snapshot, n163::N163Snapshot, nrom::NromSnapshot, uxrom::UxromSnapshot,
     vrc::VrcSnapshot, vrc6::Vrc6Snapshot, vrc7::Vrc7Snapshot,
@@ -24,6 +24,7 @@ pub(crate) enum MapperSnapshot {
     Mmc5(Mmc5Snapshot),
     Vrc7(Vrc7Snapshot),
     Mapper99(Mapper99Snapshot),
+    Fds(FdsSnapshot),
 }
 
 pub trait Mapper {
@@ -53,6 +54,7 @@ pub trait Mapper {
         0.0
     }
     fn reset(&mut self) {}
+    fn swap_disk(&mut self) {}
     fn mirroring(&self) -> Option<Mirroring> {
         None
     }
