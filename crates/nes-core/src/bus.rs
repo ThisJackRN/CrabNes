@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     apu::Apu,
     cartridge::{Cartridge, CartridgeSnapshot},
+    cheat::Cheat,
     controller::Controller,
     fceux_state::{FceuxMmc3State, FceuxState, FceuxStateError},
     ppu::Ppu,
@@ -26,6 +27,7 @@ pub struct Bus {
     cpu_sequence_cycles: u16,
     nmi_samples: Vec<bool>,
     irq_samples: Vec<bool>,
+    cheats: Vec<Cheat>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ impl Bus {
             cpu_sequence_cycles: 0,
             nmi_samples: Vec::with_capacity(8),
             irq_samples: Vec::with_capacity(8),
+            cheats: Vec::new(),
         }
     }
 
@@ -185,7 +188,7 @@ impl Bus {
     }
 
     fn read_untimed(&mut self, address: u16) -> u8 {
-        let (value, drives_external_bus) = if let Some(value) = self.cartridge.cpu_read(address) {
+        let (actual, drives_external_bus) = if let Some(value) = self.cartridge.cpu_read(address) {
             (value, true)
         } else {
             match address {
@@ -209,6 +212,7 @@ impl Bus {
                 _ => (self.open_bus, false),
             }
         };
+        let value = self.apply_cheats(address, actual);
         self.internal_data_bus = value;
         if drives_external_bus {
             self.open_bus = value;
@@ -367,7 +371,8 @@ impl Bus {
             if get_cycle && dmc_ready {
                 let address = self.dmc_dma.unwrap().address;
                 self.clock_hardware_cycle();
-                let value = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
+                let actual = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
+                let value = self.apply_cheats(address, actual);
                 self.open_bus = value;
                 if self.cartridge.region() == crate::Region::Ntsc
                     && let Some(cpu_address @ 0x4000..=0x401f) = halted_address
@@ -540,6 +545,17 @@ impl Bus {
         self.cpu_cycles
     }
 
+    pub(crate) fn set_cheats(&mut self, cheats: Vec<Cheat>) {
+        self.cheats = cheats;
+    }
+
+    fn apply_cheats(&self, address: u16, actual: u8) -> u8 {
+        self.cheats
+            .iter()
+            .find_map(|cheat| cheat.replacement(address, actual))
+            .unwrap_or(actual)
+    }
+
     pub(crate) fn snapshot(&self) -> BusSnapshot {
         let mut ppu = self.ppu.clone();
         // Frame RGB bytes are part of the legacy snapshot layout. Normalize
@@ -603,13 +619,15 @@ impl Bus {
     }
 
     pub(crate) fn peek_cpu(&self, address: u16) -> u8 {
-        self.cartridge
+        let actual = self
+            .cartridge
             .cpu_peek(address)
             .unwrap_or_else(|| match address {
                 0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
                 // Avoid side effects from PPU, APU, and controller reads.
                 _ => 0,
-            })
+            });
+        self.apply_cheats(address, actual)
     }
 
     pub(crate) fn debug_write_cpu_ram(&mut self, offset: usize, value: u8) -> bool {
@@ -663,6 +681,18 @@ mod tests {
         bus.open_bus = 0xe0;
         bus.internal_data_bus = 0xe0;
         assert_eq!(bus.read_untimed(0x4016), 0xe1);
+    }
+
+    #[test]
+    fn raw_cheats_replace_cpu_ram_reads_and_honor_compare_values() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.ram[0x20] = 0x12;
+        bus.set_cheats(vec![Cheat::new(0x0020, 0x34, Some(0x12))]);
+        assert_eq!(bus.read_untimed(0x0020), 0x34);
+        assert_eq!(bus.ram[0x20], 0x12, "a read patch does not alter RAM");
+
+        bus.set_cheats(vec![Cheat::new(0x0020, 0x56, Some(0xff))]);
+        assert_eq!(bus.read_untimed(0x0020), 0x12);
     }
 
     #[test]

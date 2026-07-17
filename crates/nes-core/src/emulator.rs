@@ -8,6 +8,7 @@ use crate::{
     bus::Bus,
     bus::BusSnapshot,
     cartridge::{Cartridge, CartridgeError},
+    cheat::Cheat,
     controller::Controller,
     cpu::{Cpu, CpuError, CpuState},
     fceux_state::{FceuxState, FceuxStateError},
@@ -237,6 +238,9 @@ impl Nes {
     }
     pub fn mapper_id(&self) -> u16 {
         self.bus.cartridge.mapper_id()
+    }
+    pub fn set_cheats(&mut self, cheats: Vec<Cheat>) {
+        self.bus.set_cheats(cheats);
     }
     pub fn has_battery(&self) -> bool {
         self.bus.cartridge.has_battery()
@@ -645,6 +649,45 @@ mod tests {
         assert_eq!(nes.frame().pixels.len(), 256 * 240 * 3);
     }
 
+    #[test]
+    fn game_genie_patch_changes_program_reads_without_modifying_rom() {
+        let rom = test_rom(&[0xa9, 0x40, 0x00]); // LDA #$40; BRK
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        nes.set_cheats(vec![Cheat::new(0x8001, 0x7f, Some(0x40))]);
+        nes.step_instruction().unwrap();
+        assert_eq!(nes.cpu_state().a, 0x7f);
+        assert_eq!(nes.memory_image(MemorySpace::PrgRom).bytes[1], 0x40);
+    }
+
+    #[test]
+    fn cheats_survive_reset_and_state_restore_but_can_be_cleared() {
+        let rom = test_rom(&[0xa9, 0x40, 0x00]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        let initial = nes.save_state().unwrap();
+        nes.set_cheats(vec![Cheat::new(0x8001, 0x7f, None)]);
+
+        nes.load_state(&initial).unwrap();
+        nes.step_instruction().unwrap();
+        assert_eq!(nes.cpu_state().a, 0x7f);
+
+        nes.reset();
+        nes.step_instruction().unwrap();
+        assert_eq!(nes.cpu_state().a, 0x7f);
+
+        nes.set_cheats(Vec::new());
+        nes.reset();
+        nes.step_instruction().unwrap();
+        assert_eq!(nes.cpu_state().a, 0x40);
+    }
+
+    #[test]
+    fn raw_cheat_can_patch_fds_program_ram_reads() {
+        let disk = vec![0; 65_500];
+        let bios = vec![0; 0x2000];
+        let mut nes = Nes::from_fds(&disk, &bios).unwrap();
+        nes.set_cheats(vec![Cheat::new(0x6000, 0xea, None)]);
+        assert_eq!(nes.peek_cpu(0x6000), 0xea);
+    }
     #[test]
     fn reset_restarts_the_frame_counter() {
         let rom = test_rom(&[0x4c, 0x00, 0x80]);

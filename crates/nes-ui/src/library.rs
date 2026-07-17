@@ -12,6 +12,7 @@ use crate::persistence;
 use nes_core::{Nes, Region};
 
 const LIBRARY_VERSION: u32 = 3;
+const FDS_LIBRARY_SCAN_BIOS: [u8; 0x2000] = [0; 0x2000];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverSource {
@@ -121,9 +122,7 @@ impl RomLibrary {
         {
             for item in read_dir.flatten() {
                 let path = item.path();
-                if path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("nes"))
+                if is_supported_game_path(&path)
                     && !self
                         .hidden
                         .iter()
@@ -172,14 +171,8 @@ impl RomLibrary {
             } else {
                 match fs::read(&path)
                     .map_err(|e| e.to_string())
-                    .and_then(|bytes| {
-                        Nes::from_ines(&bytes)
-                            .map(|nes| {
-                                let accuracy = estimate_accuracy(&nes, &bytes);
-                                (nes.rom_hash(), accuracy)
-                            })
-                            .map_err(|e| e.to_string())
-                    }) {
+                    .and_then(|bytes| inspect_game_image(&path, &bytes))
+                {
                     Ok((hash, accuracy)) => (EntryStatus::Ready, Some(hash), Some(accuracy)),
                     Err(error) => (EntryStatus::Invalid(error), None, None),
                 }
@@ -458,6 +451,30 @@ impl RomLibrary {
     }
 }
 
+fn is_supported_game_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("nes") || extension.eq_ignore_ascii_case("fds")
+    })
+}
+
+fn inspect_game_image(path: &Path, bytes: &[u8]) -> Result<(u64, AccuracyEstimate), String> {
+    let nes = if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("fds"))
+        || bytes.starts_with(b"FDS\x1a")
+    {
+        // The BIOS contents do not participate in FDS image parsing or game
+        // identity. A correctly sized placeholder lets the library validate
+        // disks without requiring or reading the user's copyrighted BIOS.
+        Nes::from_fds(bytes, &FDS_LIBRARY_SCAN_BIOS)
+    } else {
+        Nes::from_ines(bytes)
+    }
+    .map_err(|error| error.to_string())?;
+    let accuracy = estimate_accuracy(&nes, bytes);
+    Ok((nes.rom_hash(), accuracy))
+}
+
 fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
     let mapper = nes.mapper_id();
     let (coverage, mapper_penalty, mapper_note): (&str, u8, &str) = match mapper {
@@ -505,6 +522,11 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
             "Partial",
             8,
             "Namco 163 banking, IRQs, and audio work; channel mixing remains approximate.",
+        ),
+        20 => (
+            "Partial",
+            7,
+            "FDS disk transfers, timer and transfer IRQs, writable media, side changes, and wavetable audio have focused coverage; analog audio and uncommon disk protections need more testing.",
         ),
         5 => (
             "Experimental",
@@ -560,7 +582,8 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
         format!("Mapper {mapper} coverage: {coverage}; -{mapper_penalty} points. {mapper_note}"),
     ];
 
-    let nes2 = bytes.get(7).is_some_and(|value| value & 0x0c == 0x08);
+    let is_fds = mapper == 20;
+    let nes2 = !is_fds && bytes.get(7).is_some_and(|value| value & 0x0c == 0x08);
     let submapper = if nes2 {
         bytes.get(8).map_or(0, |value| value >> 4)
     } else {
@@ -572,6 +595,8 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
             score = score.saturating_sub(6);
             details.push("Unknown specialized NES 2.0 submapper: -6 points.".into());
         }
+    } else if is_fds {
+        details.push("Famicom Disk System image; mapper 20 disk hardware is enabled.".into());
     } else {
         details.push("iNES header; hardware variants may not be fully identified.".into());
     }
@@ -586,7 +611,7 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
             );
         }
     }
-    if bytes.get(6).is_some_and(|value| value & 0x08 != 0) {
+    if !is_fds && bytes.get(6).is_some_and(|value| value & 0x08 != 0) {
         score = score.saturating_sub(4);
         details.push("Four-screen nametable hardware: -4 points due to limited coverage.".into());
     }
@@ -1005,6 +1030,12 @@ mod tests {
         rom
     }
 
+    fn test_fds() -> Vec<u8> {
+        let mut disk = vec![0; 16 + 65_500];
+        disk[..5].copy_from_slice(b"FDS\x1a\x01");
+        disk
+    }
+
     #[test]
     fn scan_marks_invalid_files_and_deduplicates_identical_roms() {
         let nonce = SystemTime::now()
@@ -1049,6 +1080,46 @@ mod tests {
                 .iter()
                 .any(|entry| matches!(&entry.status, EntryStatus::Invalid(_)))
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_recognizes_fds_without_cover_or_user_bios() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "crabnes-fds-library-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk game.FDS");
+        fs::write(&path, test_fds()).unwrap();
+
+        let mut library = RomLibrary {
+            stored: Vec::new(),
+            hidden: Vec::new(),
+            entries: Vec::new(),
+        };
+        library.refresh(Some(&dir));
+
+        assert_eq!(library.entries.len(), 1);
+        let entry = &library.entries[0];
+        assert!(matches!(entry.status, EntryStatus::Ready));
+        assert_eq!(entry.path, path);
+        assert_eq!(entry.cover_image, None);
+        assert_eq!(entry.accuracy.as_ref().unwrap().mapper_coverage, "Partial");
+        assert!(
+            entry
+                .accuracy
+                .as_ref()
+                .unwrap()
+                .details
+                .iter()
+                .any(|detail| detail.contains("Famicom Disk System image"))
+        );
+
         let _ = fs::remove_dir_all(dir);
     }
 

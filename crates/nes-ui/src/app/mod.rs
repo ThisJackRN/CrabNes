@@ -15,8 +15,8 @@ use nes_achievements_native::{
     AchievementBucket, Event as AchievementEvent, EventKind as AchievementEventKind,
 };
 use nes_core::{
-    ApuChannel, Button, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace, NTSC_2C02_PALETTE, NTSC_FRAME_RATE,
-    Nes, OutputPalette, RGB_2C03_PALETTE, Region,
+    ApuChannel, Button, Cheat, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace, NTSC_2C02_PALETTE,
+    NTSC_FRAME_RATE, Nes, OutputPalette, RGB_2C03_PALETTE, Region,
 };
 use rfd::FileDialog;
 
@@ -28,8 +28,8 @@ use crate::{
     library::{CoverSource, EntryStatus, LibraryEntry, RomLibrary},
     palettes, persistence, save_states, screenshot,
     settings::{
-        self, CrtMask, CrtProfile, GamepadBinding, KeyBinding, PaletteMode, PerGameSettings,
-        PlayMode, Settings, VideoSettings,
+        self, CheatSetting, CrtMask, CrtProfile, GamepadBinding, KeyBinding, PaletteMode,
+        PerGameSettings, PlayMode, Settings, VideoSettings,
     },
     tas::{self, TasEditor, TasFrame, TasManager, TasMode, TasMovie, TasStartType},
     tas_control::{self, ControlMovie},
@@ -186,6 +186,7 @@ pub struct App {
     show_av: bool,
     show_debugger: bool,
     show_hex: bool,
+    show_cheats: bool,
     show_settings: bool,
     selected_slot: usize,
     state_slots: Vec<Option<save_states::SlotInfo>>,
@@ -209,6 +210,9 @@ pub struct App {
     hex_jump: String,
     hex_selected: Option<usize>,
     hex_value: String,
+    cheat_name: String,
+    cheat_code: String,
+    cheat_error: Option<String>,
     fds_swap_was_down: bool,
 }
 
@@ -330,6 +334,7 @@ impl App {
             show_av: false,
             show_debugger: false,
             show_hex: false,
+            show_cheats: false,
             show_settings: false,
             selected_slot: 0,
             state_slots: Vec::new(),
@@ -353,6 +358,9 @@ impl App {
             hex_jump: String::new(),
             hex_selected: None,
             hex_value: String::new(),
+            cheat_name: String::new(),
+            cheat_code: String::new(),
+            cheat_error: None,
             fds_swap_was_down: false,
         };
         if play_mode == PlayMode::Achievement {

@@ -6,6 +6,7 @@
 pub mod apu;
 pub mod bus;
 pub mod cartridge;
+pub mod cheat;
 pub mod controller;
 pub mod cpu;
 pub mod emulator;
@@ -15,6 +16,7 @@ pub mod timing;
 
 pub use apu::{ApuChannel, ApuState};
 pub use cartridge::{Cartridge, CartridgeError, Mirroring};
+pub use cheat::{Cheat, CheatError};
 pub use controller::{Button, Controller};
 pub use emulator::{EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VERSION, StateError};
 pub use fceux_state::FceuxStateError;
