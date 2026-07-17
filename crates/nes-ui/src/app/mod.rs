@@ -104,6 +104,8 @@ enum BindingCapture {
     Gamepad { player: usize, button: usize },
     VsCoinKeyboard,
     VsCoinGamepad,
+    FdsSwapKeyboard,
+    FdsSwapGamepad,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -207,6 +209,7 @@ pub struct App {
     hex_jump: String,
     hex_selected: Option<usize>,
     hex_value: String,
+    fds_swap_was_down: bool,
 }
 
 impl App {
@@ -350,6 +353,7 @@ impl App {
             hex_jump: String::new(),
             hex_selected: None,
             hex_value: String::new(),
+            fds_swap_was_down: false,
         };
         if play_mode == PlayMode::Achievement {
             app.start_achievement_session();

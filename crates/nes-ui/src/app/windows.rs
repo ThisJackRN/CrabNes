@@ -124,6 +124,22 @@ impl App {
                             .checkbox(&mut self.settings.video.integer_scaling, "Integer scaling")
                             .changed();
                         changed |= ui
+                            .checkbox(
+                                &mut self.settings.video.crop_overscan,
+                                "Crop 8px vertical overscan",
+                            )
+                            .on_hover_text("Hide eight scanlines from both the top and bottom")
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.video.crop_overscan_horizontal,
+                                "Crop 8px horizontal overscan",
+                            )
+                            .on_hover_text(
+                                "Hide eight pixels from both sides, including SMB3 edge artifacts",
+                            )
+                            .changed();
+                        changed |= ui
                             .checkbox(&mut self.settings.video.show_fps, "Show FPS")
                             .changed();
                         changed |= ui
@@ -212,6 +228,21 @@ impl App {
                         {
                             self.settings.paths.rom_folder = path;
                             self.refresh_library_and_artwork();
+                            changed = true;
+                        }
+                        let bios_label = self
+                            .settings
+                            .paths
+                            .fds_bios_path
+                            .as_ref()
+                            .map_or_else(|| "Not configured".into(), |path| path.display().to_string());
+                        ui.label(format!("FDS BIOS: {bios_label}"));
+                        if ui.button("Choose FDS BIOS…").clicked()
+                            && let Some(path) = FileDialog::new()
+                                .add_filter("FDS BIOS", &["rom", "bin"])
+                                .pick_file()
+                        {
+                            self.settings.paths.fds_bios_path = Some(path);
                             changed = true;
                         }
                         ui.label(format!("States: {}", settings::state_root().display()));
@@ -637,6 +668,10 @@ impl App {
                     BindingCapture::VsCoinGamepad => {
                         ("controller button or direction", "VS insert coin".into())
                     }
+                    BindingCapture::FdsSwapKeyboard => ("key", "FDS eject/insert".into()),
+                    BindingCapture::FdsSwapGamepad => {
+                        ("controller button or direction", "FDS eject/insert".into())
+                    }
                 };
                 ui.strong(format!("Press a {kind} for {target}…"));
                 if ui.button("Cancel").clicked() {
@@ -823,6 +858,54 @@ impl App {
                 });
         });
 
+        ui.separator();
+        ui.strong("Famicom Disk System controls");
+        ui.small("Press once to eject, then again to insert the next disk side.");
+        egui::Grid::new(ui.id().with("fds-inputs"))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("FDS action");
+                ui.strong("Keyboard");
+                ui.strong("Controller");
+                ui.end_row();
+
+                ui.label("Eject / insert next side");
+                let key_capture = BindingCapture::FdsSwapKeyboard;
+                let key_label = if self.binding_capture == Some(key_capture) {
+                    "Press a key…"
+                } else {
+                    self.settings.input.fds_swap_binding.label()
+                };
+                if ui.button(key_label).clicked() {
+                    self.binding_capture = Some(key_capture);
+                }
+
+                let gamepad_capture = BindingCapture::FdsSwapGamepad;
+                let gamepad_label = if self.binding_capture == Some(gamepad_capture) {
+                    "Press input…".into()
+                } else {
+                    self.settings
+                        .input
+                        .fds_swap_gamepad_binding
+                        .map(gamepad_binding_label)
+                        .unwrap_or_else(|| "Not bound".into())
+                };
+                let response = ui
+                    .button(gamepad_label)
+                    .on_hover_text("Click to capture. Right-click to unbind.");
+                if response.clicked() {
+                    self.binding_capture = Some(gamepad_capture);
+                }
+                if response.secondary_clicked() {
+                    self.settings.input.fds_swap_gamepad_binding = None;
+                    if self.binding_capture == Some(gamepad_capture) {
+                        self.binding_capture = None;
+                    }
+                    changed = true;
+                }
+                ui.end_row();
+            });
+
         let player1 = self.gamepad_mask(0, &self.settings.input.gamepad_bindings);
         let player2 = self.gamepad_mask(1, &self.settings.input.player2_gamepad_bindings);
         ui.monospace(format!(
@@ -888,6 +971,22 @@ impl App {
                     .changed();
                 changed |= ui
                     .checkbox(&mut self.settings.video.integer_scaling, "Integer scaling")
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.video.crop_overscan,
+                        "Crop 8px vertical overscan",
+                    )
+                    .on_hover_text("Hide eight scanlines from both the top and bottom")
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.video.crop_overscan_horizontal,
+                        "Crop 8px horizontal overscan",
+                    )
+                    .on_hover_text(
+                        "Hide eight pixels from both sides, including SMB3 edge artifacts",
+                    )
                     .changed();
                 ui.separator();
                 changed |= palette_settings_ui(

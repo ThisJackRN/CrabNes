@@ -375,7 +375,7 @@ impl App {
     pub(super) fn open_rom_dialog(&mut self) {
         let mut dialog = FileDialog::new()
             .set_title("Open NES ROM")
-            .add_filter("NES ROM", &["nes"]);
+            .add_filter("NES/FDS ROM", &["nes", "fds"]);
         if self.settings.paths.rom_folder.is_dir() {
             dialog = dialog.set_directory(&self.settings.paths.rom_folder);
         }
@@ -391,8 +391,46 @@ impl App {
     pub(super) fn load_rom(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
         self.save_battery()?;
         let bytes = fs::read(&path)?;
+
+        let mut bios_bytes = vec![];
+        let mut bios_slice = None;
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("fds"))
+            || bytes.starts_with(b"FDS\x1a")
+        {
+            let mut found_bios = false;
+            if let Some(bios_path) = &self.settings.paths.fds_bios_path
+                && let Ok(b) = fs::read(bios_path)
+            {
+                bios_bytes = b;
+                found_bios = true;
+            }
+            if !found_bios {
+                let local_path = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("disksys.rom");
+                let rom_dir_path = path
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""))
+                    .join("disksys.rom");
+                if let Ok(b) = fs::read(&local_path) {
+                    bios_bytes = b;
+                    found_bios = true;
+                } else if let Ok(b) = fs::read(&rom_dir_path) {
+                    bios_bytes = b;
+                    found_bios = true;
+                }
+            }
+            if found_bios {
+                bios_slice = Some(bios_bytes.as_slice());
+            } else {
+                return Err("FDS BIOS not configured in Settings -> Paths and disksys.rom not found in ROM folder or current directory.".into());
+            }
+        }
+
         let inferred_region = inferred_region_from_rom_path(&path);
-        let mut replacement = nes_from_rom_path(&bytes, Some(&path))?;
+        let mut replacement = nes_from_rom_path_with_bios(&bytes, Some(&path), bios_slice)?;
         load_battery(&mut replacement, &path)?;
         let hash = replacement.rom_hash();
         self.per_game = settings::load_per_game(hash);
@@ -659,6 +697,20 @@ pub(super) fn nes_from_rom_path(
     bytes: &[u8],
     path: Option<&Path>,
 ) -> Result<Nes, nes_core::EmulationError> {
+    nes_from_rom_path_with_bios(bytes, path, None)
+}
+
+fn nes_from_rom_path_with_bios(
+    bytes: &[u8],
+    path: Option<&Path>,
+    bios: Option<&[u8]>,
+) -> Result<Nes, nes_core::EmulationError> {
+    if let Some(bios) = bios
+        && (path.is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fds")))
+            || bytes.starts_with(b"FDS\x1a"))
+    {
+        return Nes::from_fds(bytes, bios);
+    }
     match path.and_then(inferred_region_from_rom_path) {
         Some(region) => Nes::from_ines_with_region(bytes, region),
         None => Nes::from_ines(bytes),

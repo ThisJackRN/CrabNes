@@ -317,14 +317,18 @@ impl App {
                 return;
             }
             let available = ui.available_size();
-            let aspect = FRAME_WIDTH as f32 / FRAME_HEIGHT as f32;
+            let crop_x = usize::from(self.settings.video.crop_overscan_horizontal) * 8;
+            let crop_y = usize::from(self.settings.video.crop_overscan) * 8;
+            let visible_width = FRAME_WIDTH - crop_x * 2;
+            let visible_height = FRAME_HEIGHT - crop_y * 2;
+            let aspect = visible_width as f32 / visible_height as f32;
             let mut size = Vec2::new(available.x, available.x / aspect);
             if size.y > available.y {
                 size = Vec2::new(available.y * aspect, available.y);
             }
             if self.settings.video.integer_scaling {
                 let available_scale =
-                    (size.x / FRAME_WIDTH as f32).min(size.y / FRAME_HEIGHT as f32);
+                    (size.x / visible_width as f32).min(size.y / visible_height as f32);
                 let scale = if available_scale >= 1.0 {
                     available_scale.floor()
                 } else {
@@ -332,7 +336,7 @@ impl App {
                     // native resolution cannot fit in a small or snapped window.
                     available_scale.max(0.01)
                 };
-                size = Vec2::new(FRAME_WIDTH as f32 * scale, FRAME_HEIGHT as f32 * scale);
+                size = Vec2::new(visible_width as f32 * scale, visible_height as f32 * scale);
             }
             // Center the frame in both axes and snap it to whole physical
             // pixels so resizing never leaves it top-anchored or shimmering.
@@ -346,7 +350,14 @@ impl App {
                 ),
                 size,
             );
-            egui::Image::new(&self.texture).paint_at(ui, image_rect);
+            if self.powered {
+                let uv = overscan_uv(crop_x, crop_y);
+                ui.painter()
+                    .image(self.texture.id(), image_rect, uv, egui::Color32::WHITE);
+            } else {
+                ui.painter()
+                    .rect_filled(image_rect, 0.0, egui::Color32::BLACK);
+            }
         });
         self.achievement_toast_overlay(ui.ctx());
     }
@@ -752,4 +763,31 @@ pub(super) fn decode_cover_image(path: &Path) -> Result<ColorImage, String> {
         dimensions,
         rgba.as_raw(),
     ))
+}
+
+fn overscan_uv(crop_x: usize, crop_y: usize) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            crop_x as f32 / FRAME_WIDTH as f32,
+            crop_y as f32 / FRAME_HEIGHT as f32,
+        ),
+        egui::pos2(
+            (FRAME_WIDTH - crop_x) as f32 / FRAME_WIDTH as f32,
+            (FRAME_HEIGHT - crop_y) as f32 / FRAME_HEIGHT as f32,
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overscan_uv_crops_eight_source_pixels_on_every_enabled_edge() {
+        let uv = overscan_uv(8, 8);
+        assert_eq!(uv.min.x, 8.0 / 256.0);
+        assert_eq!(uv.max.x, 248.0 / 256.0);
+        assert_eq!(uv.min.y, 8.0 / 240.0);
+        assert_eq!(uv.max.y, 232.0 / 240.0);
+    }
 }

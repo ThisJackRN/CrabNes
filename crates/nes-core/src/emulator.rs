@@ -21,7 +21,7 @@ pub enum EmulationError {
 }
 
 const STATE_MAGIC: &[u8; 8] = b"MONESST\0";
-pub const SAVE_STATE_VERSION: u32 = 6;
+pub const SAVE_STATE_VERSION: u32 = 7;
 
 #[derive(Debug)]
 pub enum StateError {
@@ -105,6 +105,10 @@ impl Nes {
         Self::from_cartridge(bytes, Cartridge::from_ines(bytes)?)
     }
 
+    pub fn from_fds(bytes: &[u8], bios: &[u8]) -> Result<Self, EmulationError> {
+        Self::from_cartridge(bytes, Cartridge::from_fds(bytes, bios)?)
+    }
+
     pub fn from_ines_with_region(bytes: &[u8], region: Region) -> Result<Self, EmulationError> {
         Self::from_cartridge(bytes, Cartridge::from_ines_with_region(bytes, region)?)
     }
@@ -177,6 +181,10 @@ impl Nes {
         self.cpu.reset(&mut self.bus);
         self.bus.finish_cpu_sequence(7);
         self.powered = true;
+    }
+
+    pub fn swap_disk(&mut self) {
+        self.bus.cartridge.swap_disk();
     }
 
     pub fn power_off(&mut self) {
@@ -635,6 +643,20 @@ mod tests {
         // reaches VBlank slightly sooner than a steady-state 29,780-cycle frame.
         assert!(nes.cpu_cycles() > 27_000);
         assert_eq!(nes.frame().pixels.len(), 256 * 240 * 3);
+    }
+
+    #[test]
+    fn reset_restarts_the_frame_counter() {
+        let rom = test_rom(&[0x4c, 0x00, 0x80]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        nes.run_frame().unwrap();
+        nes.run_frame().unwrap();
+        assert_eq!(nes.frame().number, 2);
+
+        nes.reset();
+        assert_eq!(nes.frame().number, 0);
+        nes.run_frame().unwrap();
+        assert_eq!(nes.frame().number, 1);
     }
 
     #[test]

@@ -4,5 +4,7 @@
 /frame.ppm
 /roms/
 *.nes
+*.fds
+disksys.rom
 *.sav
 *.state
