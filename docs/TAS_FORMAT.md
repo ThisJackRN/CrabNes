@@ -21,6 +21,17 @@ PLAYERS 2
 are encoded as `\\`, `\n`, and `\r`. Unknown metadata keys and unknown named
 sections are ignored so optional additions do not invalidate version 1 readers.
 
+`JOYPAD_TIMING FCEUX` is optional. Real front-loader hardware clocks the
+controller shift register on every read slot, so DMC/OAM DMA cycles that
+overlap a `$4016`/`$4017` read corrupt the pad stream (games such as SMB3
+mitigate this by re-reading, which costs cycles and changes lag patterns).
+FCEUX does not emulate that corruption, so movies converted from FM2 record
+this key and play back with FCEUX's simplified single-clock model; their lag
+pattern then reproduces exactly. Absent (or `JOYPAD_TIMING HARDWARE`), playback
+uses the hardware-accurate model. Native recordings capture whichever model the
+advanced Emulation setting selected while recording, so deliberate FCEUX-style
+recordings also replay consistently.
+
 The loader rejects unsupported versions, non-NTSC movies, unknown start types,
 invalid masks, missing required fields, nonsequential input rows, malformed
 embedded states, and ROM SHA-256 mismatches. A differing emulator version is a
@@ -42,6 +53,33 @@ TU9ORVNTVAEAAAA...
 The payload is the same versioned core snapshot used by normal save states and
 contains CPU, PPU, APU, RAM, mapper, controllers, DMA, interrupts, timing, and
 power state. No screenshots, audio recordings, or video frames are stored.
+
+## Cheats (Game Genie)
+
+Movies record the cheat codes that were enabled when recording started, in an
+optional `[CHEATS]` section with one code per line. Both Game Genie letters and
+raw CPU read patches are valid; every line must decode or the file is rejected:
+
+```text
+[CHEATS]
+SXIOPO
+$6000:EA
+```
+
+The codes behave like a physical Game Genie sitting between cartridge and
+console: they are locked in when the movie starts, applied whenever the movie's
+starting condition is reconstructed, used during independent checkpoint replay,
+and cannot change mid-run. While a movie is recording or playing, the machine
+keeps the movie's codes; edits to the per-game cheat list take effect after the
+TAS stops. When converting foreign formats (FM2, BK2, BizHawk logs), the TAS
+Control View offers a checkbox (on by default) that locks the player's enabled
+codes into the converted movie — replaying the original inputs through a
+plugged-in Game Genie. Because those runs were recorded without the codes, they
+may play out differently; unchecking it converts the movie cheat-free.
+
+Movies without the section run cheat-free. Because unknown sections are
+ignored, older readers still load `[CHEATS]` movies but will not apply the
+codes and may desync.
 
 ## Markers and state hashes
 

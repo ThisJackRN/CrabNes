@@ -15,8 +15,9 @@ use nes_achievements_native::{
     AchievementBucket, Event as AchievementEvent, EventKind as AchievementEventKind,
 };
 use nes_core::{
-    ApuChannel, Button, Cheat, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace, NTSC_2C02_PALETTE,
-    NTSC_FRAME_RATE, Nes, OutputPalette, RGB_2C03_PALETTE, Region,
+    ApuChannel, Button, Cheat, CheatActivity, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace,
+    NTSC_2C02_PALETTE, NTSC_FRAME_RATE, Nes, OutputPalette, RGB_2C03_PALETTE, RGB_2C04_0004_PALETTE,
+    Region,
 };
 use rfd::FileDialog;
 
@@ -199,6 +200,8 @@ pub struct App {
     tas_control_selected: usize,
     tas_control_scroll: Option<usize>,
     tas_control_start: TasStartType,
+    tas_control_include_cheats: bool,
+    tas_control_fceux_timing: bool,
     tas_control_status: String,
     rewind: VecDeque<RewindPoint>,
     rewind_compressor: RewindCompressor,
@@ -213,7 +216,15 @@ pub struct App {
     cheat_name: String,
     cheat_code: String,
     cheat_error: Option<String>,
+    cheat_flash: Vec<CheatFlash>,
     fds_swap_was_down: bool,
+}
+
+/// Per-cheat presentation state that lights an activity dot for a short time
+/// after the substitution counter advances.
+pub(super) struct CheatFlash {
+    hits: u64,
+    flash_until: Option<Instant>,
 }
 
 impl App {
@@ -347,6 +358,8 @@ impl App {
             tas_control_selected: 0,
             tas_control_scroll: None,
             tas_control_start: TasStartType::PowerOn,
+            tas_control_include_cheats: true,
+            tas_control_fceux_timing: false,
             tas_control_status: "Open an external TAS movie to inspect its inputs".into(),
             rewind: VecDeque::new(),
             rewind_compressor: RewindCompressor::new(),
@@ -361,6 +374,7 @@ impl App {
             cheat_name: String::new(),
             cheat_code: String::new(),
             cheat_error: None,
+            cheat_flash: Vec::new(),
             fds_swap_was_down: false,
         };
         if play_mode == PlayMode::Achievement {

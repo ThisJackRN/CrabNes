@@ -51,6 +51,9 @@ impl Error for StateError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemorySpace {
+    /// The 64 KiB address space as the running program observes it, including
+    /// active cheat substitutions. Side-effect-free; hardware registers read 0.
+    CpuBus,
     CpuRam,
     PpuNametable,
     Palette,
@@ -63,6 +66,20 @@ pub struct MemoryImage {
     pub bytes: Vec<u8>,
     pub base_address: usize,
     pub writable: bool,
+}
+
+/// Live statistics for one active cheat, for front-end visualization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheatActivity {
+    pub cheat: Cheat,
+    /// Times the emulated CPU's reads were substituted since the cheat list
+    /// was installed. Runtime-only; never stored in save states or movies.
+    pub hits: u64,
+    /// The byte at the address with no cheat device attached.
+    pub actual: u8,
+    /// The byte the program currently observes; equals `actual` while an
+    /// eight-letter code waits for its compare value.
+    pub observed: u8,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,7 +115,6 @@ pub struct Nes {
     powered: bool,
     rom_hash: u64,
     rom_sha256: [u8; 32],
-    native_output_palette: Option<crate::ppu::OutputPalette>,
 }
 
 impl Nes {
@@ -115,18 +131,14 @@ impl Nes {
     }
 
     fn from_cartridge(bytes: &[u8], cartridge: Cartridge) -> Result<Self, EmulationError> {
-        let native_output_palette = native_output_palette(bytes, cartridge.mapper_id());
         let mut bus = Bus::new(cartridge);
-        if let Some(palette) = native_output_palette {
-            bus.ppu.set_output_palette(palette);
-        }
+        bus.arm_ppu_reset_reg_lock();
         let mut nes = Self {
             cpu: Cpu::default(),
             bus,
             powered: true,
             rom_hash: hash_rom(bytes),
             rom_sha256: Sha256::digest(bytes).into(),
-            native_output_palette,
         };
         nes.bus.begin_cpu_sequence();
         nes.cpu.reset(&mut nes.bus);
@@ -211,9 +223,6 @@ impl Nes {
     pub fn set_output_palette(&mut self, palette: crate::ppu::OutputPalette) {
         self.bus.ppu.set_output_palette(palette);
     }
-    pub fn native_output_palette(&self) -> Option<crate::ppu::OutputPalette> {
-        self.native_output_palette
-    }
     pub fn cpu_cycles(&self) -> u64 {
         self.bus.cpu_cycles()
     }
@@ -235,6 +244,20 @@ impl Nes {
     }
     pub fn controller_mut(&mut self, port: usize) -> Option<&mut Controller> {
         self.bus.controllers.get_mut(port)
+    }
+    /// Select the joypad clocking model. The default (`false`) is NES-001
+    /// front-loader hardware, where DMA cycles overlapping a $4016/$4017 read
+    /// clock the controller shift register extra times — the AccuracyCoin-
+    /// verified read corruption that games such as SMB3 mitigate by
+    /// re-reading. `true` selects the filtered model FCEUX uses, with no DMA
+    /// corruption; front ends enable it only while playing movies recorded
+    /// against that simplified behavior. Not part of save states: whoever
+    /// drives playback is responsible for applying the movie's model.
+    pub fn set_fceux_joypad_compat(&mut self, enabled: bool) {
+        self.bus.set_fceux_joypad_compat(enabled);
+    }
+    pub fn fceux_joypad_compat(&self) -> bool {
+        self.bus.fceux_joypad_compat()
     }
     pub fn mapper_id(&self) -> u16 {
         self.bus.cartridge.mapper_id()
@@ -326,6 +349,11 @@ impl Nes {
 
     pub fn memory_image(&self, space: MemorySpace) -> MemoryImage {
         match space {
+            MemorySpace::CpuBus => MemoryImage {
+                bytes: (0..=0xffffu16).map(|address| self.peek_cpu(address)).collect(),
+                base_address: 0,
+                writable: false,
+            },
             MemorySpace::CpuRam => MemoryImage {
                 bytes: self.bus.cpu_ram().to_vec(),
                 base_address: 0,
@@ -361,6 +389,7 @@ impl Nes {
 
     pub fn debug_write_memory(&mut self, space: MemorySpace, offset: usize, value: u8) -> bool {
         match space {
+            MemorySpace::CpuBus => false,
             MemorySpace::CpuRam => self.bus.debug_write_cpu_ram(offset, value),
             MemorySpace::PpuNametable => self.bus.ppu.debug_write_nametable(offset, value),
             MemorySpace::Palette => self.bus.ppu.debug_write_palette(offset, value),
@@ -392,28 +421,30 @@ impl Nes {
         self.bus.peek_cpu(address)
     }
 
+    /// Live view of every installed cheat: where it patches, whether the
+    /// program currently observes the patched value, and how many CPU reads
+    /// it has substituted since installation.
+    pub fn cheat_activity(&self) -> Vec<CheatActivity> {
+        self.bus
+            .cheats_with_hits()
+            .map(|(cheat, hits)| {
+                let actual = self.bus.peek_cpu_actual(cheat.address);
+                CheatActivity {
+                    cheat,
+                    hits,
+                    actual,
+                    observed: self.bus.peek_cpu(cheat.address),
+                }
+            })
+            .collect()
+    }
+
     pub fn controller_reads(&self, port: usize) -> u64 {
         self.bus
             .controllers
             .get(port)
             .map_or(0, Controller::total_reads)
     }
-}
-
-fn native_output_palette(bytes: &[u8], mapper_id: u16) -> Option<crate::ppu::OutputPalette> {
-    // Legacy iNES headers do not identify the RGB PPU revision. Match the
-    // PRG+CHR payload so header repairs do not lose the correct hardware.
-    const VS_SMB_PRG_CHR_SHA256: [u8; 32] = [
-        0x5e, 0xb7, 0xf1, 0x85, 0x41, 0xc6, 0x1e, 0xb3, 0x94, 0x1b, 0x00, 0x43, 0x66, 0x03, 0xb5,
-        0xaa, 0xad, 0x4c, 0x93, 0xa2, 0xb2, 0x99, 0x91, 0x8f, 0x88, 0x94, 0x96, 0x3d, 0x50, 0x62,
-        0x71, 0xdc,
-    ];
-    if mapper_id != 99 || bytes.len() <= 16 {
-        return None;
-    }
-    let content_start = 16 + usize::from(bytes.get(6).is_some_and(|flags| flags & 0x04 != 0)) * 512;
-    let content_hash: [u8; 32] = Sha256::digest(bytes.get(content_start..)?).into();
-    (content_hash == VS_SMB_PRG_CHR_SHA256).then_some(crate::ppu::RGB_2C04_0004_PALETTE)
 }
 
 fn hash_rom(bytes: &[u8]) -> u64 {
@@ -660,6 +691,36 @@ mod tests {
     }
 
     #[test]
+    fn cheat_activity_counts_real_reads_and_cpu_bus_view_shows_the_patch() {
+        let rom = test_rom(&[0xa9, 0x40, 0x00]); // LDA #$40; BRK
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        nes.set_cheats(vec![Cheat::new(0x8001, 0x7f, Some(0x40))]);
+
+        let before = nes.cheat_activity();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].hits, 0);
+        assert_eq!(before[0].actual, 0x40);
+        assert_eq!(before[0].observed, 0x7f);
+
+        nes.step_instruction().unwrap();
+        let after = nes.cheat_activity();
+        assert_eq!(after[0].hits, 1);
+        // Inspection peeks must never count as the cheat firing.
+        assert_eq!(nes.peek_cpu(0x8001), 0x7f);
+        assert_eq!(nes.cheat_activity()[0].hits, 1);
+
+        let bus = nes.memory_image(MemorySpace::CpuBus);
+        assert_eq!(bus.bytes.len(), 0x1_0000);
+        assert!(!bus.writable);
+        assert_eq!(bus.bytes[0x8001], 0x7f);
+        assert_eq!(nes.memory_image(MemorySpace::PrgRom).bytes[1], 0x40);
+
+        // Reinstalling the cheat list restarts the counters.
+        nes.set_cheats(vec![Cheat::new(0x8001, 0x7f, Some(0x40))]);
+        assert_eq!(nes.cheat_activity()[0].hits, 0);
+    }
+
+    #[test]
     fn cheats_survive_reset_and_state_restore_but_can_be_cleared() {
         let rom = test_rom(&[0xa9, 0x40, 0x00]);
         let mut nes = Nes::from_ines(&rom).unwrap();
@@ -880,6 +941,24 @@ mod tests {
         // The write ended on odd CPU cycle 13, selecting the 514-cycle DMA
         // stall. The following NOP still owns only its documented two slots.
         assert_eq!(nes.cpu_cycles() - before_nop, 514 + 2);
+    }
+
+    #[test]
+    fn oam_dma_uses_the_shorter_stall_from_an_even_cpu_cycle() {
+        // LDA $10 (zero page, 3 cycles) instead of the previous test's
+        // immediate LDA (2 cycles) shifts the STA $4014 write's ending cycle
+        // from odd to even, exercising the other DMA-stall parity.
+        let rom = test_rom(&[0xa5, 0x10, 0x8d, 0x14, 0x40, 0xea]);
+        let mut nes = Nes::from_ines(&rom).unwrap();
+        assert_eq!(nes.step_instruction().unwrap(), 3);
+        assert_eq!(nes.step_instruction().unwrap(), 4);
+        assert_eq!(nes.cpu_cycles(), 14, "the write must end on even CPU cycle 14");
+        let before_nop = nes.cpu_cycles();
+
+        assert_eq!(nes.step_instruction().unwrap(), 2);
+        // The write ended on an even CPU cycle, selecting the 513-cycle DMA
+        // stall (one cycle shorter than the odd-start case above).
+        assert_eq!(nes.cpu_cycles() - before_nop, 513 + 2);
     }
 
     #[test]

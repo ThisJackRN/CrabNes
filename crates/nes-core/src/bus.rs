@@ -25,9 +25,24 @@ pub struct Bus {
     open_bus: u8,
     dmc_completed_last_cpu_slot: bool,
     cpu_sequence_cycles: u16,
+    /// Tracks contiguous reads of the same joypad port (index 0 = $4016,
+    /// 1 = $4017); cleared by any other bus access. Only consulted when
+    /// `fceux_joypad_compat` is enabled.
+    joypad_oe: [bool; 2],
+    /// Joypad clocking model. `false` (default) is NES-001 front-loader
+    /// hardware: every CPU read slot on $4016/$4017 clocks the controller
+    /// shift register, so DMC/OAM DMA cycles overlapping a joypad read cause
+    /// the multi-clock corruption AccuracyCoin verifies (games like SMB3
+    /// mitigate it by re-reading). `true` filters contiguous same-port reads
+    /// down to one clock, matching the simplified model FCEUX movies were
+    /// recorded against; the front end enables it only for such movies.
+    fceux_joypad_compat: bool,
     nmi_samples: Vec<bool>,
     irq_samples: Vec<bool>,
     cheats: Vec<Cheat>,
+    /// Runtime-only substitution counts parallel to `cheats`. Deliberately not
+    /// part of snapshots: presentation statistics must never alter TAS hashes.
+    cheat_hits: Vec<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,6 +65,8 @@ impl Bus {
         let region = cartridge.region();
         Self {
             ram: [0; 0x800],
+            // Power-on write lock is armed by Nes::from_cartridge / reset, not
+            // here — unit tests construct bare buses mid-"run".
             ppu: Ppu::default(),
             apu: Apu::new(region),
             cartridge,
@@ -61,10 +78,17 @@ impl Bus {
             open_bus: 0,
             dmc_completed_last_cpu_slot: false,
             cpu_sequence_cycles: 0,
+            joypad_oe: [false; 2],
+            fceux_joypad_compat: false,
             nmi_samples: Vec::with_capacity(8),
             irq_samples: Vec::with_capacity(8),
             cheats: Vec::new(),
+            cheat_hits: Vec::new(),
         }
+    }
+
+    pub(crate) fn arm_ppu_reset_reg_lock(&mut self) {
+        self.ppu.arm_reset_reg_lock();
     }
 
     pub fn reset(&mut self) {
@@ -79,8 +103,34 @@ impl Bus {
         self.open_bus = 0;
         self.dmc_completed_last_cpu_slot = false;
         self.cpu_sequence_cycles = 0;
+        self.joypad_oe = [false; 2];
         self.nmi_samples.clear();
         self.irq_samples.clear();
+    }
+
+    pub(crate) fn set_fceux_joypad_compat(&mut self, enabled: bool) {
+        self.fceux_joypad_compat = enabled;
+        self.joypad_oe = [false; 2];
+    }
+
+    pub(crate) fn fceux_joypad_compat(&self) -> bool {
+        self.fceux_joypad_compat
+    }
+
+    /// Read a joypad port. Hardware (default) clocks the shift register on
+    /// every read slot, including DMA-induced repeats of a halted read. The
+    /// FCEUX-compat model instead folds back-to-back cycles on the same port
+    /// into a single clock so DMA overlap cannot corrupt the pad stream.
+    fn read_joypad(&mut self, port: usize) -> u8 {
+        let contiguous = self.joypad_oe[port];
+        self.joypad_oe = [false; 2];
+        self.joypad_oe[port] = true;
+        let clock = !(self.fceux_joypad_compat && contiguous);
+        self.controllers[port].read(clock)
+    }
+
+    fn clear_joypad_oe(&mut self) {
+        self.joypad_oe = [false; 2];
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
@@ -189,30 +239,43 @@ impl Bus {
 
     fn read_untimed(&mut self, address: u16) -> u8 {
         let (actual, drives_external_bus) = if let Some(value) = self.cartridge.cpu_read(address) {
+            self.clear_joypad_oe();
             (value, true)
         } else {
             match address {
-                0x0000..=0x1fff => (self.ram[address as usize & 0x07ff], true),
-                0x2000..=0x3fff => (self.ppu.cpu_read(address & 7, &mut self.cartridge), true),
+                0x0000..=0x1fff => {
+                    self.clear_joypad_oe();
+                    (self.ram[address as usize & 0x07ff], true)
+                }
+                0x2000..=0x3fff => {
+                    self.clear_joypad_oe();
+                    (self.ppu.cpu_read(address & 7, &mut self.cartridge), true)
+                }
                 // $4015 is entirely internal to the 2A03. Bit 5 retains the
                 // internal latch, and the read does not drive the external bus.
-                0x4015 => (
-                    self.apu.read_status() | (self.internal_data_bus & 0x20),
-                    false,
-                ),
+                0x4015 => {
+                    self.clear_joypad_oe();
+                    (
+                        self.apu.read_status() | (self.internal_data_bus & 0x20),
+                        false,
+                    )
+                }
                 // The controller drives only the low serial bit. The upper
                 // three bits retain CPU open bus on an NTSC NES.
                 0x4016 if self.cartridge.mapper_id() == 99 => (
-                    self.controllers[0].read() | (u8::from(self.controllers[0].coin()) * 0x20),
+                    self.read_joypad(0) | (u8::from(self.controllers[0].coin()) * 0x20),
                     true,
                 ),
-                0x4017 if self.cartridge.mapper_id() == 99 => (self.controllers[1].read(), true),
-                0x4016 => (self.controllers[0].read() | (self.open_bus & 0xe0), true),
-                0x4017 => (self.controllers[1].read() | (self.open_bus & 0xe0), true),
-                _ => (self.open_bus, false),
+                0x4017 if self.cartridge.mapper_id() == 99 => (self.read_joypad(1), true),
+                0x4016 => (self.read_joypad(0) | (self.open_bus & 0xe0), true),
+                0x4017 => (self.read_joypad(1) | (self.open_bus & 0xe0), true),
+                _ => {
+                    self.clear_joypad_oe();
+                    (self.open_bus, false)
+                }
             }
         };
-        let value = self.apply_cheats(address, actual);
+        let value = self.apply_cheats_counted(address, actual);
         self.internal_data_bus = value;
         if drives_external_bus {
             self.open_bus = value;
@@ -230,6 +293,7 @@ impl Bus {
     fn write_untimed(&mut self, address: u16, value: u8) {
         self.internal_data_bus = value;
         self.open_bus = value;
+        self.clear_joypad_oe();
         if self.cartridge.cpu_write(address, value) {
             return;
         }
@@ -327,6 +391,11 @@ impl Bus {
             return false;
         }
 
+        // NTSC: while halted on $4016/$4017, dummy/align DMA cycles must not
+        // issue extra external re-reads. The halt cycle *does* re-read (and
+        // clocks the pad); the resumed CPU access clocks again — hardware's
+        // DMA read corruption. Under the FCEUX-compat model, read_joypad folds
+        // those contiguous same-port reads into a single shift edge instead.
         let skip_dummy_reads = self.cartridge.region() == crate::Region::Ntsc
             && matches!(halted_address, Some(0x4016 | 0x4017));
 
@@ -341,6 +410,7 @@ impl Bus {
                 dma.need_halt = false;
             }
             self.clock_hardware_cycle();
+            // Halt cycle always re-issues the CPU read (visible on joypad /OE).
             if let Some(address) = halted_address {
                 self.read_untimed(address);
             }
@@ -371,8 +441,10 @@ impl Bus {
             if get_cycle && dmc_ready {
                 let address = self.dmc_dma.unwrap().address;
                 self.clock_hardware_cycle();
+                // DMA address is on the external bus, so joypad /OE drops.
+                self.clear_joypad_oe();
                 let actual = self.cartridge.cpu_read(address).unwrap_or(self.open_bus);
-                let value = self.apply_cheats(address, actual);
+                let value = self.apply_cheats_counted(address, actual);
                 self.open_bus = value;
                 if self.cartridge.region() == crate::Region::Ntsc
                     && let Some(cpu_address @ 0x4000..=0x401f) = halted_address
@@ -418,6 +490,8 @@ impl Bus {
             } else {
                 self.advance_dmc_setup();
                 self.clock_hardware_cycle();
+                // Dummy / alignment: re-read unless NTSC joypad (contiguous /OE
+                // already held from halt; extra external clocks are filtered).
                 if !skip_dummy_reads && let Some(address) = halted_address {
                     self.read_untimed(address);
                 }
@@ -447,7 +521,10 @@ impl Bus {
                 // mapped OAM source wins the data-bus conflict. That makes
                 // controller bits visible for open-bus source pages while
                 // preserving the source byte for RAM pages.
-                let controller_bit = self.controllers[port].read();
+                // OAM DMA conflict with joypad: treat as a fresh /OE edge so
+                // the shift clock still fires (side-effect on the joypad pin).
+                self.joypad_oe[port] = false;
+                let controller_bit = self.read_joypad(port);
                 if address < 0x2000 {
                     return self.read_untimed(address);
                 }
@@ -546,7 +623,15 @@ impl Bus {
     }
 
     pub(crate) fn set_cheats(&mut self, cheats: Vec<Cheat>) {
+        self.cheat_hits = vec![0; cheats.len()];
         self.cheats = cheats;
+    }
+
+    pub(crate) fn cheats_with_hits(&self) -> impl Iterator<Item = (Cheat, u64)> + '_ {
+        self.cheats
+            .iter()
+            .copied()
+            .zip(self.cheat_hits.iter().copied())
     }
 
     fn apply_cheats(&self, address: u16, actual: u8) -> u8 {
@@ -554,6 +639,19 @@ impl Bus {
             .iter()
             .find_map(|cheat| cheat.replacement(address, actual))
             .unwrap_or(actual)
+    }
+
+    /// Cheat substitution on the emulated CPU's own read paths. Unlike the
+    /// side-effect-free peek used by inspection tools, real reads count hits
+    /// so the front end can show where a code is firing.
+    fn apply_cheats_counted(&mut self, address: u16, actual: u8) -> u8 {
+        for (cheat, hits) in self.cheats.iter().zip(&mut self.cheat_hits) {
+            if let Some(value) = cheat.replacement(address, actual) {
+                *hits = hits.wrapping_add(1);
+                return value;
+            }
+        }
+        actual
     }
 
     pub(crate) fn snapshot(&self) -> BusSnapshot {
@@ -619,15 +717,18 @@ impl Bus {
     }
 
     pub(crate) fn peek_cpu(&self, address: u16) -> u8 {
-        let actual = self
-            .cartridge
+        self.apply_cheats(address, self.peek_cpu_actual(address))
+    }
+
+    /// The byte the console would see with no cheat device attached.
+    pub(crate) fn peek_cpu_actual(&self, address: u16) -> u8 {
+        self.cartridge
             .cpu_peek(address)
             .unwrap_or_else(|| match address {
                 0x0000..=0x1fff => self.ram[address as usize & 0x07ff],
                 // Avoid side effects from PPU, APU, and controller reads.
                 _ => 0,
-            });
-        self.apply_cheats(address, actual)
+            })
     }
 
     pub(crate) fn debug_write_cpu_ram(&mut self, offset: usize, value: u8) -> bool {
@@ -773,6 +874,8 @@ mod tests {
 
     #[test]
     fn dmc_dma_collision_clocks_ntsc_controller_before_retried_read() {
+        // Halt re-reads $4016 (clocks A off), dummy/align filtered, DMA get
+        // drops /OE, resume clocks again — returned bit is B (released = 0).
         let mut bus = Bus::new(nrom_cartridge());
         bus.controllers[0].set_button(crate::controller::Button::A, true);
         bus.controllers[0].write_strobe(1, true);
@@ -785,7 +888,44 @@ mod tests {
         });
 
         assert_eq!(bus.read(0x4016) & 1, 0, "the retried read sees B, not A");
+        // Halt + resume both access $4016 (dummy/align skipped for NTSC joypad).
         assert_eq!(bus.controllers[0].total_reads(), 2);
+    }
+
+    #[test]
+    fn fceux_compat_folds_back_to_back_joypad_reads_into_one_clock() {
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.set_fceux_joypad_compat(true);
+        bus.controllers[0].set_button(crate::controller::Button::A, true);
+        bus.controllers[0].set_button(crate::controller::Button::B, true);
+        bus.controllers[0].write_strobe(1, true);
+        bus.controllers[0].write_strobe(0, true);
+
+        // Two untimed reads in the same "contiguous" sense need the OE flag.
+        let a = bus.read_untimed(0x4016) & 1;
+        let b = bus.read_untimed(0x4016) & 1;
+        assert_eq!(a, 1, "first contiguous read clocks A");
+        assert_eq!(b, 1, "held contiguous set does not shift — still A");
+        // Break contiguity with an unrelated access; the next poll clocks B.
+        let _ = bus.read_untimed(0x0000);
+        assert_eq!(bus.read_untimed(0x4016) & 1, 1, "fresh read clocks B");
+    }
+
+    #[test]
+    fn hardware_default_clocks_every_joypad_read_slot() {
+        // The NES-001 model AccuracyCoin verifies: no contiguity filtering,
+        // so back-to-back reads (as DMA overlap produces) shift every time.
+        let mut bus = Bus::new(nrom_cartridge());
+        bus.controllers[0].set_button(crate::controller::Button::A, true);
+        bus.controllers[0].write_strobe(1, true);
+        bus.controllers[0].write_strobe(0, true);
+
+        assert_eq!(bus.read_untimed(0x4016) & 1, 1, "first read clocks A");
+        assert_eq!(
+            bus.read_untimed(0x4016) & 1,
+            0,
+            "second contiguous read still shifts to B (released)"
+        );
     }
 
     #[test]

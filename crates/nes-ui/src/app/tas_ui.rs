@@ -152,7 +152,21 @@ impl App {
                             movie.start_type, movie.region, movie.rerecord_count
                         ));
                         ui.monospace(format!("ROM {}…", &movie.rom_sha256[..12]));
+                        if movie.fceux_joypad_compat {
+                            ui.colored_label(egui::Color32::LIGHT_BLUE, "FCEUX pad timing")
+                                .on_hover_text(
+                                    "This movie plays with FCEUX's simplified controller \
+                                     clocking (no DMC/OAM DMA read corruption). Hardware-accurate \
+                                     clocking resumes when the TAS stops.",
+                                );
+                        }
                     });
+                    if !movie.cheats.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Game Genie / cheats locked into this movie:");
+                            ui.monospace(movie.cheats.join("  "));
+                        });
+                    }
                     ui.add_enabled_ui(!read_only, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Author");
@@ -403,7 +417,7 @@ impl App {
             self.toggle_pause();
         }
         if stop {
-            self.tas.stop();
+            self.stop_tas_and_restore_cheats();
         }
         if rewind {
             self.rewind_step();
@@ -560,6 +574,33 @@ impl App {
                             )
                             .clicked();
                     });
+                    ui.checkbox(
+                        &mut self.tas_control_fceux_timing,
+                        "FCEUX-compatible controller timing for this movie",
+                    )
+                    .on_hover_text(
+                        "FCEUX does not emulate the DMC/OAM DMA controller-read corruption real \
+                         hardware has, so FM2 movies were recorded without it. This plays the \
+                         movie with FCEUX's simplified pad clocking; normal play keeps the \
+                         hardware-accurate model.",
+                    );
+                    let enabled_codes = self.enabled_cheat_codes();
+                    if !enabled_codes.is_empty() {
+                        ui.checkbox(
+                            &mut self.tas_control_include_cheats,
+                            format!(
+                                "Play through your enabled Game Genie codes ({})",
+                                enabled_codes.join("  ")
+                            ),
+                        );
+                        if self.tas_control_include_cheats {
+                            ui.small(
+                                "Like a real Game Genie between console and cartridge. The source \
+                                 movie was recorded without these codes, so the run may play out \
+                                 differently or break.",
+                            );
+                        }
+                    }
                     if self.nes.is_none() {
                         ui.small("Load the matching NES ROM before converting.");
                     }
@@ -651,6 +692,7 @@ impl App {
             match tas_control::load(&path, expected_hash.as_deref()) {
                 Ok(movie) => {
                     self.tas_control_start = movie.suggested_start;
+                    self.tas_control_fceux_timing = movie.fceux_joypad_compat;
                     self.tas_control_selected = 0;
                     self.tas_control_scroll = Some(0);
                     self.tas_control_status = format!(
@@ -708,7 +750,22 @@ impl App {
         );
         converted.state_checksums = base.state_checksums.clone();
         let frame_count = converted.frames.len();
+        // Foreign movies were recorded without this emulator's cheat engine.
+        // Only the explicit opt-in locks the player's enabled codes into the
+        // conversion, replaying the inputs through a plugged-in Game Genie;
+        // either way the machine matches the converted movie's cheat list.
+        if self.tas_control_include_cheats {
+            converted.cheats = self.enabled_cheat_codes();
+        }
+        converted.fceux_joypad_compat = self.tas_control_fceux_timing;
+        let cheat_count = converted.cheats.len();
+        let movie_cheats = converted.parsed_cheats();
+        let joypad_compat = converted.fceux_joypad_compat;
         self.tas.movie = Some(converted);
+        if let Some(nes) = &mut self.nes {
+            nes.set_cheats(movie_cheats);
+            nes.set_fceux_joypad_compat(joypad_compat);
+        }
         self.tas.set_cursor_paused_for_preview(0);
         self.tas_held_input = TasFrame::default();
         self.tas_timeline_scroll = Some(0);
@@ -718,12 +775,17 @@ impl App {
         self.clear_audio_pipeline();
         self.show_tas = true;
         self.status = format!(
-            "Converted {frame_count} {} frames into the native TAS editor{}",
+            "Converted {frame_count} {} frames into the native TAS editor{}{}",
             source.format,
             if imported_fceux {
                 " from its embedded FCEUX state"
             } else {
                 ""
+            },
+            if cheat_count > 0 {
+                format!(" with {cheat_count} Game Genie code(s) locked in")
+            } else {
+                String::new()
             }
         );
         self.tas_control_status = self.status.clone();
@@ -739,12 +801,16 @@ impl App {
             .map_err(|error| error.to_string())?;
         nes.import_fceux_state(fcs)
             .map_err(|error| error.to_string())?;
+        // An embedded FCEUX state implies an FCEUX-recorded movie; play it
+        // with the same simplified joypad clocking it was made against.
+        nes.set_fceux_joypad_compat(true);
         let initial_state = nes.save_state().map_err(|error| error.to_string())?;
-        let movie = TasMovie::new(
+        let mut movie = TasMovie::new(
             tas::rom_sha256_hex(nes.rom_sha256()),
             TasStartType::SaveState,
             Some(initial_state.clone()),
         );
+        movie.fceux_joypad_compat = true;
         self.last_controller_reads = nes
             .controller_reads(0)
             .wrapping_add(nes.controller_reads(1));
@@ -821,6 +887,19 @@ impl App {
         let Ok(mut verifier) = nes_from_rom_path(&self.rom_bytes, self.rom_path.as_deref()) else {
             return TasCheckpointRecovery::Unrecoverable;
         };
+        verifier.set_cheats(
+            self.tas
+                .movie
+                .as_ref()
+                .map(TasMovie::parsed_cheats)
+                .unwrap_or_default(),
+        );
+        verifier.set_fceux_joypad_compat(
+            self.tas
+                .movie
+                .as_ref()
+                .is_some_and(|movie| movie.fceux_joypad_compat),
+        );
         if verifier.load_state(&previous.state).is_err() {
             return TasCheckpointRecovery::Unrecoverable;
         }
@@ -864,6 +943,17 @@ impl App {
         }
     }
 
+    /// Enabled, decodable per-game cheat codes in canonical text form.
+    pub(super) fn enabled_cheat_codes(&self) -> Vec<String> {
+        self.per_game
+            .cheats
+            .iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| entry.code.trim().to_ascii_uppercase())
+            .filter(|code| Cheat::parse(code).is_ok())
+            .collect()
+    }
+
     pub(super) fn new_tas_movie(&mut self, start_type: TasStartType) {
         if self.play_mode().restricts_assists() {
             self.status = format!(
@@ -903,15 +993,27 @@ impl App {
             }
         };
         let embedded = (start_type != TasStartType::PowerOn).then(|| initial_state.clone());
-        let movie = TasMovie::new(tas::rom_sha256_hex(nes.rom_sha256()), start_type, embedded);
+        let mut movie = TasMovie::new(tas::rom_sha256_hex(nes.rom_sha256()), start_type, embedded);
+        // The enabled cheat codes are locked into the movie at start, exactly
+        // like a physical Game Genie sitting between cartridge and console.
+        movie.cheats = self.enabled_cheat_codes();
+        // Likewise the joypad model: recordings capture the advanced Emulation
+        // setting so deliberate FCEUX-style recordings replay consistently.
+        movie.fceux_joypad_compat = self.effective_fceux_joypad_compat();
+        let joypad_compat = movie.fceux_joypad_compat;
+        let movie_cheats = movie.parsed_cheats();
+        self.last_controller_reads = nes
+            .controller_reads(0)
+            .wrapping_add(nes.controller_reads(1));
         self.tas.new_movie(movie, initial_state);
+        if let Some(nes) = &mut self.nes {
+            nes.set_cheats(movie_cheats);
+            nes.set_fceux_joypad_compat(joypad_compat);
+        }
         self.tas_held_input = TasFrame::default();
         self.powered = true;
         self.paused = false;
         self.fast_forward = false;
-        self.last_controller_reads = nes
-            .controller_reads(0)
-            .wrapping_add(nes.controller_reads(1));
         self.clear_rewind_history();
         self.lag_frames = 0;
         self.frame_dirty = true;
@@ -927,11 +1029,18 @@ impl App {
                 self.play_mode().label()
             ));
         }
-        let (start_type, starting_state) = self
+        let (start_type, starting_state, movie_cheats, joypad_compat) = self
             .tas
             .movie
             .as_ref()
-            .map(|movie| (movie.start_type, movie.starting_state.clone()))
+            .map(|movie| {
+                (
+                    movie.start_type,
+                    movie.starting_state.clone(),
+                    movie.parsed_cheats(),
+                    movie.fceux_joypad_compat,
+                )
+            })
             .ok_or_else(|| "no TAS movie loaded".to_owned())?;
         match start_type {
             TasStartType::PowerOn => {
@@ -953,6 +1062,12 @@ impl App {
                     return Err("save-state movie has no embedded starting state".into());
                 }
             }
+        }
+        // Machine snapshots carry neither cheat state nor the joypad model, so
+        // both are reapplied whenever the starting condition is reconstructed.
+        if let Some(nes) = &mut self.nes {
+            nes.set_cheats(movie_cheats);
+            nes.set_fceux_joypad_compat(joypad_compat);
         }
         let _ = self.apply_video_palette();
         self.nes
@@ -1030,6 +1145,17 @@ impl App {
             .as_ref()
             .map(|movie| movie.frames[checkpoint.frame..target].to_vec())
             .unwrap_or_default();
+        let movie_cheats = self
+            .tas
+            .movie
+            .as_ref()
+            .map(TasMovie::parsed_cheats)
+            .unwrap_or_default();
+        let joypad_compat = self
+            .tas
+            .movie
+            .as_ref()
+            .is_some_and(|movie| movie.fceux_joypad_compat);
         {
             let Some(nes) = &mut self.nes else {
                 return false;
@@ -1038,6 +1164,8 @@ impl App {
                 self.status = format!("Checkpoint load failed: {error}");
                 return false;
             }
+            nes.set_cheats(movie_cheats);
+            nes.set_fceux_joypad_compat(joypad_compat);
         }
         for (offset, input) in frames.into_iter().enumerate() {
             let next_frame = checkpoint.frame + offset + 1;

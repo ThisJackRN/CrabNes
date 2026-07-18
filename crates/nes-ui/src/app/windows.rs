@@ -119,7 +119,9 @@ impl App {
                             "settings-palette",
                             &mut self.settings.video,
                             &mut import_palette,
+                            self.nes.as_ref().is_some_and(|nes| nes.mapper_id() == 99),
                         );
+                        self.vs_system_palette_hint(ui);
                         changed |= ui
                             .checkbox(&mut self.settings.video.integer_scaling, "Integer scaling")
                             .changed();
@@ -213,8 +215,46 @@ impl App {
                                 .text("Snapshot every N frames"),
                             )
                             .changed();
+                        ui.separator();
+                        ui.strong("Advanced accuracy");
+                        let compat_response = ui
+                            .checkbox(
+                                &mut self.settings.emulation.fceux_joypad_compat,
+                                "FCEUX-compatible controller timing (less accurate)",
+                            )
+                            .on_hover_text(
+                                "Real hardware corrupts controller reads when DMC or OAM DMA \
+                                 overlaps them; games like SMB3 compensate with re-reads that \
+                                 shift lag patterns. FCEUX never emulated the corruption. Enable \
+                                 this to run and record with FCEUX's simplified model — new TAS \
+                                 recordings capture the choice, and movies always play back with \
+                                 their own recorded setting.",
+                            );
+                        if compat_response.changed() {
+                            changed = true;
+                            let joypad_compat = self.effective_fceux_joypad_compat();
+                            if self.tas.mode == TasMode::Inactive
+                                && let Some(nes) = &mut self.nes
+                            {
+                                nes.set_fceux_joypad_compat(joypad_compat);
+                            }
+                        }
+                        if self.settings.emulation.fceux_joypad_compat {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "AccuracyCoin's controller-clocking tests will fail while this \
+                                 is on. A running TAS keeps its movie's own timing until it \
+                                 stops.",
+                            );
+                        }
                         if ui.button("Restore Emulation defaults").clicked() {
                             self.settings.emulation = Default::default();
+                            let joypad_compat = self.effective_fceux_joypad_compat();
+                            if self.tas.mode == TasMode::Inactive
+                                && let Some(nes) = &mut self.nes
+                            {
+                                nes.set_fceux_joypad_compat(joypad_compat);
+                            }
                             changed = true;
                         }
                     }
@@ -299,55 +339,19 @@ impl App {
                                     .text("Hex rows per page"),
                             )
                             .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.debugging.hex_live_edit,
+                                "Hex editor live mode (keep the game running while it is open)",
+                            )
+                            .changed();
                         if ui.button("Restore Debugging defaults").clicked() {
                             self.settings.debugging = Default::default();
                             changed = true;
                         }
                     }
                 }
-                if self.nes.is_some() {
-                    ui.separator();
-                    ui.collapsing("Per-game overrides", |ui| {
-                        let mut v = self.per_game.volume.unwrap_or(self.settings.audio.volume);
-                        let mut use_v = self.per_game.volume.is_some();
-                        if ui.checkbox(&mut use_v, "Override volume").changed() {
-                            self.per_game.volume = use_v.then_some(v);
-                            self.save_per_game();
-                        }
-                        if use_v && ui.add(egui::Slider::new(&mut v, 0.0..=1.0)).changed() {
-                            self.per_game.volume = Some(v);
-                            self.save_per_game();
-                        }
-                        let mut mute = self.per_game.muted.unwrap_or(self.settings.audio.muted);
-                        let mut use_mute = self.per_game.muted.is_some();
-                        if ui.checkbox(&mut use_mute, "Override mute").changed() {
-                            self.per_game.muted = use_mute.then_some(mute);
-                            self.save_per_game();
-                        }
-                        if use_mute && ui.checkbox(&mut mute, "Muted for this game").changed() {
-                            self.per_game.muted = Some(mute);
-                            self.save_per_game();
-                        }
-                        if self.settings.general.play_mode == PlayMode::Standard {
-                            let mut use_s = self.per_game.speed_index.is_some();
-                            if ui.checkbox(&mut use_s, "Override speed").changed() {
-                                self.per_game.speed_index = use_s.then_some(self.speed_index);
-                                self.save_per_game();
-                            }
-                            if use_s {
-                                let mut speed = self
-                                    .per_game
-                                    .speed_index
-                                    .unwrap_or(self.speed_index)
-                                    .min(SPEEDS.len() - 1);
-                                if speed_ui(ui, &mut speed) {
-                                    self.per_game.speed_index = Some(speed);
-                                    self.save_per_game();
-                                }
-                            }
-                        }
-                    });
-                }
+                self.per_game_overrides_ui(ui);
                 if changed {
                     self.settings_dirty = true;
                     self.tas.checkpoint_interval = self.settings.tas.checkpoint_interval.max(1);
@@ -994,11 +998,14 @@ impl App {
                     "av-palette",
                     &mut self.settings.video,
                     &mut import_palette,
+                    self.nes.as_ref().is_some_and(|nes| nes.mapper_id() == 99),
                 );
+                self.vs_system_palette_hint(ui);
                 changed |= crt_settings_ui(ui, &mut self.settings.video);
                 if changed {
                     self.settings_dirty = true;
                 }
+                self.per_game_overrides_ui(ui);
                 if let Some(audio) = &self.audio {
                     ui.label(format!(
                         "{} / {} Hz / queued {} / underruns {} / overflows {}",
@@ -1133,6 +1140,13 @@ impl App {
                     );
                 }
                 ui.small("Examples: GOSSIP   APEETPEY   6000:EA   810E?F0:10");
+                if self.tas.mode != TasMode::Inactive {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "A TAS is running with the cheats recorded in its movie. New TAS recordings \
+                         lock in the codes enabled here; edits to this list apply after the TAS stops.",
+                    );
+                }
                 ui.separator();
 
                 egui::Grid::new("add-cheat-grid")
@@ -1228,6 +1242,25 @@ impl App {
                         }
                     });
                 }
+                let activity = nes.cheat_activity();
+                if !activity.is_empty() {
+                    ui.separator();
+                    ui.strong("Live activity");
+                    ui.small(
+                        "The dot lights up whenever the console reads a byte through a code — \
+                         the exact spot where a real Game Genie sits in the cartridge read path.",
+                    );
+                    let labels = cheat_code_labels(&self.per_game, self.tas.movie.as_ref());
+                    if let Some(address) =
+                        cheat_activity_rows(ui, &activity, &mut self.cheat_flash, &labels)
+                    {
+                        self.show_hex = true;
+                        self.hex_space = MemorySpace::CpuBus;
+                        self.hex_start = address as usize & !15;
+                        self.hex_selected = Some(address as usize);
+                        self.hex_value = format!("{:02X}", nes.peek_cpu(address));
+                    }
+                }
             });
         if let Some(index) = remove {
             self.per_game.cheats.remove(index);
@@ -1253,15 +1286,37 @@ impl App {
             .resizable(true)
             .vscroll(true)
             .show(ui, |ui| {
-                let Some(nes) = &mut self.nes else {
+                if self.nes.is_none() {
                     ui.label("No ROM loaded");
                     return;
+                }
+                if ui
+                    .checkbox(
+                        &mut self.settings.debugging.hex_live_edit,
+                        "Live mode (keep the game running)",
+                    )
+                    .changed()
+                {
+                    self.settings_dirty = true;
+                    if self.settings.debugging.hex_live_edit {
+                        // Leaving the forced pause should feel like pressing
+                        // Resume: no frame-budget burst, no stale audio.
+                        self.paused = false;
+                        self.frame_budget = 0.0;
+                        self.clear_audio_pipeline();
+                    }
+                }
+                if !self.settings.debugging.hex_live_edit {
+                    self.paused = true;
+                }
+                let Some(nes) = &mut self.nes else {
+                    return;
                 };
-                self.paused = true;
                 egui::ComboBox::from_label("Memory")
                     .selected_text(memory_label(self.hex_space))
                     .show_ui(ui, |ui| {
                         for (space, label) in [
+                            (MemorySpace::CpuBus, "CPU bus (game's view)"),
                             (MemorySpace::CpuRam, "CPU RAM"),
                             (MemorySpace::PpuNametable, "PPU nametables"),
                             (MemorySpace::Palette, "Palette RAM"),
@@ -1280,10 +1335,30 @@ impl App {
                     });
                 let image = nes.memory_image(self.hex_space);
                 ui.label(if image.writable {
-                    "Writable (emulation paused while editing)"
+                    if self.settings.debugging.hex_live_edit {
+                        "Writable (live: edits land between frames while the game runs)"
+                    } else {
+                        "Writable (emulation paused while editing)"
+                    }
                 } else {
                     "Read-only"
                 });
+                let cheat_activity = nes.cheat_activity();
+                let mut cheat_cells = HashMap::new();
+                for entry in &cheat_activity {
+                    // Cheats key on exact CPU addresses; only spaces where an
+                    // image offset means a CPU address can show them in place.
+                    let index = match self.hex_space {
+                        MemorySpace::CpuBus => Some(entry.cheat.address as usize),
+                        MemorySpace::CpuRam if entry.cheat.address < 0x2000 => {
+                            Some(entry.cheat.address as usize & 0x7ff)
+                        }
+                        _ => None,
+                    };
+                    if let Some(index) = index {
+                        cheat_cells.insert(index, *entry);
+                    }
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Address");
                     ui.text_edit_singleline(&mut self.hex_jump);
@@ -1320,14 +1395,30 @@ impl App {
                                 ui.monospace(format!("{:04X}:", image.base_address + offset));
                                 for col in 0..16 {
                                     let index = offset + col;
-                                    if let Some(value) = image.bytes.get(index)
-                                        && ui
-                                            .selectable_label(
-                                                self.hex_selected == Some(index),
-                                                format!("{value:02X}"),
-                                            )
-                                            .clicked()
-                                    {
+                                    let Some(value) = image.bytes.get(index) else {
+                                        continue;
+                                    };
+                                    let cheat_cell = cheat_cells.get(&index);
+                                    let mut text =
+                                        egui::RichText::new(format!("{value:02X}"));
+                                    if let Some(entry) = cheat_cell {
+                                        text = text.strong().color(
+                                            if entry.observed != entry.actual {
+                                                egui::Color32::LIGHT_GREEN
+                                            } else {
+                                                egui::Color32::YELLOW
+                                            },
+                                        );
+                                    }
+                                    let mut response = ui.selectable_label(
+                                        self.hex_selected == Some(index),
+                                        text,
+                                    );
+                                    if let Some(entry) = cheat_cell {
+                                        response =
+                                            response.on_hover_text(cheat_cell_hover(entry));
+                                    }
+                                    if response.clicked() {
                                         self.hex_selected = Some(index);
                                         self.hex_value = format!("{value:02X}");
                                     }
@@ -1347,6 +1438,21 @@ impl App {
                             });
                         }
                     });
+                if !cheat_activity.is_empty() {
+                    ui.small(
+                        "Cheat bytes: green = the code is patching this byte right now, yellow = \
+                         an eight-letter code waiting for its compare value.",
+                    );
+                    let labels = cheat_code_labels(&self.per_game, self.tas.movie.as_ref());
+                    if let Some(address) =
+                        cheat_activity_rows(ui, &cheat_activity, &mut self.cheat_flash, &labels)
+                    {
+                        self.hex_space = MemorySpace::CpuBus;
+                        self.hex_start = address as usize & !15;
+                        self.hex_selected = Some(address as usize);
+                        self.hex_value = format!("{:02X}", nes.peek_cpu(address));
+                    }
+                }
                 if let Some(offset) = self.hex_selected {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Offset {offset:04X}"));
@@ -1372,6 +1478,133 @@ impl App {
             });
         self.show_hex = open;
     }
+
+    /// Volume, mute, speed, and palette settings scoped to the currently
+    /// loaded ROM instead of the global defaults. Shown from both the full
+    /// Settings window and the quick Audio/Video window, expanded by default,
+    /// so a palette fix for the loaded game doesn't require leaving
+    /// Config > Audio/Video for the Settings dialog.
+    pub(super) fn per_game_overrides_ui(&mut self, ui: &mut egui::Ui) {
+        if self.nes.is_none() {
+            return;
+        }
+        ui.separator();
+        egui::CollapsingHeader::new("Per-game overrides")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut v = self.per_game.volume.unwrap_or(self.settings.audio.volume);
+                let mut use_v = self.per_game.volume.is_some();
+                if ui.checkbox(&mut use_v, "Override volume").changed() {
+                    self.per_game.volume = use_v.then_some(v);
+                    self.save_per_game();
+                }
+                if use_v && ui.add(egui::Slider::new(&mut v, 0.0..=1.0)).changed() {
+                    self.per_game.volume = Some(v);
+                    self.save_per_game();
+                }
+                let mut mute = self.per_game.muted.unwrap_or(self.settings.audio.muted);
+                let mut use_mute = self.per_game.muted.is_some();
+                if ui.checkbox(&mut use_mute, "Override mute").changed() {
+                    self.per_game.muted = use_mute.then_some(mute);
+                    self.save_per_game();
+                }
+                if use_mute && ui.checkbox(&mut mute, "Muted for this game").changed() {
+                    self.per_game.muted = Some(mute);
+                    self.save_per_game();
+                }
+                if self.settings.general.play_mode == PlayMode::Standard {
+                    let mut use_s = self.per_game.speed_index.is_some();
+                    if ui.checkbox(&mut use_s, "Override speed").changed() {
+                        self.per_game.speed_index = use_s.then_some(self.speed_index);
+                        self.save_per_game();
+                    }
+                    if use_s {
+                        let mut speed = self
+                            .per_game
+                            .speed_index
+                            .unwrap_or(self.speed_index)
+                            .min(SPEEDS.len() - 1);
+                        if speed_ui(ui, &mut speed) {
+                            self.per_game.speed_index = Some(speed);
+                            self.save_per_game();
+                        }
+                    }
+                }
+                let mut use_palette = self.per_game.palette_mode.is_some();
+                let effective_palette = self.effective_palette_mode();
+                if ui
+                    .checkbox(&mut use_palette, "Override palette")
+                    .on_hover_text(
+                        "Vs. System (mapper 99) games always use RGB 2C04-0004 unless \
+                         overridden here, regardless of the global palette setting.",
+                    )
+                    .changed()
+                {
+                    self.per_game.palette_mode = use_palette.then_some(effective_palette);
+                    self.save_per_game();
+                    self.apply_video_palette_with_status();
+                }
+                if use_palette {
+                    let mut mode = effective_palette;
+                    let is_vs_system = self.nes.as_ref().is_some_and(|nes| nes.mapper_id() == 99);
+                    egui::ComboBox::from_id_salt("per-game-palette")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for candidate in [
+                                PaletteMode::Ntsc2c02,
+                                PaletteMode::Rgb2c03,
+                                PaletteMode::Custom,
+                            ] {
+                                ui.selectable_value(&mut mode, candidate, candidate.label());
+                            }
+                            ui.add_enabled_ui(is_vs_system, |ui| {
+                                ui.selectable_value(
+                                    &mut mode,
+                                    PaletteMode::VsRp2c04,
+                                    PaletteMode::VsRp2c04.label(),
+                                )
+                                .on_disabled_hover_text(
+                                    "Only meaningful for a loaded Vs. System (mapper 99) ROM; \
+                                     it renders wrong colors on an ordinary NES game.",
+                                );
+                            });
+                        });
+                    if mode != effective_palette {
+                        self.per_game.palette_mode = Some(mode);
+                        self.save_per_game();
+                        self.apply_video_palette_with_status();
+                    }
+                }
+            });
+    }
+
+    /// Explains why the global palette picker above has no visible effect on
+    /// a loaded Vs. System ROM, and offers a one-click way to actually change
+    /// that ROM's colors instead of silently doing nothing (the global
+    /// setting is deliberately never the fallback for Vs. games — see
+    /// `effective_palette_mode`).
+    pub(super) fn vs_system_palette_hint(&mut self, ui: &mut egui::Ui) {
+        if self.per_game.palette_mode.is_some()
+            || self.nes.as_ref().is_none_or(|nes| nes.mapper_id() != 99)
+        {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "This ROM is Vs. System (mapper 99) hardware: it always renders with \
+                 RGB 2C04-0004 regardless of the setting above.",
+            );
+            if ui
+                .button("Use the palette above for just this game")
+                .clicked()
+            {
+                self.per_game.palette_mode = Some(self.settings.video.palette_mode);
+                self.save_per_game();
+                self.apply_video_palette_with_status();
+            }
+        });
+    }
 }
 
 pub(super) fn palette_settings_ui(
@@ -1379,6 +1612,7 @@ pub(super) fn palette_settings_ui(
     id: &'static str,
     video: &mut VideoSettings,
     import_requested: &mut bool,
+    is_vs_system: bool,
 ) -> bool {
     let old_mode = video.palette_mode;
     egui::ComboBox::from_id_salt(id)
@@ -1391,6 +1625,13 @@ pub(super) fn palette_settings_ui(
             ] {
                 ui.selectable_value(&mut video.palette_mode, mode, mode.label());
             }
+            ui.add_enabled_ui(is_vs_system, |ui| {
+                ui.selectable_value(&mut video.palette_mode, PaletteMode::VsRp2c04, PaletteMode::VsRp2c04.label())
+                    .on_disabled_hover_text(
+                        "Only meaningful for a loaded Vs. System (mapper 99) ROM; it renders \
+                         wrong colors on an ordinary NES game.",
+                    );
+            });
         });
     ui.horizontal_wrapped(|ui| {
         if ui.button("Import palette…").clicked() {
@@ -1398,6 +1639,9 @@ pub(super) fn palette_settings_ui(
         }
         if video.palette_mode == PaletteMode::Rgb2c03 {
             ui.small("RGB DAC colors used by RP2C03 / PlayChoice-10");
+        }
+        if video.palette_mode == PaletteMode::VsRp2c04 {
+            ui.small("Authentic RGB DAC colors for the Vs. Super Mario Bros. color PROM");
         }
     });
     if let Some(path) = video.custom_palette_path.as_deref() {
@@ -1412,6 +1656,7 @@ pub(super) fn palette_settings_ui(
     let preview = match video.palette_mode {
         PaletteMode::Ntsc2c02 => Some(NTSC_2C02_PALETTE),
         PaletteMode::Rgb2c03 => Some(RGB_2C03_PALETTE),
+        PaletteMode::VsRp2c04 => Some(RGB_2C04_0004_PALETTE),
         PaletteMode::Custom => video
             .custom_palette_path
             .as_deref()
@@ -1565,6 +1810,7 @@ pub(super) fn palette_preview(ui: &mut egui::Ui, palette: &OutputPalette) {
 
 pub(super) fn memory_label(space: MemorySpace) -> &'static str {
     match space {
+        MemorySpace::CpuBus => "CPU bus (game's view)",
         MemorySpace::CpuRam => "CPU RAM",
         MemorySpace::PpuNametable => "PPU nametables",
         MemorySpace::Palette => "Palette RAM",
@@ -1572,4 +1818,129 @@ pub(super) fn memory_label(space: MemorySpace) -> &'static str {
         MemorySpace::PrgRom => "PRG ROM (read-only)",
         MemorySpace::Chr => "CHR",
     }
+}
+
+fn cheat_cell_hover(entry: &CheatActivity) -> String {
+    let Cheat {
+        address,
+        value,
+        compare,
+    } = entry.cheat;
+    let mut text = format!(
+        "Cheat patch at ${address:04X}: {:02X} → {value:02X}",
+        entry.actual
+    );
+    if let Some(compare) = compare {
+        text.push_str(&format!(" while the real byte is {compare:02X}"));
+    }
+    text.push_str(&format!(
+        "\nCPU currently sees {:02X} • fired {} time(s)",
+        entry.observed, entry.hits
+    ));
+    text
+}
+
+/// Human labels for decoded cheats, sourced from the per-game list and any
+/// loaded TAS movie so activity rows can show the original code text.
+fn cheat_code_labels(per_game: &PerGameSettings, movie: Option<&TasMovie>) -> Vec<(Cheat, String)> {
+    let mut labels: Vec<(Cheat, String)> = Vec::new();
+    let add = |code: &str, name: &str, labels: &mut Vec<(Cheat, String)>| {
+        if let Ok(cheat) = Cheat::parse(code)
+            && !labels.iter().any(|(existing, _)| *existing == cheat)
+        {
+            let code = code.trim().to_ascii_uppercase();
+            let label = if name.trim().is_empty() {
+                code
+            } else {
+                format!("{code} — {}", name.trim())
+            };
+            labels.push((cheat, label));
+        }
+    };
+    for entry in &per_game.cheats {
+        add(&entry.code, &entry.name, &mut labels);
+    }
+    for code in movie.iter().flat_map(|movie| movie.cheats.iter()) {
+        add(code, "", &mut labels);
+    }
+    labels
+}
+
+/// One status row per installed cheat with a short-lived activity dot.
+/// Returns the CPU address the user asked to reveal in the hex editor.
+fn cheat_activity_rows(
+    ui: &mut egui::Ui,
+    activity: &[CheatActivity],
+    flash: &mut Vec<CheatFlash>,
+    labels: &[(Cheat, String)],
+) -> Option<u16> {
+    if flash.len() != activity.len() {
+        *flash = activity
+            .iter()
+            .map(|entry| CheatFlash {
+                hits: entry.hits,
+                flash_until: None,
+            })
+            .collect();
+    }
+    let now = Instant::now();
+    let mut jump = None;
+    for (entry, state) in activity.iter().zip(flash.iter_mut()) {
+        if entry.hits != state.hits {
+            if entry.hits > state.hits {
+                state.flash_until = Some(now + Duration::from_millis(600));
+            }
+            state.hits = entry.hits;
+        }
+        let firing = state.flash_until.is_some_and(|until| until > now);
+        if firing {
+            // Keep repainting so the dot fades out even while nothing else
+            // requests frames.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                if firing {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::DARK_GRAY
+                },
+                "●",
+            );
+            let label = labels
+                .iter()
+                .find(|(cheat, _)| *cheat == entry.cheat)
+                .map(|(_, label)| label.as_str())
+                .unwrap_or("unnamed patch");
+            ui.monospace(label);
+            let Cheat {
+                address,
+                value,
+                compare,
+            } = entry.cheat;
+            ui.monospace(match compare {
+                Some(compare) => format!("${address:04X}: {compare:02X} → {value:02X}"),
+                None => format!("${address:04X} → {value:02X}"),
+            });
+            if entry.observed != entry.actual {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "patching");
+            } else if entry
+                .cheat
+                .compare
+                .is_some_and(|compare| compare != entry.actual)
+            {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("waiting (byte is {:02X})", entry.actual),
+                );
+            } else {
+                ui.label("byte already matches");
+            }
+            ui.label(format!("fired {}×", entry.hits));
+            if ui.small_button("Show in hex").clicked() {
+                jump = Some(entry.cheat.address);
+            }
+        });
+    }
+    jump
 }

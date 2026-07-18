@@ -103,6 +103,7 @@ pub enum PaletteMode {
     #[default]
     Ntsc2c02,
     Rgb2c03,
+    VsRp2c04,
     Custom,
 }
 
@@ -111,6 +112,7 @@ impl PaletteMode {
         match self {
             Self::Ntsc2c02 => "NTSC 2C02 (default)",
             Self::Rgb2c03 => "RGB 2C03 / PlayChoice-10",
+            Self::VsRp2c04 => "RGB 2C04-0004 (Vs. System, e.g. Vs. Super Mario Bros.)",
             Self::Custom => "Custom imported palette",
         }
     }
@@ -230,6 +232,12 @@ pub struct EmulationSettings {
     pub speed_index: usize,
     pub rewind_seconds: usize,
     pub rewind_interval_frames: u64,
+    /// Advanced: run with FCEUX's simplified joypad clocking instead of the
+    /// hardware-accurate DMC/OAM DMA read-corruption model. Applies to normal
+    /// Standard-mode play and is captured into new TAS recordings; movies
+    /// carry their own flag during playback, and restricted play modes always
+    /// force the hardware model.
+    pub fceux_joypad_compat: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -258,6 +266,9 @@ pub struct TasSettings {
 #[serde(default)]
 pub struct DebugSettings {
     pub hex_rows: usize,
+    /// Keep emulation running while the hex editor is open instead of the
+    /// classic pause-while-inspecting behavior.
+    pub hex_live_edit: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -277,6 +288,7 @@ pub struct PerGameSettings {
     pub volume: Option<f32>,
     pub muted: Option<bool>,
     pub speed_index: Option<usize>,
+    pub palette_mode: Option<PaletteMode>,
     pub cheats: Vec<CheatSetting>,
 }
 
@@ -385,6 +397,7 @@ impl Default for EmulationSettings {
             speed_index: 2,
             rewind_seconds: 120,
             rewind_interval_frames: 2,
+            fceux_joypad_compat: false,
         }
     }
 }
@@ -421,7 +434,10 @@ impl Default for TasSettings {
 }
 impl Default for DebugSettings {
     fn default() -> Self {
-        Self { hex_rows: 16 }
+        Self {
+            hex_rows: 16,
+            hex_live_edit: false,
+        }
     }
 }
 
@@ -596,6 +612,7 @@ mod tests {
     fn per_game_cheats_round_trip_and_old_files_default_to_none() {
         let old: PerGameSettings = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
         assert!(old.cheats.is_empty());
+        assert_eq!(old.palette_mode, None);
 
         let settings = PerGameSettings {
             cheats: vec![CheatSetting {
@@ -603,6 +620,7 @@ mod tests {
                 code: "SXIOPO".into(),
                 enabled: true,
             }],
+            palette_mode: Some(PaletteMode::VsRp2c04),
             ..Default::default()
         };
         let decoded: PerGameSettings =
@@ -610,5 +628,19 @@ mod tests {
         assert_eq!(decoded.cheats.len(), 1);
         assert_eq!(decoded.cheats[0].code, "SXIOPO");
         assert!(decoded.cheats[0].enabled);
+        assert_eq!(decoded.palette_mode, Some(PaletteMode::VsRp2c04));
+    }
+
+    #[test]
+    fn palette_mode_round_trips_through_json() {
+        for mode in [
+            PaletteMode::Ntsc2c02,
+            PaletteMode::Rgb2c03,
+            PaletteMode::VsRp2c04,
+            PaletteMode::Custom,
+        ] {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<PaletteMode>(&encoded).unwrap(), mode);
+        }
     }
 }
