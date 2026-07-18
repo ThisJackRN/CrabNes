@@ -15,9 +15,9 @@ fn main() {
     let w = width as u16;
     let h = height as u16;
 
-    let row_bytes = ((w as u32 * 24 + 31) / 32) * 4;
+    let row_bytes = (w as u32 * 24).div_ceil(32) * 4;
     let pixel_data_size = row_bytes * height;
-    let and_mask_row = ((w as u32 + 31) / 32) * 4;
+    let and_mask_row = (w as u32).div_ceil(32) * 4;
     let and_mask_size = and_mask_row * height;
     let dib_size = 40 + pixel_data_size + and_mask_size;
 
@@ -31,7 +31,7 @@ fn main() {
     ico.push(0);
     ico.extend_from_slice(&1u16.to_le_bytes());
     ico.extend_from_slice(&24u16.to_le_bytes());
-    ico.extend_from_slice(&(dib_size as u32).to_le_bytes());
+    ico.extend_from_slice(&dib_size.to_le_bytes());
     ico.extend_from_slice(&22u32.to_le_bytes());
 
     ico.extend_from_slice(&40u32.to_le_bytes());
@@ -40,7 +40,7 @@ fn main() {
     ico.extend_from_slice(&1u16.to_le_bytes());
     ico.extend_from_slice(&24u16.to_le_bytes());
     ico.extend_from_slice(&0u32.to_le_bytes());
-    ico.extend_from_slice(&(pixel_data_size as u32 + and_mask_size as u32).to_le_bytes());
+    ico.extend_from_slice(&(pixel_data_size + and_mask_size).to_le_bytes());
     ico.extend_from_slice(&0i32.to_le_bytes());
     ico.extend_from_slice(&0i32.to_le_bytes());
     ico.extend_from_slice(&0u32.to_le_bytes());
