@@ -187,6 +187,18 @@ in games such as Super Mario Bros. 3. Cropping affects only the displayed image,
 and both native and CRT rendering preserve the visible area's aspect ratio and
 integer-scaling dimensions.
 
+Palettes are chosen in **Settings > Video** (or the quick **Audio / Video**
+window): NTSC 2C02, RGB 2C03 / PlayChoice-10, RGB 2C04-0004 (Vs. System), or a
+custom imported palette. Nintendo Vs. System (mapper 99) ROMs used a
+scrambled-palette RGB PPU, not a home console's composite one, so the wrong
+chip renders visibly wrong colors, not just different ones — Vs. System games
+therefore always render with RGB 2C04-0004 unless that specific game has an
+explicit palette override, regardless of the global setting used by every
+other ROM. Pick a different palette for a Vs. game in **Per-game overrides >
+Override palette** — shown in both the Settings window and the quick Audio /
+Video window — and it sticks until the override is turned off again; see
+[Custom palettes](docs/CUSTOM_PALETTES.md) for details.
+
 ## Controls
 
 All gameplay bindings can be changed in **Settings > Input**.
@@ -239,6 +251,32 @@ program RAM rather than cartridge ROM, raw patches are usually more useful and
 can target the full disk-loaded `$6000-$DFFF` range. Game Genie codes cover
 `$8000-$FFFF`. Codes are specific to the game's region and revision.
 
+You can watch codes work in real time. The Cheat Codes window shows a Live
+activity row per code: a dot flashes whenever the console actually reads a byte
+through the code, along with how many reads it has substituted and whether an
+eight-letter code is still waiting for its compare value. The hex editor gains
+a "CPU bus (game's view)" space showing the full 64 KiB address space exactly as
+the running program sees it — patched bytes are drawn in green while actively
+substituted (yellow while armed but waiting), with hover details, and every
+activity row has a "Show in hex" button that jumps straight to the byte. The
+hex editor normally pauses emulation while open; its "Live mode" checkbox (also
+in Settings → Debugging) keeps the game running so the view refreshes every
+frame and edits land between frames.
+
+TAS movies treat cheats like a physical Game Genie plugged in before power-on:
+starting a new recording locks the currently enabled codes into the movie, the
+`.tas` file stores them, and playback reapplies them automatically. While a
+movie is recording or playing the machine keeps the movie's codes; edits to the
+per-game list take effect after the TAS stops. When converting FM2, BK2, or
+BizHawk input logs, the TAS Control View asks whether to lock your enabled
+codes into the converted movie (on by default) — the original inputs replay
+through the codes as if a Game Genie were plugged in, which can change how the
+run plays out.
+
+FM2 conversions also default to FCEUX-compatible controller timing so FCEUX
+movies replay without desyncing; see
+[FCEUX compatibility mode](#fceux-compatibility-mode).
+
 ## Save states and rewind
 
 Each game has ten save-state slots by default. States include the full CPU, PPU,
@@ -261,6 +299,36 @@ Native `.tas` files are readable text and include the ROM SHA-256. CrabNes still
 accepts movies created before the rename with the legacy emulator identifier.
 See the [TAS format specification](docs/TAS_FORMAT.md) and
 [TAS Control View guide](docs/TAS_CONTROL_VIEW.md).
+
+## FCEUX compatibility mode
+
+On a real front-loader NES, a DMC or OAM DMA cycle that overlaps a
+`$4016`/`$4017` controller read clocks the controller shift register extra
+times, corrupting that read. Games that use DMC audio — Super Mario Bros. 3 is
+the classic case — defend themselves by re-reading the controller until two
+reads agree, and those retries cost CPU time that occasionally produces an
+extra lag frame. CrabNes emulates this corruption by default; AccuracyCoin's
+"DMA + $4016 READ" and "CONTROLLER CLOCKING" tests verify it.
+
+FCEUX never emulated the corruption, so FM2 movies were recorded against a
+console where it does not exist. Played back on accurate hardware timing, their
+inputs land one frame late after the first divergent lag frame and the run
+desyncs. CrabNes therefore keeps both models and switches between them
+automatically:
+
+- **Normal play, native recordings, Speedrun and Achievement profiles** use the
+  hardware-accurate model.
+- **FM2 conversions** default to FCEUX-compatible timing (a checkbox in the TAS
+  Control View). The converted movie records the choice as `JOYPAD_TIMING
+  FCEUX` in its `.tas` file, playback applies it automatically, the TAS editor
+  shows an "FCEUX pad timing" badge, and the hardware model returns the moment
+  the TAS stops.
+- **Settings > Emulation > Advanced accuracy** exposes the same switch
+  globally for experiments outside movie playback. It applies to Standard-mode
+  play, is captured into new TAS recordings you make while it is on, and never
+  overrides a playing movie's own recorded setting. Restricted play profiles
+  ignore it. Expect AccuracyCoin's controller-clocking tests to fail while it
+  is enabled — that is the point of the switch.
 
 ## Settings and existing data
 

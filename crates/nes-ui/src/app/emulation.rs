@@ -145,7 +145,7 @@ impl App {
             }
         }
         let Some(input) = self.tas.input_for_frame(live_input) else {
-            self.tas.stop();
+            self.stop_tas_and_restore_cheats();
             if let Some(nes) = &mut self.nes {
                 set_controller_mask(nes, 0, 0);
                 set_controller_mask(nes, 1, 0);
@@ -253,7 +253,7 @@ impl App {
             self.powered = true;
             self.paused = false;
             self.clear_rewind_history();
-            self.tas.stop();
+            self.stop_tas_and_restore_cheats();
             self.lag_frames = 0;
             self.frame_dirty = true;
             self.clear_audio_pipeline();
@@ -271,7 +271,7 @@ impl App {
     }
     pub(super) fn toggle_power(&mut self) {
         self.clear_audio_pipeline();
-        self.tas.stop();
+        self.stop_tas_and_restore_cheats();
         if let Some(nes) = &mut self.nes {
             if self.powered {
                 nes.power_off();
@@ -321,7 +321,7 @@ impl App {
                     self.frame_dirty = true;
                     self.last_controller_reads = nes.controller_reads(0);
                     self.clear_rewind_history();
-                    self.tas.stop();
+                    self.stop_tas_and_restore_cheats();
                     self.lag_frames = 0;
                     self.clear_audio_pipeline();
                     self.status = format!("Loaded slot {}", self.selected_slot);
@@ -433,10 +433,12 @@ impl App {
         let mut replacement = nes_from_rom_path_with_bios(&bytes, Some(&path), bios_slice)?;
         load_battery(&mut replacement, &path)?;
         let hash = replacement.rom_hash();
+        let is_vs_system = replacement.mapper_id() == 99;
         self.per_game = settings::load_per_game(hash);
         if self.play_mode() == PlayMode::Standard {
             replacement.set_cheats(decoded_enabled_cheats(&self.per_game).0);
         }
+        replacement.set_fceux_joypad_compat(self.effective_fceux_joypad_compat());
         self.speed_index = if self.play_mode().restricts_assists() {
             NORMAL_SPEED_INDEX
         } else {
@@ -447,6 +449,18 @@ impl App {
         };
         self.nes = Some(replacement);
         let palette_note = self.apply_video_palette().err();
+        let vs_hint = is_vs_system.then(|| {
+            format!(
+                "Vs. System arcade controls: {} inserts a coin, Select starts 1 player, Start starts 2 players",
+                self.settings.input.vs_coin_binding.label()
+            )
+        });
+        let load_note = match (palette_note, vs_hint) {
+            (Some(error), Some(hint)) => Some(format!("{error}; {hint}")),
+            (Some(error), None) => Some(error),
+            (None, Some(hint)) => Some(hint),
+            (None, None) => None,
+        };
         self.rom_path = Some(path.clone());
         self.rom_bytes = bytes;
         self.powered = true;
@@ -471,7 +485,7 @@ impl App {
         self.refresh_library_and_artwork();
         self.clear_audio_pipeline();
         self.page = MainPage::Game;
-        self.status = match (inferred_region, palette_note) {
+        self.status = match (inferred_region, load_note) {
             (Some(Region::Pal), Some(note)) => {
                 format!("ROM loaded with PAL timing inferred from filename; {note}")
             }
@@ -492,20 +506,27 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn apply_video_palette(&mut self) -> Result<Option<String>, String> {
-        if let Some(palette) = self.nes.as_ref().and_then(Nes::native_output_palette) {
-            if let Some(nes) = &mut self.nes {
-                nes.set_output_palette(palette);
+    /// Resolves the palette actually in effect. An explicit per-game override
+    /// always wins. Otherwise, Vs. System (mapper 99) ROMs fall back to
+    /// RGB 2C04-0004 rather than the global setting: that setting is shared
+    /// by every ordinary NES game and has nothing to do with which arcade RGB
+    /// chip a Vs. board used, so it must never be the implicit answer for a
+    /// Vs. game — including after the per-game override is turned off again.
+    pub(super) fn effective_palette_mode(&self) -> PaletteMode {
+        self.per_game.palette_mode.unwrap_or_else(|| {
+            if self.nes.as_ref().is_some_and(|nes| nes.mapper_id() == 99) {
+                PaletteMode::VsRp2c04
+            } else {
+                self.settings.video.palette_mode
             }
-            self.frame_dirty = true;
-            return Ok(Some(format!(
-                "VS RP2C04-0004 palette selected; {} inserts a coin, Select starts 1 player, and Start starts 2 players",
-                self.settings.input.vs_coin_binding.label()
-            )));
-        }
-        let (palette, warning) = match self.settings.video.palette_mode {
+        })
+    }
+
+    pub(super) fn apply_video_palette(&mut self) -> Result<Option<String>, String> {
+        let (palette, warning) = match self.effective_palette_mode() {
             PaletteMode::Ntsc2c02 => (NTSC_2C02_PALETTE, None),
             PaletteMode::Rgb2c03 => (RGB_2C03_PALETTE, None),
+            PaletteMode::VsRp2c04 => (RGB_2C04_0004_PALETTE, None),
             PaletteMode::Custom => {
                 let Some(path) = self.settings.video.custom_palette_path.as_deref() else {
                     if let Some(nes) = &mut self.nes {
@@ -537,13 +558,11 @@ impl App {
     }
 
     pub(super) fn apply_video_palette_with_status(&mut self) {
+        let label = self.effective_palette_mode().label();
         match self.apply_video_palette() {
             Ok(Some(warning)) => self.status = warning,
             Ok(None) => {
-                self.status = format!(
-                    "Video palette changed to {}",
-                    self.settings.video.palette_mode.label()
-                );
+                self.status = format!("Video palette changed to {label}");
             }
             Err(error) => self.status = error,
         }
@@ -609,6 +628,7 @@ impl App {
         if mode.restricts_assists() {
             if let Some(nes) = &mut self.nes {
                 nes.set_cheats(Vec::new());
+                nes.set_fceux_joypad_compat(false);
             }
             self.speed_index = NORMAL_SPEED_INDEX;
             self.show_states = false;
@@ -638,11 +658,26 @@ impl App {
                 .unwrap_or(self.settings.emulation.speed_index)
                 .min(SPEEDS.len() - 1);
             self.apply_per_game_cheats();
+            let joypad_compat = self.effective_fceux_joypad_compat();
+            if self.tas.mode == TasMode::Inactive
+                && let Some(nes) = &mut self.nes
+            {
+                nes.set_fceux_joypad_compat(joypad_compat);
+            }
             self.status = "Standard mode enabled".into();
         }
     }
 
     pub(super) fn apply_per_game_cheats(&mut self) {
+        if self.tas.mode != TasMode::Inactive {
+            // A running movie behaves like hardware with the Game Genie already
+            // plugged in: its codes cannot change mid-run. The edited per-game
+            // list takes effect once the TAS stops.
+            self.status =
+                "TAS active: the movie keeps its recorded cheats; changes apply after the TAS stops"
+                    .into();
+            return;
+        }
         let (cheats, invalid) = if self.play_mode() == PlayMode::Standard {
             decoded_enabled_cheats(&self.per_game)
         } else {
@@ -664,6 +699,37 @@ impl App {
                 invalid.len()
             )
         };
+    }
+
+    /// The joypad model normal (non-movie) execution should use right now:
+    /// the advanced Emulation setting in Standard mode, and always the
+    /// hardware model in restricted play modes. Engaged TAS movies override
+    /// this with their own recorded flag for deterministic playback.
+    pub(super) fn effective_fceux_joypad_compat(&self) -> bool {
+        self.play_mode() == PlayMode::Standard && self.settings.emulation.fceux_joypad_compat
+    }
+
+    /// Stop any engaged TAS and hand the machine back to normal-play
+    /// configuration: the per-game cheat list (like unplugging the movie's
+    /// Game Genie and reinserting the player's own) and the user's configured
+    /// joypad model. Movie snapshots carry neither, so this is the single
+    /// point where they leave the movie's control.
+    pub(super) fn stop_tas_and_restore_cheats(&mut self) {
+        let was_engaged = self.tas.mode != TasMode::Inactive;
+        self.tas.stop();
+        if !was_engaged {
+            return;
+        }
+        let cheats = if self.play_mode() == PlayMode::Standard {
+            decoded_enabled_cheats(&self.per_game).0
+        } else {
+            Vec::new()
+        };
+        let joypad_compat = self.effective_fceux_joypad_compat();
+        if let Some(nes) = &mut self.nes {
+            nes.set_cheats(cheats);
+            nes.set_fceux_joypad_compat(joypad_compat);
+        }
     }
 
     pub(super) fn current_speed(&self) -> f64 {

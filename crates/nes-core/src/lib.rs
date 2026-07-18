@@ -18,7 +18,9 @@ pub use apu::{ApuChannel, ApuState};
 pub use cartridge::{Cartridge, CartridgeError, Mirroring};
 pub use cheat::{Cheat, CheatError};
 pub use controller::{Button, Controller};
-pub use emulator::{EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VERSION, StateError};
+pub use emulator::{
+    CheatActivity, EmulationError, MemoryImage, MemorySpace, Nes, SAVE_STATE_VERSION, StateError,
+};
 pub use fceux_state::FceuxStateError;
 pub use ppu::{
     FRAME_HEIGHT, FRAME_WIDTH, Frame, NTSC_2C02_PALETTE, OutputPalette, PpuState, RGB_2C03_PALETTE,

@@ -10,6 +10,7 @@ use std::{
 // THIRD_PARTY_NOTICES.md.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use nes_core::Cheat;
 use sha2::{Digest, Sha256};
 
 pub const FORMAT_VERSION: u32 = 1;
@@ -84,6 +85,13 @@ pub struct TasMovie {
     pub markers: Vec<TasMarker>,
     /// Hashes of the machine state immediately before the keyed frame.
     pub state_checksums: BTreeMap<usize, String>,
+    /// Game Genie or raw cheat codes active for the whole movie, exactly like
+    /// a pass-through cartridge device plugged in before power-on.
+    pub cheats: Vec<String>,
+    /// Play back with FCEUX's simplified joypad clocking (no DMC/OAM DMA read
+    /// corruption). Set for movies converted from FCEUX so their lag pattern
+    /// reproduces; native recordings default to hardware-accurate clocking.
+    pub fceux_joypad_compat: bool,
 }
 
 impl TasMovie {
@@ -105,7 +113,18 @@ impl TasMovie {
             frames: Vec::new(),
             markers: Vec::new(),
             state_checksums: BTreeMap::new(),
+            cheats: Vec::new(),
+            fceux_joypad_compat: false,
         }
+    }
+
+    /// The movie's cheat codes decoded into CPU read substitutions. Codes are
+    /// validated on load and save, so undecodable entries are skipped here.
+    pub fn parsed_cheats(&self) -> Vec<Cheat> {
+        self.cheats
+            .iter()
+            .filter_map(|code| Cheat::parse(code).ok())
+            .collect()
     }
 }
 
@@ -758,6 +777,11 @@ impl TasSerializer {
         push_line(&mut text, "START_TYPE", movie.start_type.as_text());
         push_line(&mut text, "RERECORDS", &movie.rerecord_count.to_string());
         push_line(&mut text, "PLAYERS", "2");
+        if movie.fceux_joypad_compat {
+            // Optional key: absent means hardware joypad clocking, and version
+            // 1 readers that predate it simply ignore the line.
+            push_line(&mut text, "JOYPAD_TIMING", "FCEUX");
+        }
         if let Some(author) = &movie.author
             && !author.is_empty()
         {
@@ -772,6 +796,13 @@ impl TasSerializer {
             text.push_str("\n[STATE]\n");
             text.push_str(&BASE64.encode(state));
             text.push('\n');
+        }
+        if !movie.cheats.is_empty() {
+            text.push_str("\n[CHEATS]\n");
+            for cheat in &movie.cheats {
+                text.push_str(cheat);
+                text.push('\n');
+            }
         }
         if !movie.markers.is_empty() {
             text.push_str("\n[MARKERS]\n");
@@ -808,6 +839,7 @@ impl TasDeserializer {
         enum Section {
             Metadata,
             State,
+            Cheats,
             Markers,
             Checksums,
             Input,
@@ -817,6 +849,7 @@ impl TasDeserializer {
         let mut section = Section::Metadata;
         let mut metadata = BTreeMap::<String, String>::new();
         let mut state_text = String::new();
+        let mut cheats = Vec::new();
         let mut markers = Vec::new();
         let mut checksums = BTreeMap::new();
         let mut frames = Vec::new();
@@ -829,6 +862,7 @@ impl TasDeserializer {
             if line.starts_with('[') && line.ends_with(']') {
                 section = match &line[1..line.len() - 1] {
                     "STATE" => Section::State,
+                    "CHEATS" => Section::Cheats,
                     "MARKERS" => Section::Markers,
                     "CHECKSUMS" => Section::Checksums,
                     "INPUT" => {
@@ -847,6 +881,15 @@ impl TasDeserializer {
                     metadata.insert(key.to_owned(), value.trim().to_owned());
                 }
                 Section::State => state_text.push_str(line),
+                Section::Cheats => {
+                    if let Err(error) = Cheat::parse(line) {
+                        return Err(invalid_line(
+                            line_number,
+                            &format!("invalid cheat code: {error}"),
+                        ));
+                    }
+                    cheats.push(line.to_owned());
+                }
                 Section::Markers => {
                     let (frame, label) = line
                         .split_once('|')
@@ -958,6 +1001,15 @@ impl TasDeserializer {
         let rerecord_count = required(&metadata, "RERECORDS")?
             .parse::<u64>()
             .map_err(|_| TasFormatError::Invalid("invalid RERECORDS".into()))?;
+        let fceux_joypad_compat = match metadata.get("JOYPAD_TIMING").map(String::as_str) {
+            None | Some("HARDWARE") => false,
+            Some("FCEUX") => true,
+            Some(other) => {
+                return Err(TasFormatError::Invalid(format!(
+                    "unknown JOYPAD_TIMING {other}"
+                )));
+            }
+        };
         let mut warnings = Vec::new();
         if emulator_name == LEGACY_EMULATOR_NAME {
             warnings.push("movie uses the legacy pre-CrabNes emulator name".into());
@@ -986,6 +1038,8 @@ impl TasDeserializer {
             frames,
             markers,
             state_checksums: checksums,
+            cheats,
+            fceux_joypad_compat,
         };
         validate_movie(&movie)?;
         Ok(LoadedTas { movie, warnings })
@@ -1047,6 +1101,13 @@ fn validate_movie(movie: &TasMovie) -> Result<(), TasFormatError> {
         return Err(TasFormatError::Invalid(
             "state checksum points beyond the end of the movie".into(),
         ));
+    }
+    for cheat in &movie.cheats {
+        if let Err(error) = Cheat::parse(cheat) {
+            return Err(TasFormatError::Invalid(format!(
+                "invalid cheat code {cheat}: {error}"
+            )));
+        }
     }
     Ok(())
 }
@@ -1153,6 +1214,7 @@ mod tests {
             label: "jump".into(),
         });
         movie.state_checksums.insert(0, "34".repeat(32));
+        movie.cheats = vec!["GOSSIP".into(), "$6000:EA".into()];
         movie
     }
 
@@ -1169,6 +1231,7 @@ mod tests {
         assert_eq!(loaded.starting_state, movie.starting_state);
         assert_eq!(loaded.author, movie.author);
         assert_eq!(loaded.description, movie.description);
+        assert_eq!(loaded.cheats, movie.cheats);
         assert!(matches!(
             TasDeserializer::deserialize(&text, &"99".repeat(32)),
             Err(TasFormatError::WrongRom { .. })
@@ -1392,6 +1455,57 @@ mod tests {
         assert_eq!(manager.cursor, 2);
         assert_eq!(manager.mode, TasMode::Paused);
         assert!(manager.recording_context());
+    }
+
+    #[test]
+    fn joypad_timing_round_trips_and_defaults_to_hardware() {
+        let mut movie = movie();
+        let text = TasSerializer::serialize(&movie).unwrap();
+        assert!(!text.contains("JOYPAD_TIMING"));
+        assert!(
+            !TasDeserializer::deserialize(&text, &movie.rom_sha256)
+                .unwrap()
+                .movie
+                .fceux_joypad_compat
+        );
+
+        movie.fceux_joypad_compat = true;
+        let text = TasSerializer::serialize(&movie).unwrap();
+        assert!(text.contains("JOYPAD_TIMING FCEUX"));
+        assert!(
+            TasDeserializer::deserialize(&text, &movie.rom_sha256)
+                .unwrap()
+                .movie
+                .fceux_joypad_compat
+        );
+
+        let bad = text.replace("JOYPAD_TIMING FCEUX", "JOYPAD_TIMING MYSTERY");
+        assert!(TasDeserializer::deserialize(&bad, &movie.rom_sha256).is_err());
+    }
+
+    #[test]
+    fn cheats_round_trip_and_invalid_codes_are_rejected() {
+        let movie = movie();
+        let text = TasSerializer::serialize(&movie).unwrap();
+        assert!(text.contains("[CHEATS]"));
+        assert!(text.contains("GOSSIP"));
+        let bad = text.replace("GOSSIP", "QQQQQQ");
+        assert!(matches!(
+            TasDeserializer::deserialize(&bad, &movie.rom_sha256),
+            Err(TasFormatError::Invalid(_))
+        ));
+
+        let mut invalid = movie.clone();
+        invalid.cheats.push("not a code".into());
+        assert!(TasSerializer::serialize(&invalid).is_err());
+
+        assert_eq!(
+            movie.parsed_cheats(),
+            vec![
+                Cheat::parse("GOSSIP").unwrap(),
+                Cheat::parse("$6000:EA").unwrap()
+            ]
+        );
     }
 
     #[test]

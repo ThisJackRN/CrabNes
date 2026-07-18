@@ -541,7 +541,7 @@ fn estimate_accuracy(nes: &Nes, bytes: &[u8]) -> AccuracyEstimate {
         99 => (
             "Partial",
             10,
-            "Nintendo Vs. System PRG/CHR banking, four-screen nametables, single-coin input, and the known Vs. Super Mario Bros. RGB palette are covered; configurable DIP switches and other RGB PPU revisions remain incomplete.",
+            "Nintendo Vs. System PRG/CHR banking, four-screen nametables, single-coin input, and a selectable Vs. Super Mario Bros. RGB palette (defaulted to PlayChoice-10 RGB) are covered; configurable DIP switches and other RGB PPU revisions remain incomplete.",
         ),
         _ => (
             "Experimental",

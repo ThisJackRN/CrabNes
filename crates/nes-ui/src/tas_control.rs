@@ -55,6 +55,10 @@ pub struct ControlMovie {
     pub events: Vec<ControlEvent>,
     pub fceux_rom_md5: Option<[u8; 16]>,
     pub embedded_fceux_state: Option<Vec<u8>>,
+    /// Suggests playing the conversion with FCEUX's simplified joypad
+    /// clocking (no DMC/OAM DMA read corruption). True for FM2 sources; the
+    /// conversion UI lets the player override it.
+    pub fceux_joypad_compat: bool,
 }
 
 impl ControlMovie {
@@ -95,6 +99,7 @@ impl ControlMovie {
             ),
         });
         movie.rerecord_count = self.rerecord_count;
+        movie.fceux_joypad_compat = self.fceux_joypad_compat;
         movie.markers = self
             .events
             .iter()
@@ -133,6 +138,7 @@ pub fn load(path: &Path, expected_rom_sha256: Option<&str>) -> Result<ControlMov
                 events: Vec::new(),
                 fceux_rom_md5: None,
                 embedded_fceux_state: None,
+                fceux_joypad_compat: loaded.movie.fceux_joypad_compat,
             })
         }
         "txt" | "log" => {
@@ -377,6 +383,9 @@ fn parse_fm2(text: &str, source_path: PathBuf) -> Result<ControlMovie, String> {
         events,
         fceux_rom_md5,
         embedded_fceux_state,
+        // FCEUX does not model DMA joypad-read corruption, so its movies
+        // assume the filtered clocking model.
+        fceux_joypad_compat: true,
     })
 }
 
@@ -457,6 +466,7 @@ fn parse_bizhawk_input_log(
         events,
         fceux_rom_md5: None,
         embedded_fceux_state: None,
+        fceux_joypad_compat: false,
     })
 }
 
@@ -693,10 +703,30 @@ mod tests {
             }],
             fceux_rom_md5: None,
             embedded_fceux_state: None,
+            fceux_joypad_compat: true,
         };
         let movie = source.to_native_movie("12".repeat(32), TasStartType::PowerOn, None);
         assert_eq!(movie.frames, source.frames);
         assert_eq!(movie.rerecord_count, 9);
         assert_eq!(movie.markers.len(), 1);
+        assert!(movie.fceux_joypad_compat);
+    }
+
+    #[test]
+    fn fm2_sources_suggest_fceux_joypad_timing_and_bizhawk_sources_do_not() {
+        let fm2 = parse_fm2(
+            "version 3\n|0|........|........||\n",
+            PathBuf::from("movie.fm2"),
+        )
+        .unwrap();
+        assert!(fm2.fceux_joypad_compat);
+
+        let bizhawk = parse_bizhawk_input_log(
+            "[Input]\nLogKey:#Reset|P1 Up|P1 Down|P1 Left|P1 Right|P1 Start|P1 Select|P1 B|P1 A|\n|..|........|\n[/Input]\n",
+            PathBuf::from("Input Log.txt"),
+            ControlFormat::BizHawkInputLog,
+        )
+        .unwrap();
+        assert!(!bizhawk.fceux_joypad_compat);
     }
 }

@@ -155,6 +155,16 @@ pub struct Ppu {
     nmi_output_active: bool,
     #[serde(default)]
     suppress_vblank: bool,
+    /// While set, writes to $2000/$2001/$2005/$2006 are ignored (PPU post-reset
+    /// / power-up warm-up). Cleared on the pre-render line after the first
+    /// vblank flag set — about 29658 CPU cycles on NTSC (Blargg).
+    /// Snapshot default is false: only a fresh power/reset arms the lock.
+    #[serde(default)]
+    reset_reg_lock: bool,
+    /// Latches that a vblank flag set occurred while `reset_reg_lock` is held,
+    /// so the following pre-render clear can release the lock.
+    #[serde(default)]
+    reset_reg_lock_saw_vblank: bool,
     odd_frame: bool,
     frame: Frame,
     #[serde(skip, default = "default_output_palette")]
@@ -233,6 +243,9 @@ impl Default for Ppu {
             nmi_pending: false,
             nmi_output_active: false,
             suppress_vblank: false,
+            // Armed explicitly by Bus::new / reset — bare Default is for tests.
+            reset_reg_lock: false,
+            reset_reg_lock_saw_vblank: false,
             odd_frame: false,
             frame: Frame::default(),
             output_palette: default_output_palette(),
@@ -330,6 +343,9 @@ impl Ppu {
         self.nmi_output_active = at_frame_boundary || (self.status & 0x80 != 0);
         self.nmi_pending = at_frame_boundary && self.control & 0x80 != 0;
         self.suppress_vblank = false;
+        // Mid-run FCEUX states are past power-up; never re-arm the write lock.
+        self.reset_reg_lock = false;
+        self.reset_reg_lock_saw_vblank = false;
         self.odd_frame = odd_frame;
         self.evaluated_sprites.clear();
         self.next_sprites.clear();
@@ -387,6 +403,12 @@ impl Ppu {
             .resize(FRAME_WIDTH * FRAME_HEIGHT, 0);
     }
 
+    /// Arm the post-power/reset write lock on $2000/$2001/$2005/$2006.
+    pub(crate) fn arm_reset_reg_lock(&mut self) {
+        self.reset_reg_lock = true;
+        self.reset_reg_lock_saw_vblank = false;
+    }
+
     pub fn reset(&mut self) {
         self.control = 0;
         self.mask = 0;
@@ -429,6 +451,8 @@ impl Ppu {
         self.nmi_pending = false;
         self.nmi_output_active = false;
         self.suppress_vblank = false;
+        self.reset_reg_lock = true;
+        self.reset_reg_lock_saw_vblank = false;
         self.evaluated_sprites.clear();
         self.next_sprites.clear();
         self.next_sprites_valid = false;
@@ -518,7 +542,13 @@ impl Ppu {
 
     pub fn cpu_write(&mut self, register: u16, value: u8, cartridge: &mut Cartridge) {
         self.update_open_bus(value, 0xff);
-        match register & 7 {
+        let register = register & 7;
+        // After power/reset, $2000/$2001/$2005/$2006 are ignored until the
+        // internal PPU reset signal drops (pre-render after the first vblank).
+        if self.reset_reg_lock && matches!(register, 0 | 1 | 5 | 6) {
+            return;
+        }
+        match register {
             0 => {
                 let nmi_was_off = self.control & 0x80 == 0;
                 self.control = value;
@@ -663,14 +693,33 @@ impl Ppu {
 
         if self.scanline == -1 && self.dot == 1 {
             self.status &= !0xe0;
+            // The internal reset signal that suppresses $2000/$2001/$2005/$2006
+            // drops with the same pre-render edge that clears the vblank flag,
+            // but only after at least one vblank has been raised since reset.
+            if self.reset_reg_lock && self.reset_reg_lock_saw_vblank {
+                self.reset_reg_lock = false;
+                self.reset_reg_lock_saw_vblank = false;
+            }
         } else if self.scanline == 241 && self.dot == 1 {
             if self.suppress_vblank {
                 self.suppress_vblank = false;
                 self.status &= !0x80;
                 self.nmi_output_active = false;
                 self.nmi_pending = false;
+            } else if self.reset_reg_lock && !self.reset_reg_lock_saw_vblank {
+                // First post-reset vblank edge: count it for releasing the
+                // $2000/$2001/$2005/$2006 write lock on the following pre-render,
+                // but do not expose bit 7 on $2002 yet. Commercial boot code
+                // (and FCEUX power-on movie timing) double-polls $2002 so the
+                // first observable vblank lands near cycle 57k, after the
+                // post-reset warm-up window — matching hardware/FCEUX for
+                // power-on TASes such as SMB3.
+                self.reset_reg_lock_saw_vblank = true;
             } else {
                 self.status |= 0x80;
+                if self.reset_reg_lock {
+                    self.reset_reg_lock_saw_vblank = true;
+                }
             }
             self.frame_complete = true;
             self.frame.number = self.frame.number.wrapping_add(1);
@@ -1821,6 +1870,40 @@ mod tests {
         assert_eq!(ppu.status & 0x80, 0);
         assert!(!ppu.take_nmi());
         assert!(ppu.take_frame_complete());
+    }
+
+    #[test]
+    fn post_reset_write_lock_and_first_vblank_match_power_on_warmup() {
+        let mut ppu = Ppu::default();
+        let mut cartridge = test_cartridge();
+        ppu.arm_reset_reg_lock();
+
+        // $2000/$2001 ignored while locked.
+        ppu.cpu_write(0, 0x80, &mut cartridge);
+        ppu.cpu_write(1, 0x1e, &mut cartridge);
+        assert_eq!(ppu.control, 0);
+        assert_eq!(ppu.mask, 0);
+
+        // First post-reset vblank edge does not raise $2002 bit 7.
+        ppu.scanline = 241;
+        ppu.dot = 1;
+        ppu.clock(&mut cartridge);
+        assert_eq!(ppu.status & 0x80, 0);
+        assert!(ppu.reset_reg_lock);
+
+        // Pre-render after that edge releases the write lock.
+        ppu.scanline = -1;
+        ppu.dot = 1;
+        ppu.clock(&mut cartridge);
+        assert!(!ppu.reset_reg_lock);
+
+        // Subsequent vblanks raise the flag, and register writes work again.
+        ppu.scanline = 241;
+        ppu.dot = 1;
+        ppu.clock(&mut cartridge);
+        assert_ne!(ppu.status & 0x80, 0);
+        ppu.cpu_write(0, 0x80, &mut cartridge);
+        assert_eq!(ppu.control, 0x80);
     }
 
     #[test]

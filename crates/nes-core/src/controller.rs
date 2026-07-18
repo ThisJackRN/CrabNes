@@ -70,13 +70,21 @@ impl Controller {
         self.strobe = new_strobe;
     }
 
-    pub(crate) fn read(&mut self) -> u8 {
+    /// Read the serial joypad bit.
+    ///
+    /// `clock` is true when this access should advance the shift register.
+    /// Hardware clocks on every read slot — DMA cycles overlapping a
+    /// $4016/$4017 read therefore multi-shift the pad, the read corruption
+    /// games like SMB3 mitigate with re-read loops. The bus passes
+    /// `clock: false` only in its FCEUX-compatibility model, which folds
+    /// contiguous same-port reads into a single shift for movie playback.
+    pub(crate) fn read(&mut self, clock: bool) -> u8 {
         self.total_reads = self.total_reads.wrapping_add(1);
         if self.strobe {
             self.shift = self.buttons;
         }
         let value = self.shift & 1;
-        if !self.strobe {
+        if clock && !self.strobe {
             self.shift = (self.shift >> 1) | 0x80;
         }
         value
@@ -98,7 +106,19 @@ mod tests {
         pad.set_button(Button::Start, true);
         pad.write_strobe(1, true);
         pad.write_strobe(0, true);
-        let bits: Vec<_> = (0..8).map(|_| pad.read() & 1).collect();
+        let bits: Vec<_> = (0..8).map(|_| pad.read(true) & 1).collect();
         assert_eq!(bits, vec![1, 0, 0, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn contiguous_oe_without_clock_does_not_shift() {
+        let mut pad = Controller::default();
+        pad.set_button(Button::A, true);
+        pad.set_button(Button::B, true);
+        pad.write_strobe(1, true);
+        pad.write_strobe(0, true);
+        assert_eq!(pad.read(true) & 1, 1); // A
+        assert_eq!(pad.read(false) & 1, 1); // still A — OE held, no clock
+        assert_eq!(pad.read(true) & 1, 1); // B (clocked)
     }
 }

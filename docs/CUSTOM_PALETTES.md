@@ -28,6 +28,38 @@ codes documented by NESdev, expanded to RGB888. It changes the output-color
 lookup only. It does not switch PPU timing, register quirks, or game/system type,
 so it is safe to use as a visual preference with an ordinary NES ROM.
 
+The **RGB 2C04-0004 (Vs. System)** built-in uses the color PROM from the RP2C04-0004
+PPU revision found in Vs. Super Mario Bros. arcade boards. It is the most
+accurate choice for that specific game; other Nintendo Vs. System titles used
+different RP2C04-000x PROMs with different color assignments, so it is an
+approximation for them.
+
+## Nintendo Vs. System (mapper 99)
+
+Vs. System arcade boards used an RGB PPU rather than the composite NTSC 2C02 in
+home consoles, and almost universally an RP2C04-000x chip whose color index
+wiring is scrambled per revision as an anti-piracy measure. Running Vs. System
+tile data through the wrong chip family's decoding does not just look
+different — it renders the wrong colors outright (for example, a PlayChoice-10
+decoding of Vs. Super Mario Bros. renders a neon green background and magenta
+bricks instead of blue sky and brown bricks).
+
+A mapper 99 ROM always renders with **RGB 2C04-0004 (Vs. System)** — the chip
+Vs. Super Mario Bros. was authored for, and the closest built-in family for
+other Vs. System titles even when their board used a different RP2C04
+revision — unless that specific game has an explicit palette override. This is
+a per-game fallback, not a one-time default: the global palette setting used by
+every other ROM (Settings > Video) is never the implicit answer for a Vs. game,
+including after a per-game override is turned back off.
+
+Pick a different palette for a specific Vs. game in **Per-game overrides >
+Override palette** — shown in both the Settings window and the quick Audio /
+Video window, expanded by default — choosing PlayChoice-10, NTSC, RP2C04-0004
+explicitly, or a custom imported palette. It sticks until you turn the
+override off again. If you change the palette dropdown above it while a Vs.
+game is loaded, a "Use the palette above for just this game" button appears as
+a shortcut that sets the override to match.
+
 Output palette selection is deliberately excluded from core save-state and TAS
 machine data. Loading a state or rewinding therefore preserves the user's active
 palette and cannot change deterministic emulation results.
