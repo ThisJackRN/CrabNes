@@ -16,8 +16,8 @@ use nes_achievements_native::{
 };
 use nes_core::{
     ApuChannel, Button, Cheat, CheatActivity, FRAME_HEIGHT, FRAME_WIDTH, MemorySpace,
-    NTSC_2C02_PALETTE, NTSC_FRAME_RATE, Nes, OutputPalette, RGB_2C03_PALETTE, RGB_2C04_0004_PALETTE,
-    Region,
+    NTSC_2C02_PALETTE, NTSC_FRAME_RATE, Nes, OutputPalette, RGB_2C03_PALETTE,
+    RGB_2C04_0004_PALETTE, Region,
 };
 use rfd::FileDialog;
 
