@@ -1399,8 +1399,7 @@ impl App {
                                         continue;
                                     };
                                     let cheat_cell = cheat_cells.get(&index);
-                                    let mut text =
-                                        egui::RichText::new(format!("{value:02X}"));
+                                    let mut text = egui::RichText::new(format!("{value:02X}"));
                                     if let Some(entry) = cheat_cell {
                                         text = text.strong().color(
                                             if entry.observed != entry.actual {
@@ -1410,13 +1409,10 @@ impl App {
                                             },
                                         );
                                     }
-                                    let mut response = ui.selectable_label(
-                                        self.hex_selected == Some(index),
-                                        text,
-                                    );
+                                    let mut response =
+                                        ui.selectable_label(self.hex_selected == Some(index), text);
                                     if let Some(entry) = cheat_cell {
-                                        response =
-                                            response.on_hover_text(cheat_cell_hover(entry));
+                                        response = response.on_hover_text(cheat_cell_hover(entry));
                                     }
                                     if response.clicked() {
                                         self.hex_selected = Some(index);
@@ -1626,11 +1622,15 @@ pub(super) fn palette_settings_ui(
                 ui.selectable_value(&mut video.palette_mode, mode, mode.label());
             }
             ui.add_enabled_ui(is_vs_system, |ui| {
-                ui.selectable_value(&mut video.palette_mode, PaletteMode::VsRp2c04, PaletteMode::VsRp2c04.label())
-                    .on_disabled_hover_text(
-                        "Only meaningful for a loaded Vs. System (mapper 99) ROM; it renders \
+                ui.selectable_value(
+                    &mut video.palette_mode,
+                    PaletteMode::VsRp2c04,
+                    PaletteMode::VsRp2c04.label(),
+                )
+                .on_disabled_hover_text(
+                    "Only meaningful for a loaded Vs. System (mapper 99) ROM; it renders \
                          wrong colors on an ordinary NES game.",
-                    );
+                );
             });
         });
     ui.horizontal_wrapped(|ui| {

@@ -350,7 +350,9 @@ impl Nes {
     pub fn memory_image(&self, space: MemorySpace) -> MemoryImage {
         match space {
             MemorySpace::CpuBus => MemoryImage {
-                bytes: (0..=0xffffu16).map(|address| self.peek_cpu(address)).collect(),
+                bytes: (0..=0xffffu16)
+                    .map(|address| self.peek_cpu(address))
+                    .collect(),
                 base_address: 0,
                 writable: false,
             },
@@ -952,7 +954,11 @@ mod tests {
         let mut nes = Nes::from_ines(&rom).unwrap();
         assert_eq!(nes.step_instruction().unwrap(), 3);
         assert_eq!(nes.step_instruction().unwrap(), 4);
-        assert_eq!(nes.cpu_cycles(), 14, "the write must end on even CPU cycle 14");
+        assert_eq!(
+            nes.cpu_cycles(),
+            14,
+            "the write must end on even CPU cycle 14"
+        );
         let before_nop = nes.cpu_cycles();
 
         assert_eq!(nes.step_instruction().unwrap(), 2);

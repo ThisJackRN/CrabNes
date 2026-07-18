@@ -82,7 +82,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut frames = parse_fm2_frames(&text);
     println!("Parsed {} input frames from {fm2_path}", frames.len());
-    let run_limit: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(frames.len());
+    let run_limit: usize = args
+        .next()
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or(frames.len());
     frames.truncate(run_limit);
 
     let mut lag_frames = 0u64;
@@ -92,11 +96,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         apply_mask(&mut nes, 0, *p1);
         apply_mask(&mut nes, 1, *p2);
 
-        let reads_before = nes.controller_reads(0).wrapping_add(nes.controller_reads(1));
+        let reads_before = nes
+            .controller_reads(0)
+            .wrapping_add(nes.controller_reads(1));
         let cycles_before = nes.cpu_cycles();
         nes.run_frame()?;
         let cycles_after = nes.cpu_cycles();
-        let reads_after = nes.controller_reads(0).wrapping_add(nes.controller_reads(1));
+        let reads_after = nes
+            .controller_reads(0)
+            .wrapping_add(nes.controller_reads(1));
 
         let is_lag = reads_after == reads_before;
         let lag_before = lag_frames;
